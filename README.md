@@ -22,6 +22,10 @@ Postgres ──physical WAL──► open-ltap ──Arrow──► Delta table 
 tired of babysitting a Debezium → Kafka → streaming-job pipeline (three copies of data, snapshot
 cutover ceremony, small-file cleanup, per-table config) just to get operational data into the lake.
 
+📊 **[Architecture deep-dive](https://zemin-piao.github.io/open-ltap/)** — how reads and writes
+flow through each stage, with pros/cons of the product track (M0–M4) vs. the storage-level
+future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
+
 ## Status: M0 — working vertical slice
 
 - ✅ Hand-rolled replication wire client (trust auth, dev)

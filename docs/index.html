@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>open-ltap — data flow: M0 → M5 → v2</title>
+<style>
+  :root {
+    --bg: #14181D;
+    --panel: #181E25;
+    --panel-2: #1F2731;
+    --line: #2A333D;
+    --ink: #E6E1D7;
+    --muted: #8A939F;
+    --amber: #E2A65B;
+    --teal: #52B9A5;
+    --slate: #7BA3C9;
+    --ghost: #5A6570;
+    --rose: #C98A8A;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  html { background: var(--bg); }
+  body {
+    font-family: var(--sans); color: var(--ink); line-height: 1.6;
+    font-size: 15px; margin: 0; -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 56px 24px 80px; }
+  header { margin-bottom: 48px; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--amber); margin: 0 0 10px;
+  }
+  h1 { font-size: 27px; font-weight: 650; letter-spacing: -.01em; margin: 0 0 12px; text-wrap: balance; }
+  .dek { color: var(--muted); max-width: 66ch; margin: 0 0 18px; }
+  p code, .dek code, li code {
+    font-family: var(--mono); font-size: .88em; color: var(--ink);
+    background: var(--panel-2); padding: 1px 5px; border-radius: 4px;
+  }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px; }
+  .key {
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px;
+    background: var(--panel); display: inline-flex; align-items: center; gap: 7px;
+  }
+  .swatch { width: 16px; height: 0; border-top: 2px solid; display: inline-block; }
+  .swatch.dashed { border-top-style: dashed; }
+  section { margin-bottom: 68px; }
+  .stage-eyebrow {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .14em;
+    text-transform: uppercase; margin: 0 0 8px;
+  }
+  h2 { font-size: 19px; font-weight: 650; margin: 0 0 10px; text-wrap: balance; }
+  section > p { color: var(--muted); max-width: 68ch; margin: 0 0 20px; }
+  section > p strong { color: var(--ink); font-weight: 600; }
+  .diagram {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px 14px 10px; overflow-x: auto;
+  }
+  .diagram svg { display: block; min-width: 940px; width: 100%; height: auto; }
+  svg text { font-family: var(--mono); }
+  .pcgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+  @media (max-width: 720px) { .pcgrid { grid-template-columns: 1fr; } }
+  .pc { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px 16px; }
+  .pc h3 {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .12em;
+    text-transform: uppercase; font-weight: 500; margin: 0;
+  }
+  .pc.pro h3 { color: var(--teal); }
+  .pc.con h3 { color: var(--rose); }
+  .pc ul { margin: 10px 0 0; padding: 0; list-style: none; }
+  .pc li { position: relative; padding-left: 20px; font-size: 13px; color: var(--muted); margin: 7px 0; }
+  .pc li strong { color: var(--ink); font-weight: 600; }
+  .pc li::before { position: absolute; left: 0; font-family: var(--mono); }
+  .pc.pro li::before { content: "+"; color: var(--teal); }
+  .pc.con li::before { content: "–"; color: var(--rose); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+  th {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--muted); font-weight: 500;
+  }
+  td:first-child { color: var(--muted); }
+  td { vertical-align: top; }
+  .t-good { color: var(--teal); }
+  .t-hot { color: var(--amber); }
+  .tablecard { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; }
+  footer { margin-top: 48px; color: var(--ghost); font-size: 12.5px; font-family: var(--mono); }
+  footer a { color: var(--slate); }
+</style>
+
+<div class="wrap">
+<header>
+  <p class="eyebrow">open-ltap · architecture notes</p>
+  <h1>How reads and writes flow: the product (M0–M4) and the research track</h1>
+  <p class="dek">The product: point one binary at the Postgres you already run and get fresh Delta
+  tables on your own S3 — no Kafka, no Debezium, no new database platform. Storage-level
+  integration with Neon (M5, v2) is future work. Each diagram traces a write
+  (<code>W①…</code>) to durable storage and the two kinds of reads (<code>R①…</code>):
+  OLTP point queries and analytical scans.</p>
+  <div class="legend">
+    <span class="key"><span class="swatch" style="border-color:#E2A65B"></span>write path (row data in motion)</span>
+    <span class="key"><span class="swatch" style="border-color:#7BA3C9"></span>OLTP reads</span>
+    <span class="key"><span class="swatch" style="border-color:#52B9A5"></span>analytical reads</span>
+    <span class="key"><span class="swatch dashed" style="border-color:#8A939F"></span>on-demand / planned</span>
+  </div>
+</header>
+
+<!-- ============================================= M0 -->
+<section>
+  <p class="stage-eyebrow" style="color:var(--teal)">The product · M0 shipped, M1–M4 the roadmap</p>
+  <h2>Any Postgres → Delta on your S3, one binary</h2>
+  <p>This architecture is the whole product — M1–M4 deepen it (resume, updates/deletes, DDL
+  tracking, the freshness read path) without changing its shape, and it works against RDS,
+  self-hosted, Supabase, or Neon compute. Writes commit exactly as before —
+  <strong>Postgres acks after its local WAL fsync</strong> (W①), and the walsender streams the same
+  WAL bytes to open-ltap in parallel (W②). OLTP reads (R①) never change: shared buffers, then
+  local heap. Analytical reads (R②) never touch Postgres — they scan Delta, seeing data as of the
+  last transcoded commit; the M4 tail merge (R③) upgrades that to read-your-writes.</p>
+
+  <div class="diagram">
+  <svg viewBox="0 0 1000 440" role="img" aria-label="M0: application writes and OLTP reads go to Postgres; WAL streams to open-ltap which appends committed transactions to Delta on MinIO; analytics scan Delta only">
+    <defs>
+      <marker id="ah-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#E2A65B"/>
+      </marker>
+      <marker id="ah-t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#52B9A5"/>
+      </marker>
+      <marker id="ah-s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#7BA3C9"/>
+      </marker>
+      <marker id="ah-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#5A6570"/>
+      </marker>
+    </defs>
+
+    <!-- Application -->
+    <rect x="24" y="52" width="140" height="110" rx="8" fill="#1F2731" stroke="#2A333D"/>
+    <text x="94" y="98" text-anchor="middle" font-size="13" font-weight="600" fill="#E6E1D7">Application</text>
+    <text x="94" y="116" text-anchor="middle" font-size="10.5" fill="#8A939F">psql · your app</text>
+    <text x="24" y="198" font-size="9.5" fill="#8A939F">OLTP reads unchanged:</text>
+    <text x="24" y="212" font-size="9.5" fill="#8A939F">buffer pool → local heap</text>
+
+    <!-- W1 / R1 -->
+    <text x="202" y="70" text-anchor="middle" font-size="9.5" fill="#E2A65B">W① write</text>
+    <line x1="168" y1="84" x2="236" y2="84" stroke="#E2A65B" stroke-width="1.5" marker-end="url(#ah-a)"/>
+    <line x1="168" y1="150" x2="236" y2="150" stroke="#7BA3C9" stroke-width="1.5" marker-start="url(#ah-s)" marker-end="url(#ah-s)"/>
+    <text x="202" y="168" text-anchor="middle" font-size="9.5" fill="#7BA3C9">R① SELECT</text>
+
+    <!-- Postgres -->
+    <rect x="240" y="36" width="200" height="190" rx="8" fill="#1F2731" stroke="#3D566E"/>
+    <text x="340" y="62" text-anchor="middle" font-size="13.5" font-weight="600" fill="#7BA3C9">Postgres 17</text>
+    <text x="340" y="79" text-anchor="middle" font-size="10" fill="#8A939F">compute + storage</text>
+    <rect x="258" y="90" width="164" height="22" rx="4" fill="#232B34"/>
+    <text x="266" y="105" font-size="10" fill="#E6E1D7">shared buffers</text>
+    <rect x="258" y="118" width="164" height="22" rx="4" fill="#232B34"/>
+    <text x="266" y="133" font-size="10" fill="#E6E1D7">heap on disk — copy ①</text>
+    <rect x="258" y="146" width="164" height="22" rx="4" fill="#232B34"/>
+    <text x="266" y="161" font-size="10" fill="#E6E1D7">WAL on disk (fsync)</text>
+    <rect x="258" y="174" width="164" height="22" rx="4" fill="#232B34" stroke="#3D566E"/>
+    <text x="266" y="189" font-size="10" fill="#8A939F">walsender</text>
+    <text x="340" y="244" text-anchor="middle" font-size="9.5" fill="#8A939F">COMMIT acked after local WAL fsync</text>
+
+    <!-- W2 -->
+    <text x="480" y="92" text-anchor="middle" font-size="9.5" fill="#E2A65B">W②</text>
+    <text x="480" y="105" text-anchor="middle" font-size="9.5" fill="#8A939F">physical WAL</text>
+    <line x1="444" y1="118" x2="516" y2="118" stroke="#E2A65B" stroke-width="1.5" marker-end="url(#ah-a)"/>
+
+    <!-- open-ltap -->
+    <rect x="520" y="52" width="210" height="140" rx="8" fill="#1F2731" stroke="#E2A65B"/>
+    <text x="625" y="78" text-anchor="middle" font-size="14" font-weight="600" fill="#E2A65B">open-ltap</text>
+    <text x="625" y="95" text-anchor="middle" font-size="10" fill="#8A939F">the transcoder · Rust</text>
+    <rect x="540" y="106" width="170" height="22" rx="4" fill="#232B34"/>
+    <text x="625" y="121" text-anchor="middle" font-size="9.5" fill="#E6E1D7">pgwire → walreader → decode</text>
+    <rect x="540" y="134" width="170" height="22" rx="4" fill="#232B34"/>
+    <text x="625" y="149" text-anchor="middle" font-size="9.5" fill="#E6E1D7">txbuf — commit/abort gate</text>
+    <text x="625" y="178" text-anchor="middle" font-size="9.5" fill="#8A939F">aborted txns never leave here</text>
+
+    <!-- W3 -->
+    <text x="765" y="92" text-anchor="middle" font-size="9.5" fill="#E2A65B">W③</text>
+    <text x="765" y="105" text-anchor="middle" font-size="9.5" fill="#8A939F">append</text>
+    <line x1="734" y1="118" x2="796" y2="118" stroke="#E2A65B" stroke-width="1.5" marker-end="url(#ah-a)"/>
+
+    <!-- Delta -->
+    <rect x="800" y="52" width="176" height="110" rx="8" fill="#1F2731" stroke="#3A5F56"/>
+    <text x="888" y="80" text-anchor="middle" font-size="13.5" font-weight="600" fill="#52B9A5">Delta table</text>
+    <text x="888" y="97" text-anchor="middle" font-size="10" fill="#8A939F">s3://lake/t · MinIO</text>
+    <rect x="820" y="110" width="136" height="20" rx="10" fill="#14181D" stroke="#2A333D"/>
+    <text x="888" y="124" text-anchor="middle" font-size="9.5" fill="#8A939F">parquet + _ltap_lsn</text>
+    <text x="888" y="150" text-anchor="middle" font-size="9.5" fill="#52B9A5">columnar = copy ②</text>
+
+    <!-- R2 analytics -->
+    <line x1="888" y1="296" x2="888" y2="166" stroke="#52B9A5" stroke-width="1.5" marker-end="url(#ah-t)"/>
+    <text x="878" y="224" text-anchor="end" font-size="9.5" fill="#52B9A5">R② delta_scan</text>
+    <text x="878" y="238" text-anchor="end" font-size="9.5" fill="#8A939F">fresh to last transcode (~s)</text>
+    <rect x="800" y="300" width="176" height="84" rx="8" fill="#1F2731" stroke="#2A333D"/>
+    <text x="888" y="334" text-anchor="middle" font-size="12.5" font-weight="600" fill="#E6E1D7">Analytics</text>
+    <text x="888" y="352" text-anchor="middle" font-size="10" fill="#8A939F">DuckDB · Spark</text>
+
+    <!-- R3 planned tail merge -->
+    <path d="M 796 340 L 640 340 L 640 196" fill="none" stroke="#5A6570" stroke-width="1.5"
+          stroke-dasharray="5 5" marker-end="url(#ah-g)"/>
+    <text x="718" y="358" text-anchor="middle" font-size="9.5" fill="#5A6570">R③ fresh-tail merge — planned (M4)</text>
+  </svg>
+  </div>
+
+  <div class="pcgrid">
+    <div class="pc pro">
+      <h3>You get</h3>
+      <ul>
+        <li><strong>Any Postgres</strong> — RDS, Supabase, Neon, a laptop; no fork, no extension to install</li>
+        <li><strong>Transactional correctness</strong> — commit/abort gate; rolled-back rows never reach the lake</li>
+        <li><strong>Analytics fully offloaded</strong> — R② never touches Postgres; scans hit object storage</li>
+        <li><strong>LSN lineage</strong> — every row stamped with its commit LSN, the hook everything later builds on</li>
+      </ul>
+    </div>
+    <div class="pc con">
+      <h3>Missing / costs — each gap is a milestone</h3>
+      <ul>
+        <li><strong>INSERT-only today</strong> — UPDATE/DELETE via deletion vectors, TOAST, <code>COPY</code> → M1/M2</li>
+        <li><strong>No resume yet</strong> — restart loses stream position; no CRC checks → M1 (LSN in Delta commit metadata = exactly-once)</li>
+        <li><strong>Small files</strong> — one Delta commit per Postgres commit; batching + compaction → M1</li>
+        <li><strong>Schema frozen at startup</strong> — DDL mid-stream breaks decoding; multi-table → M3</li>
+        <li><strong>Freshness = transcode lag</strong> — read-your-writes tail merge → M4, the headline feature</li>
+        <li><strong>Inherent to this shape</strong> — costs Postgres one walsender (+ WAL retention if the transcoder stalls); two copies of table data</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================= M5 -->
+<section>
+  <p class="stage-eyebrow" style="color:var(--ghost)">Future work · M5 — Neon source adapter</p>
+  <h2>Same decoder, re-pointed at Neon's storage layer</h2>
+  <p>For platform teams already running Neon — not a prerequisite for the product. Writes ack on a
+  <strong>safekeeper Paxos quorum</strong> (W②); compute holds no durable state. OLTP reads hit the
+  buffer pool, then fetch pages from the pageserver on a miss (<code>R② GetPage@LSN</code>).
+  open-ltap consumes the safekeeper stream (W③) — downstream of compute, so transcoding costs
+  Postgres nothing — and uses the pageserver as a <strong>random-access oracle</strong>: it can
+  answer "what did page N of relation R look like at LSN X", which the sequential WAL tape can't —
+  that's how UPDATE/DELETE pre-images, out-of-line TOAST chunks, and consistent backfill scans get
+  resolved. Note the honest trade-off: table data exists <strong>twice on S3</strong> (layer files
+  + Parquet) until v2.</p>
+
+  <div class="diagram">
+  <svg viewBox="0 0 1000 420" role="img" aria-label="M5: writes quorum-commit on safekeepers; open-ltap consumes the safekeeper WAL stream and queries the pageserver for pre-images; OLTP reads fetch pages from the pageserver on buffer-pool miss; analytics scan Delta with a planned tail merge">
+    <!-- Application -->
+    <rect x="24" y="52" width="120" height="96" rx="8" fill="#1F2731" stroke="#2A333D"/>
+    <text x="84" y="92" text-anchor="middle" font-size="12.5" font-weight="600" fill="#E6E1D7">Application</text>
+    <text x="84" y="110" text-anchor="middle" font-size="10" fill="#8A939F">SQL</text>
+
+    <text x="172" y="70" text-anchor="middle" font-size="9" fill="#E2A65B">W① write</text>
+    <line x1="148" y1="84" x2="196" y2="84" stroke="#E2A65B" stroke-width="1.5" marker-end="url(#ah-a)"/>
+    <line x1="148" y1="124" x2="196" y2="124" stroke="#7BA3C9" stroke-width="1.5" marker-start="url(#ah-s)" marker-end="url(#ah-s)"/>
+    <text x="172" y="142" text-anchor="middle" font-size="9" fill="#7BA3C9">R① SELECT</text>
+
+    <!-- Neon compute -->
+    <rect x="200" y="36" width="180" height="130" rx="8" fill="#1F2731" stroke="#3D566E"/>
+    <text x="290" y="62" text-anchor="middle" font-size="13" font-weight="600" fill="#7BA3C9">Neon compute</text>
+    <text x="290" y="79" text-anchor="middle" font-size="10" fill="#8A939F">stateless Postgres</text>
+    <rect x="218" y="92" width="144" height="22" rx="4" fill="#232B34"/>
+    <text x="290" y="107" text-anchor="middle" font-size="10" fill="#E6E1D7">buffer pool</text>
+    <text x="290" y="140" text-anchor="middle" font-size="9.5" fill="#8A939F">no durable state</text>
+    <text x="250" y="186" text-anchor="middle" font-size="9.5" fill="#8A939F">COMMIT acked on Paxos quorum</text>
+
+    <!-- W2 -->
+    <text x="405" y="86" text-anchor="middle" font-size="9" fill="#E2A65B">W② WAL</text>
+    <line x1="384" y1="100" x2="426" y2="100" stroke="#E2A65B" stroke-width="1.5" marker-end="url(#ah-a)"/>
+
+    <!-- Safekeepers -->
+    <rect x="440" y="34" width="160" height="110" rx="8" fill="#1B222B" stroke="#2A333D"/>
+    <rect x="435" y="39" width="160" height="110" rx="8" fill="#1D242D" stroke="#2A333D"/>
+    <rect x="430" y="44" width="160" height="110" rx="8" fill="#1F2731" stroke="#3D566E"/>
+    <text x="510" y="74" text-anchor="middle" font-size="13" font-weight="600" fill="#7BA3C9">Safekeepers ×3</text>
+    <text x="510" y="92" text-anchor="middle" font-size="10" fill="#8A939F">Paxos WAL service</text>
+    <text x="510" y="118" text-anchor="middle" font-size="9.5" fill="#8A939F">durable, ordered log</text>
+
+    <!-- W3 -->
+    <text x="615" y="86" text-anchor="middle" font-size="9" fill="#E2A65B">W③ WAL</text>
+    <line x1="594" y1="100" x2="636" y2="100" stroke="#E2A65B" stroke-width="1.5" marker-end="url(#ah-a)"/>
+
+    <!-- open-ltap -->
+    <rect x="640" y="36" width="170" height="130" rx="8" fill="#1F2731" stroke="#E2A65B"/>
+    <text x="725" y="62" text-anchor="middle" font-size="13.5" font-weight="600" fill="#E2A65B">open-ltap</text>
+    <text x="725" y="79" text-anchor="middle" font-size="10" fill="#8A939F">same decoder as M0</text>
+    <rect x="658" y="92" width="134" height="22" rx="4" fill="#232B34"/>
+    <text x="725" y="107" text-anchor="middle" font-size="9.5" fill="#E6E1D7">decode · txbuf</text>
+    <rect x="658" y="120" width="134" height="22" rx="4" fill="#232B34"/>
+    <text x="725" y="135" text-anchor="middle" font-size="9.5" fill="#8A939F">tail buffer — M4</text>
+
+    <!-- W4 -->
+    <text x="830" y="86" text-anchor="middle" font-size="9" fill="#E2A65B">W④</text>
+    <line x1="814" y1="100" x2="846" y2="100" stroke="#E2A65B" stroke-width="1.5" marker-end="url(#ah-a)"/>
+
+    <!-- Delta -->
+    <rect x="850" y="36" width="136" height="134" rx="8" fill="#1F2731" stroke="#3A5F56"/>
+    <text x="918" y="64" text-anchor="middle" font-size="13" font-weight="600" fill="#52B9A5">Delta table</text>
+    <text x="918" y="82" text-anchor="middle" font-size="10" fill="#8A939F">Parquet on S3</text>
+    <rect x="886" y="128" width="64" height="20" rx="10" fill="none" stroke="#3A5F56"/>
+    <text x="918" y="142" text-anchor="middle" font-size="9.5" fill="#52B9A5">copy ②</text>
+
+    <!-- sk -> pageserver (Neon's path) -->
+    <line x1="510" y1="158" x2="510" y2="276" stroke="#5A6570" stroke-width="1.5" marker-end="url(#ah-g)"/>
+    <text x="522" y="212" font-size="9.5" fill="#8A939F">WAL — Neon's existing path</text>
+
+    <!-- compute -> pageserver GetPage -->
+    <path d="M 340 170 L 340 335 L 426 335" fill="none" stroke="#7BA3C9" stroke-width="1.5"
+          stroke-dasharray="5 5" marker-end="url(#ah-s)"/>
+    <text x="346" y="248" font-size="9" fill="#7BA3C9">R② GetPage@LSN</text>
+    <text x="346" y="262" font-size="9" fill="#8A939F">(buffer-pool miss)</text>
+
+    <!-- pageserver -->
+    <rect x="430" y="280" width="160" height="110" rx="8" fill="#1F2731" stroke="#3D566E"/>
+    <text x="510" y="312" text-anchor="middle" font-size="13" font-weight="600" fill="#7BA3C9">Pageserver</text>
+    <text x="510" y="330" text-anchor="middle" font-size="10" fill="#8A939F">GetPage@LSN service</text>
+    <text x="510" y="356" text-anchor="middle" font-size="9.5" fill="#8A939F">unforked, upstream Neon</text>
+
+    <!-- pageserver -> layer files -->
+    <text x="365" y="351" text-anchor="middle" font-size="9.5" fill="#8A939F">layer upload</text>
+    <line x1="426" y1="360" x2="304" y2="360" stroke="#5A6570" stroke-width="1.5" marker-end="url(#ah-g)"/>
+    <rect x="100" y="300" width="200" height="90" rx="8" fill="#1B222B" stroke="#2A333D"/>
+    <text x="200" y="332" text-anchor="middle" font-size="12" font-weight="600" fill="#8A939F">Neon layer files</text>
+    <text x="200" y="350" text-anchor="middle" font-size="10" fill="#8A939F">pages on S3</text>
+    <text x="200" y="374" text-anchor="middle" font-size="9.5" fill="#7BA3C9">row copy ①</text>
+
+    <!-- pageserver -> ltap oracle -->
+    <path d="M 594 300 L 700 300 L 700 172" fill="none" stroke="#E2A65B" stroke-width="1.5"
+          stroke-dasharray="5 5" marker-end="url(#ah-a)"/>
+    <text x="600" y="292" font-size="9" fill="#E2A65B">GetPage@LSN — pre-images · TOAST · backfill</text>
+
+    <!-- analytics -->
+    <rect x="850" y="280" width="136" height="96" rx="8" fill="#1F2731" stroke="#2A333D"/>
+    <text x="918" y="316" text-anchor="middle" font-size="12.5" font-weight="600" fill="#E6E1D7">Analytics</text>
+    <text x="918" y="334" text-anchor="middle" font-size="10" fill="#8A939F">DuckDB · Spark</text>
+    <line x1="918" y1="276" x2="918" y2="174" stroke="#52B9A5" stroke-width="1.5" marker-end="url(#ah-t)"/>
+    <text x="908" y="220" text-anchor="end" font-size="9.5" fill="#52B9A5">R③ delta_scan</text>
+    <text x="908" y="234" text-anchor="end" font-size="9.5" fill="#8A939F">freshness: transcode lag</text>
+
+    <!-- tail merge -->
+    <path d="M 846 330 L 760 330 L 760 172" fill="none" stroke="#52B9A5" stroke-width="1.5"
+          stroke-dasharray="5 5" marker-end="url(#ah-t)"/>
+    <text x="800" y="348" text-anchor="middle" font-size="9" fill="#52B9A5">R④ tail merge — M4</text>
+  </svg>
+  </div>
+
+  <div class="pcgrid">
+    <div class="pc pro">
+      <h3>You get</h3>
+      <ul>
+        <li><strong>Zero load on compute</strong> — the transcoder taps WAL downstream, at the safekeepers</li>
+        <li><strong>Every table automatically</strong> — no replication slots, no publications, no per-table setup</li>
+        <li><strong>The GetPage@LSN oracle</strong> — pre-images for updates, TOAST chunks, consistent backfill scans; vanilla CDC never has this</li>
+        <li><strong>No Neon fork</strong> — an external subscriber; upstream upgrades stay painless</li>
+        <li><strong>Read-your-writes analytics</strong> — pin LSN, scan Delta ≤ LSN, merge the tail (R④, with M4)</li>
+      </ul>
+    </div>
+    <div class="pc con">
+      <h3>Missing / costs</h3>
+      <ul>
+        <li><strong>Still two copies on S3</strong> — Neon layer files and Parquet; the duplication only disappears in v2</li>
+        <li><strong>You must run Neon</strong> — 3 safekeepers, pageserver, compute images, no managed control plane in OSS; a platform decision, not a tool install</li>
+        <li><strong>Narrow audience</strong> — teams on RDS/self-hosted Postgres get nearly all the value from M0–M4 without this</li>
+        <li><strong>Transcoder can lag</strong> — an independent consumer; freshness bounded by decode+commit unless the tail merge is deployed</li>
+        <li><strong>Depends on M1–M4 being done first</strong> — resume, deletes, catalog tracking, tail merge are prerequisites</li>
+        <li><strong>Branches &amp; PITR unmapped</strong> — Neon branches have no Delta-snapshot story yet</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================= v2 -->
+<section>
+  <p class="stage-eyebrow" style="color:var(--ghost)">Future work · v2 — the research endgame</p>
+  <h2>Transcoding inside compaction — columnar becomes canonical</h2>
+  <p>What Databricks built, and the only design that eliminates the storage duplication. The write
+  path is unchanged through the safekeepers, but the forked
+  pageserver's compaction <strong>emits Parquet as the only durable copy</strong> (W④). The read
+  paths invert: analytics scan canonical Parquet directly with an exact-LSN tail merge from the
+  pageserver (R③, R⑤), while <strong>cold OLTP reads now pay the reverse path</strong> — a buffer-pool
+  and page-cache miss means rebuilding the exact 8KB page from Parquet + WAL tail (R④), which is why
+  the caching hierarchy has to be aggressive.</p>
+
+  <div class="diagram">
+  <svg viewBox="0 0 1000 470" role="img" aria-label="v2: writes flow through safekeepers into a forked pageserver whose compaction writes canonical Parquet; OLTP reads are served from an ephemeral page cache rebuilt from Parquet on miss; analytics scan Parquet directly with a tail merge">
+    <!-- Application -->
+    <rect x="24" y="52" width="120" height="96" rx="8" fill="#1F2731" stroke="#2A333D"/>
+    <text x="84" y="92" text-anchor="middle" font-size="12.5" font-weight="600" fill="#E6E1D7">Application</text>
+    <text x="84" y="110" text-anchor="middle" font-size="10" fill="#8A939F">SQL</text>
+
+    <text x="172" y="70" text-anchor="middle" font-size="9" fill="#E2A65B">W① write</text>
+    <line x1="148" y1="84" x2="196" y2="84" stroke="#E2A65B" stroke-width="1.5" marker-end="url(#ah-a)"/>
+    <line x1="148" y1="124" x2="196" y2="124" stroke="#7BA3C9" stroke-width="1.5" marker-start="url(#ah-s)" marker-end="url(#ah-s)"/>
+    <text x="172" y="142" text-anchor="middle" font-size="9" fill="#7BA3C9">R① SELECT</text>
+
+    <!-- compute -->
+    <rect x="200" y="36" width="170" height="130" rx="8" fill="#1F2731" stroke="#3D566E"/>
+    <text x="285" y="66" text-anchor="middle" font-size="13" font-weight="600" fill="#7BA3C9">Neon compute</text>
+    <text x="285" y="84" text-anchor="middle" font-size="10" fill="#8A939F">stateless Postgres</text>
+    <rect x="218" y="98" width="134" height="22" rx="4" fill="#232B34"/>
+    <text x="285" y="113" text-anchor="middle" font-size="10" fill="#E6E1D7">buffer pool</text>
+
+    <!-- W2 -->
+    <text x="385" y="86" text-anchor="middle" font-size="9" fill="#E2A65B">W②</text>
+    <line x1="374" y1="100" x2="396" y2="100" stroke="#E2A65B" stroke-width="1.5" marker-end="url(#ah-a)"/>
+
+    <!-- safekeepers -->
+    <rect x="400" y="52" width="120" height="96" rx="8" fill="#1F2731" stroke="#3D566E"/>
+    <text x="460" y="88" text-anchor="middle" font-size="12" font-weight="600" fill="#7BA3C9">Safekeepers</text>
+    <text x="460" y="106" text-anchor="middle" font-size="10" fill="#8A939F">Paxos WAL</text>
+
+    <!-- W3 -->
+    <text x="540" y="86" text-anchor="middle" font-size="9" fill="#E2A65B">W③</text>
+    <line x1="524" y1="100" x2="556" y2="100" stroke="#E2A65B" stroke-width="1.5" marker-end="url(#ah-a)"/>
+
+    <!-- pageserver fork -->
+    <rect x="560" y="36" width="220" height="250" rx="8" fill="#1F2731" stroke="#7BA3C9"/>
+    <text x="670" y="62" text-anchor="middle" font-size="13" font-weight="600" fill="#7BA3C9">Pageserver — forked</text>
+    <rect x="580" y="76" width="180" height="26" rx="4" fill="#232B34"/>
+    <text x="670" y="93" text-anchor="middle" font-size="10" fill="#E6E1D7">WAL ingest</text>
+    <line x1="670" y1="102" x2="670" y2="114" stroke="#5A6570" stroke-width="1.5" marker-end="url(#ah-g)"/>
+    <rect x="580" y="118" width="180" height="40" rx="4" fill="#2A2620" stroke="#E2A65B"/>
+    <text x="670" y="135" text-anchor="middle" font-size="10" fill="#E2A65B">compaction + transcoder</text>
+    <text x="670" y="151" text-anchor="middle" font-size="9" fill="#8A939F">rows → Parquet · MVCC kept</text>
+    <line x1="670" y1="158" x2="670" y2="170" stroke="#5A6570" stroke-width="1.5" marker-end="url(#ah-g)"/>
+    <rect x="580" y="174" width="180" height="40" rx="4" fill="#232B34" stroke="#2A333D" stroke-dasharray="4 4"/>
+    <text x="670" y="191" text-anchor="middle" font-size="10" fill="#8A939F">page cache — ephemeral</text>
+    <text x="670" y="207" text-anchor="middle" font-size="9" fill="#8A939F">rebuilt on demand</text>
+    <text x="670" y="252" text-anchor="middle" font-size="9.5" fill="#8A939F">serves GetPage@LSN</text>
+
+    <!-- W4 -->
+    <text x="805" y="80" text-anchor="middle" font-size="9" fill="#52B9A5">W④</text>
+    <text x="805" y="92" text-anchor="middle" font-size="9" fill="#8A939F">Parquet</text>
+    <line x1="784" y1="100" x2="826" y2="100" stroke="#52B9A5" stroke-width="1.5" marker-end="url(#ah-t)"/>
+
+    <!-- S3 canonical -->
+    <rect x="830" y="36" width="156" height="180" rx="8" fill="#1F2731" stroke="#52B9A5"/>
+    <text x="908" y="64" text-anchor="middle" font-size="13" font-weight="600" fill="#52B9A5">Delta / Parquet</text>
+    <text x="908" y="82" text-anchor="middle" font-size="10" fill="#8A939F">canonical storage</text>
+    <rect x="856" y="98" width="104" height="20" rx="10" fill="none" stroke="#3A5F56"/>
+    <text x="908" y="112" text-anchor="middle" font-size="9.5" fill="#52B9A5">the only copy ①</text>
+    <text x="908" y="146" text-anchor="middle" font-size="9.5" fill="#8A939F">MVCC row versions</text>
+    <text x="908" y="162" text-anchor="middle" font-size="9.5" fill="#8A939F">retained for PITR</text>
+
+    <!-- R4 reverse path -->
+    <path d="M 900 220 L 900 244 L 784 244" fill="none" stroke="#52B9A5" stroke-width="1.5"
+          stroke-dasharray="5 5" marker-end="url(#ah-t)"/>
+    <text x="845" y="236" text-anchor="middle" font-size="9" fill="#52B9A5">R④</text>
+
+    <!-- R2 GetPage return -->
+    <path d="M 560 266 L 285 266 L 285 172" fill="none" stroke="#7BA3C9" stroke-width="1.5"
+          stroke-dasharray="5 5" marker-end="url(#ah-s)"/>
+    <text x="296" y="284" font-size="9" fill="#7BA3C9">R② GetPage@LSN — OLTP reads on cache miss</text>
+
+    <!-- analytics -->
+    <rect x="830" y="330" width="156" height="90" rx="8" fill="#1F2731" stroke="#2A333D"/>
+    <text x="908" y="364" text-anchor="middle" font-size="12.5" font-weight="600" fill="#E6E1D7">Analytics</text>
+    <text x="908" y="382" text-anchor="middle" font-size="10" fill="#8A939F">DuckDB · Spark</text>
+    <line x1="908" y1="326" x2="908" y2="220" stroke="#52B9A5" stroke-width="1.5" marker-end="url(#ah-t)"/>
+    <text x="898" y="262" text-anchor="end" font-size="9.5" fill="#52B9A5">R③ scan Parquet</text>
+    <text x="898" y="276" text-anchor="end" font-size="9.5" fill="#8A939F">LSN-exact freshness</text>
+
+    <!-- R5 tail -->
+    <path d="M 670 290 L 670 375 L 826 375" fill="none" stroke="#52B9A5" stroke-width="1.5"
+          stroke-dasharray="5 5" marker-end="url(#ah-t)"/>
+    <text x="676" y="367" font-size="9" fill="#52B9A5">R⑤ fresh tail @ LSN</text>
+
+    <text x="500" y="450" text-anchor="middle" font-size="9.5" fill="#8A939F">R④ — cold read: page-cache miss → rebuild the exact 8KB page from Parquet + WAL tail — the research-grade reverse path</text>
+  </svg>
+  </div>
+
+  <div class="pcgrid">
+    <div class="pc pro">
+      <h3>You get</h3>
+      <ul>
+        <li><strong>One copy</strong> — columnar is the source of truth; storage cost halves, views can't diverge</li>
+        <li><strong>Exact freshness for free</strong> — analytics pin an LSN and merge the unmaterialized tail from the pageserver (R⑤), zero Postgres involvement</li>
+        <li><strong>Transcoding is amortized</strong> — it rides compaction work the storage layer already does</li>
+        <li><strong>Everything from M0–M5 carries over</strong> — catalog tracking, visibility, TOAST, type fidelity are the same logic, relocated</li>
+      </ul>
+    </div>
+    <div class="pc con">
+      <h3>Missing / costs</h3>
+      <ul>
+        <li><strong>Pageserver fork</strong> — a rebase treadmill against fast-moving Neon internals, forever</li>
+        <li><strong>The reverse path</strong> — rebuilding byte-addressed pages (indexes point at exact block/offset) is the research-grade problem; nobody outside Databricks has shipped it</li>
+        <li><strong>Cold OLTP reads pay for it</strong> — a cache miss costs Parquet→page reconstruction (R④); needs an aggressive cache hierarchy to hide</li>
+        <li><strong>Shared failure domain</strong> — a transcoder bug now sits in the OLTP read path, not beside it</li>
+        <li><strong>Branching, PITR, GC all rework</strong> — Neon's copy-on-write branches must map onto Delta snapshots</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================= summary -->
+<section>
+  <p class="stage-eyebrow" style="color:var(--muted)">at a glance</p>
+  <h2>What changes at each stage</h2>
+  <div class="tablecard">
+  <table>
+    <thead>
+      <tr><th></th><th>M0–M4 — the product</th><th>M5 — future work</th><th>v2 — research</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Write commit ack</td><td>local WAL fsync</td><td>safekeeper quorum</td><td>safekeeper quorum</td></tr>
+      <tr><td>WAL source for transcoding</td><td>walsender on compute</td><td>safekeeper stream</td><td>pageserver ingest</td></tr>
+      <tr><td>OLTP read path</td><td>buffer pool → local heap</td><td>buffer pool → GetPage@LSN</td><td class="t-hot">…→ rebuild from Parquet on cold miss</td></tr>
+      <tr><td>Analytical freshness</td><td class="t-good">LSN-exact with M4 tail merge (lag until then)</td><td>same, via tail merge</td><td class="t-good">LSN-exact, native</td></tr>
+      <tr><td>Load on Postgres</td><td class="t-hot">one walsender</td><td class="t-good">zero</td><td class="t-good">zero</td></tr>
+      <tr><td>Copies of table data</td><td>2 — heap + Parquet</td><td>2 — layers + Parquet</td><td class="t-good">1 — Parquet only</td></tr>
+      <tr><td>Neon fork needed</td><td class="t-good">no — any Postgres</td><td class="t-good">no — external subscriber</td><td class="t-hot">yes — compaction + read path</td></tr>
+      <tr><td>Who wants it</td><td class="t-good">anyone with Postgres + S3 + Spark/DuckDB</td><td>platform teams running Neon</td><td>whoever forks the pageserver</td></tr>
+      <tr><td>Status</td><td class="t-good">M0 shipped &amp; verified; M1–M4 roadmap</td><td>future work</td><td>research-grade</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<footer>
+  open-ltap · <a href="https://github.com/zemin-piao/open-ltap">github.com/zemin-piao/open-ltap</a> · M0 verified 2026-07-02
+</footer>
+</div>
