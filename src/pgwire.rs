@@ -1,0 +1,250 @@
+//! Minimal Postgres frontend-protocol client for *physical* streaming
+//! replication. Deliberately tiny: trust auth only (dev), simple queries,
+//! CopyBoth streaming. This is the piece that later gets a second
+//! implementation speaking the Neon safekeeper protocol.
+
+use anyhow::{Context, Result, bail};
+use bytes::{Buf, BufMut, BytesMut};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+/// Microseconds between the unix epoch and Postgres' 2000-01-01 epoch.
+const PG_EPOCH_OFFSET_US: i64 = 946_684_800_000_000;
+
+pub fn fmt_lsn(lsn: u64) -> String {
+    format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF)
+}
+
+pub fn parse_lsn(s: &str) -> Result<u64> {
+    let (hi, lo) = s.split_once('/').context("bad LSN format")?;
+    Ok((u64::from_str_radix(hi, 16)? << 32) | u64::from_str_radix(lo, 16)?)
+}
+
+fn now_pg_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64 - PG_EPOCH_OFFSET_US)
+        .unwrap_or(0)
+}
+
+pub struct XLogData {
+    pub start_lsn: u64,
+    pub wal_end: u64,
+    pub data: BytesMut,
+}
+
+pub enum ReplMsg {
+    XLogData(XLogData),
+    Keepalive { wal_end: u64, reply_requested: bool },
+}
+
+pub struct ReplConn {
+    stream: TcpStream,
+    buf: BytesMut,
+}
+
+impl ReplConn {
+    pub async fn connect(host: &str, port: u16, user: &str) -> Result<Self> {
+        let stream = TcpStream::connect((host, port))
+            .await
+            .with_context(|| format!("connecting to {host}:{port}"))?;
+        let mut conn = ReplConn { stream, buf: BytesMut::with_capacity(64 * 1024) };
+        conn.send_startup(user).await?;
+        conn.await_ready().await?;
+        Ok(conn)
+    }
+
+    async fn send_startup(&mut self, user: &str) -> Result<()> {
+        let mut body = BytesMut::new();
+        body.put_u32(196608); // protocol 3.0
+        for (k, v) in [("user", user), ("replication", "true")] {
+            body.put_slice(k.as_bytes());
+            body.put_u8(0);
+            body.put_slice(v.as_bytes());
+            body.put_u8(0);
+        }
+        body.put_u8(0);
+        let mut msg = BytesMut::new();
+        msg.put_u32(body.len() as u32 + 4);
+        msg.extend_from_slice(&body);
+        self.stream.write_all(&msg).await?;
+        Ok(())
+    }
+
+    async fn await_ready(&mut self) -> Result<()> {
+        loop {
+            let (tag, mut payload) = self.read_msg().await?;
+            match tag {
+                b'R' => {
+                    let code = payload.get_u32();
+                    if code != 0 {
+                        bail!(
+                            "server requires auth method {code}; dev setup expects \
+                             `host replication ... trust` in pg_hba.conf"
+                        );
+                    }
+                }
+                b'S' | b'K' | b'N' => {} // ParameterStatus / BackendKeyData / Notice
+                b'Z' => return Ok(()),
+                b'E' => bail!("server error: {}", parse_error(&payload)),
+                t => bail!("unexpected message '{}' during startup", t as char),
+            }
+        }
+    }
+
+    /// IDENTIFY_SYSTEM -> (timeline_id, current flush LSN)
+    pub async fn identify_system(&mut self) -> Result<(u32, u64)> {
+        self.send_query("IDENTIFY_SYSTEM").await?;
+        let mut row: Option<Vec<Option<String>>> = None;
+        loop {
+            let (tag, payload) = self.read_msg().await?;
+            match tag {
+                b'T' | b'C' => {}
+                b'D' => row = Some(parse_data_row(payload)?),
+                b'Z' => break,
+                b'E' => bail!("IDENTIFY_SYSTEM failed: {}", parse_error(&payload)),
+                t => bail!("unexpected message '{}' in IDENTIFY_SYSTEM", t as char),
+            }
+        }
+        let row = row.context("IDENTIFY_SYSTEM returned no row")?;
+        let tli: u32 = row
+            .get(1)
+            .and_then(|f| f.as_deref())
+            .context("missing timeline")?
+            .parse()?;
+        let lsn = parse_lsn(row.get(2).and_then(|f| f.as_deref()).context("missing xlogpos")?)?;
+        Ok((tli, lsn))
+    }
+
+    /// Enter CopyBoth mode streaming physical WAL from `start_lsn`
+    /// (must be a WAL page boundary for the reader to sync).
+    pub async fn start_replication(&mut self, start_lsn: u64, timeline: u32) -> Result<()> {
+        let q = format!("START_REPLICATION PHYSICAL {} TIMELINE {}", fmt_lsn(start_lsn), timeline);
+        self.send_query(&q).await?;
+        loop {
+            let (tag, payload) = self.read_msg().await?;
+            match tag {
+                b'W' => return Ok(()), // CopyBothResponse
+                b'N' => {}
+                b'E' => bail!("START_REPLICATION failed: {}", parse_error(&payload)),
+                t => bail!("unexpected message '{}' starting replication", t as char),
+            }
+        }
+    }
+
+    pub async fn next_msg(&mut self) -> Result<ReplMsg> {
+        loop {
+            let (tag, mut payload) = self.read_msg().await?;
+            match tag {
+                b'd' => {
+                    let kind = payload.get_u8();
+                    match kind {
+                        b'w' => {
+                            let start_lsn = payload.get_u64();
+                            let wal_end = payload.get_u64();
+                            let _send_time = payload.get_i64();
+                            return Ok(ReplMsg::XLogData(XLogData { start_lsn, wal_end, data: payload }));
+                        }
+                        b'k' => {
+                            let wal_end = payload.get_u64();
+                            let _send_time = payload.get_i64();
+                            let reply_requested = payload.get_u8() != 0;
+                            return Ok(ReplMsg::Keepalive { wal_end, reply_requested });
+                        }
+                        k => bail!("unexpected CopyData kind '{}'", k as char),
+                    }
+                }
+                b'N' => {}
+                b'E' => bail!("stream error: {}", parse_error(&payload)),
+                b'c' | b'Z' => bail!("server ended the replication stream"),
+                t => bail!("unexpected message '{}' in stream", t as char),
+            }
+        }
+    }
+
+    /// Standby status update: tells the server what we've received/flushed.
+    pub async fn send_status(&mut self, flushed_lsn: u64) -> Result<()> {
+        let mut msg = BytesMut::new();
+        msg.put_u8(b'd');
+        msg.put_u32(4 + 1 + 8 * 3 + 8 + 1);
+        msg.put_u8(b'r');
+        msg.put_u64(flushed_lsn); // received
+        msg.put_u64(flushed_lsn); // flushed
+        msg.put_u64(flushed_lsn); // applied
+        msg.put_i64(now_pg_micros());
+        msg.put_u8(0); // no reply requested
+        self.stream.write_all(&msg).await?;
+        Ok(())
+    }
+
+    async fn send_query(&mut self, q: &str) -> Result<()> {
+        let mut msg = BytesMut::new();
+        msg.put_u8(b'Q');
+        msg.put_u32(4 + q.len() as u32 + 1);
+        msg.put_slice(q.as_bytes());
+        msg.put_u8(0);
+        self.stream.write_all(&msg).await?;
+        Ok(())
+    }
+
+    async fn read_msg(&mut self) -> Result<(u8, BytesMut)> {
+        loop {
+            if self.buf.len() >= 5 {
+                let tag = self.buf[0];
+                let len =
+                    u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
+                if len < 4 {
+                    bail!("corrupt message length");
+                }
+                if self.buf.len() >= 1 + len {
+                    self.buf.advance(5);
+                    let payload = self.buf.split_to(len - 4);
+                    return Ok((tag, payload));
+                }
+            }
+            let n = self.stream.read_buf(&mut self.buf).await?;
+            if n == 0 {
+                bail!("connection closed by server");
+            }
+        }
+    }
+}
+
+fn parse_data_row(mut payload: BytesMut) -> Result<Vec<Option<String>>> {
+    let n = payload.get_u16();
+    let mut fields = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let len = payload.get_i32();
+        if len < 0 {
+            fields.push(None);
+        } else {
+            let bytes = payload.split_to(len as usize);
+            fields.push(Some(String::from_utf8_lossy(&bytes).into_owned()));
+        }
+    }
+    Ok(fields)
+}
+
+fn parse_error(payload: &[u8]) -> String {
+    // ErrorResponse: sequence of (field_type: u8, cstring) pairs, 0-terminated.
+    let mut msg = String::new();
+    let mut i = 0;
+    while i < payload.len() && payload[i] != 0 {
+        let field = payload[i];
+        i += 1;
+        let start = i;
+        while i < payload.len() && payload[i] != 0 {
+            i += 1;
+        }
+        let val = String::from_utf8_lossy(&payload[start..i]);
+        if field == b'M' || field == b'S' {
+            if !msg.is_empty() {
+                msg.push_str(": ");
+            }
+            msg.push_str(&val);
+        }
+        i += 1;
+    }
+    if msg.is_empty() { "unknown error".into() } else { msg }
+}
