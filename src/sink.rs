@@ -14,8 +14,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use deltalake::arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
-use deltalake::arrow::datatypes::{DataType as ArrowType, Field, Schema as ArrowSchema};
+use deltalake::arrow::array::{
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
+    Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+};
+use deltalake::arrow::datatypes::{DataType as ArrowType, Field, Schema as ArrowSchema, TimeUnit};
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::DeltaTable;
 use deltalake::kernel::transaction::{CommitBuilder, CommitProperties};
@@ -52,18 +55,32 @@ pub struct DeltaSink {
 fn delta_type(ty: PgType) -> DeltaType {
     DeltaType::Primitive(match ty {
         PgType::Bool => PrimitiveType::Boolean,
+        PgType::Int2 => PrimitiveType::Short,
         PgType::Int4 => PrimitiveType::Integer,
         PgType::Int8 => PrimitiveType::Long,
-        PgType::Text => PrimitiveType::String,
+        PgType::Float4 => PrimitiveType::Float,
+        PgType::Float8 => PrimitiveType::Double,
+        PgType::Text | PgType::Uuid => PrimitiveType::String,
+        PgType::Bytea => PrimitiveType::Binary,
+        PgType::Date => PrimitiveType::Date,
+        PgType::Timestamp => PrimitiveType::TimestampNtz,
+        PgType::TimestampTz => PrimitiveType::Timestamp,
     })
 }
 
 fn arrow_type(ty: PgType) -> ArrowType {
     match ty {
         PgType::Bool => ArrowType::Boolean,
+        PgType::Int2 => ArrowType::Int16,
         PgType::Int4 => ArrowType::Int32,
         PgType::Int8 => ArrowType::Int64,
-        PgType::Text => ArrowType::Utf8,
+        PgType::Float4 => ArrowType::Float32,
+        PgType::Float8 => ArrowType::Float64,
+        PgType::Text | PgType::Uuid => ArrowType::Utf8,
+        PgType::Bytea => ArrowType::Binary,
+        PgType::Date => ArrowType::Date32,
+        PgType::Timestamp => ArrowType::Timestamp(TimeUnit::Microsecond, None),
+        PgType::TimestampTz => ArrowType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
     }
 }
 
@@ -140,41 +157,36 @@ impl DeltaSink {
         commit_lsn: u64,
         restart_lsn: u64,
     ) -> Result<i64> {
+        // Pull column j out of every row as Option<T>, tolerating type
+        // mismatches as NULL (decode already validated shapes).
+        macro_rules! col_vals {
+            ($j:expr, $variant:ident) => {
+                rows.iter()
+                    .map(|(_, r)| match &r[$j] {
+                        Some(Value::$variant(v)) => Some(v.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+        }
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.cols.len() + 1);
         for (j, col) in self.cols.iter().enumerate() {
             let array: ArrayRef = match col.ty {
-                PgType::Bool => Arc::new(BooleanArray::from(
-                    rows.iter()
-                        .map(|(_, r)| match &r[j] {
-                            Some(Value::Bool(b)) => Some(*b),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
+                PgType::Bool => Arc::new(BooleanArray::from(col_vals!(j, Bool))),
+                PgType::Int2 => Arc::new(Int16Array::from(col_vals!(j, I16))),
+                PgType::Int4 => Arc::new(Int32Array::from(col_vals!(j, I32))),
+                PgType::Int8 => Arc::new(Int64Array::from(col_vals!(j, I64))),
+                PgType::Float4 => Arc::new(Float32Array::from(col_vals!(j, F32))),
+                PgType::Float8 => Arc::new(Float64Array::from(col_vals!(j, F64))),
+                PgType::Text | PgType::Uuid => Arc::new(StringArray::from(col_vals!(j, Text))),
+                PgType::Bytea => Arc::new(BinaryArray::from(
+                    col_vals!(j, Bytes).iter().map(|o| o.as_deref()).collect::<Vec<_>>(),
                 )),
-                PgType::Int4 => Arc::new(Int32Array::from(
-                    rows.iter()
-                        .map(|(_, r)| match &r[j] {
-                            Some(Value::I32(v)) => Some(*v),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
-                )),
-                PgType::Int8 => Arc::new(Int64Array::from(
-                    rows.iter()
-                        .map(|(_, r)| match &r[j] {
-                            Some(Value::I64(v)) => Some(*v),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
-                )),
-                PgType::Text => Arc::new(StringArray::from(
-                    rows.iter()
-                        .map(|(_, r)| match &r[j] {
-                            Some(Value::Text(s)) => Some(s.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
-                )),
+                PgType::Date => Arc::new(Date32Array::from(col_vals!(j, I32))),
+                PgType::Timestamp => Arc::new(TimestampMicrosecondArray::from(col_vals!(j, I64))),
+                PgType::TimestampTz => Arc::new(
+                    TimestampMicrosecondArray::from(col_vals!(j, I64)).with_timezone("UTC"),
+                ),
             };
             arrays.push(array);
         }

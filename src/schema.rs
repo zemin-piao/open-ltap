@@ -12,19 +12,40 @@ use tokio_postgres::NoTls;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgType {
     Bool,
+    Int2,
     Int4,
     Int8,
+    Float4,
+    Float8,
     Text,
+    Bytea,
+    Uuid,
+    /// i32 days since 2000-01-01 on the wire; shifted to unix epoch on decode.
+    Date,
+    /// i64 microseconds since 2000-01-01; shifted to unix epoch on decode.
+    Timestamp,
+    TimestampTz,
 }
 
 impl PgType {
     fn from_oid(oid: u32) -> Result<Self> {
         Ok(match oid {
             16 => PgType::Bool,
+            21 => PgType::Int2,
             23 => PgType::Int4,
             20 => PgType::Int8,
-            25 | 1043 => PgType::Text, // text, varchar
-            other => bail!("unsupported column type oid {other} (M0 supports bool/int4/int8/text/varchar)"),
+            700 => PgType::Float4,
+            701 => PgType::Float8,
+            25 | 1043 | 1042 => PgType::Text, // text, varchar, bpchar
+            17 => PgType::Bytea,
+            2950 => PgType::Uuid,
+            1082 => PgType::Date,
+            1114 => PgType::Timestamp,
+            1184 => PgType::TimestampTz,
+            other => bail!(
+                "unsupported column type oid {other} \
+                 (supported: bool/int2/int4/int8/float4/float8/text/varchar/bytea/uuid/date/timestamp/timestamptz)"
+            ),
         })
     }
 }

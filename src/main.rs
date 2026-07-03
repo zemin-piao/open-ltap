@@ -295,9 +295,18 @@ fn handle_record(
         }
         rmgr::XACT => {
             let op = record.info & heap::XLOG_XACT_OPMASK;
+            let subxids = match op {
+                heap::XLOG_XACT_COMMIT | heap::XLOG_XACT_ABORT => {
+                    heap::parse_xact_subxacts(record.info, &record.main_data).unwrap_or_else(|e| {
+                        tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to parse subxact list: {e}");
+                        Vec::new()
+                    })
+                }
+                _ => Vec::new(),
+            };
             match op {
                 heap::XLOG_XACT_COMMIT => {
-                    let rows = txbuf.commit(record.xid);
+                    let rows = txbuf.commit(record.xid, &subxids);
                     if rows.is_empty() {
                         return Ok(());
                     }
@@ -319,7 +328,7 @@ fn handle_record(
                     pending.push_commit(lsn, rows);
                 }
                 heap::XLOG_XACT_ABORT => {
-                    let dropped = txbuf.abort(record.xid);
+                    let dropped = txbuf.abort(record.xid, &subxids);
                     if dropped > 0 {
                         tracing::info!(xid = record.xid, rows = dropped, "aborted transaction discarded");
                     }

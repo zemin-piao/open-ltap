@@ -25,6 +25,41 @@ pub const XLOG_HEAP2_MULTI_INSERT: u8 = 0x50;
 pub const XLOG_XACT_OPMASK: u8 = 0x70;
 pub const XLOG_XACT_COMMIT: u8 = 0x00;
 pub const XLOG_XACT_ABORT: u8 = 0x20;
+pub const XLOG_XACT_HAS_INFO: u8 = 0x80;
+
+const XACT_XINFO_HAS_DBINFO: u32 = 1 << 0;
+const XACT_XINFO_HAS_SUBXACTS: u32 = 1 << 1;
+
+/// Extract the subtransaction xid list from a commit or abort record's main
+/// data (xactdesc.c ParseCommitRecord/ParseAbortRecord — both start with
+/// xact_time, then xinfo if XLOG_XACT_HAS_INFO, then dbinfo, then subxacts;
+/// later chunks don't matter here).
+pub fn parse_xact_subxacts(info: u8, main_data: &[u8]) -> Result<Vec<u32>> {
+    if info & XLOG_XACT_HAS_INFO == 0 {
+        return Ok(Vec::new());
+    }
+    let mut off = 8; // xact_time (TimestampTz)
+    let xinfo_bytes = main_data
+        .get(off..off + 4)
+        .ok_or_else(|| anyhow::anyhow!("xact record too short for xinfo"))?;
+    let xinfo = u32::from_le_bytes(xinfo_bytes.try_into().unwrap());
+    off += 4;
+    if xinfo & XACT_XINFO_HAS_DBINFO != 0 {
+        off += 8; // dbId + tsId
+    }
+    if xinfo & XACT_XINFO_HAS_SUBXACTS == 0 {
+        return Ok(Vec::new());
+    }
+    let n_bytes = main_data
+        .get(off..off + 4)
+        .ok_or_else(|| anyhow::anyhow!("xact record too short for nsubxacts"))?;
+    let n = i32::from_le_bytes(n_bytes.try_into().unwrap()) as usize;
+    off += 4;
+    let xids_bytes = main_data
+        .get(off..off + 4 * n)
+        .ok_or_else(|| anyhow::anyhow!("xact record too short for {n} subxacts"))?;
+    Ok(xids_bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+}
 
 // htup_details.h
 const HEAP_HASNULL: u16 = 0x0001;
@@ -33,10 +68,19 @@ const SIZEOF_HEAP_TUPLE_HEADER: usize = 23;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Bool(bool),
+    I16(i16),
     I32(i32),
     I64(i64),
+    F32(f32),
+    F64(f64),
     Text(String),
+    Bytes(Vec<u8>),
 }
+
+/// Days between 1970-01-01 (unix/Delta epoch) and 2000-01-01 (PG epoch).
+const PG_EPOCH_DAYS: i32 = 10_957;
+/// Microseconds between the same two epochs.
+const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 
 pub type Row = Vec<Option<Value>>;
 
@@ -133,25 +177,67 @@ fn align_to(off: usize, align: usize) -> usize {
     (off + align - 1) & !(align - 1)
 }
 
+fn fixed<const N: usize>(data: &[u8], off: usize, align: usize, what: &str) -> Result<([u8; N], usize)> {
+    let off = align_to(off, align);
+    let s = data
+        .get(off..off + N)
+        .ok_or_else(|| anyhow::anyhow!("truncated {what}"))?;
+    Ok((s.try_into().unwrap(), off + N))
+}
+
 fn decode_value(data: &[u8], off: usize, ty: PgType) -> Result<(Value, usize)> {
     match ty {
         PgType::Bool => {
             let b = *data.get(off).ok_or_else(|| anyhow::anyhow!("truncated bool"))?;
             Ok((Value::Bool(b != 0), off + 1))
         }
+        PgType::Int2 => {
+            let (s, off) = fixed::<2>(data, off, 2, "int2")?;
+            Ok((Value::I16(i16::from_le_bytes(s)), off))
+        }
         PgType::Int4 => {
-            let off = align_to(off, 4);
-            let s = data.get(off..off + 4).ok_or_else(|| anyhow::anyhow!("truncated int4"))?;
-            Ok((Value::I32(i32::from_le_bytes(s.try_into().unwrap())), off + 4))
+            let (s, off) = fixed::<4>(data, off, 4, "int4")?;
+            Ok((Value::I32(i32::from_le_bytes(s)), off))
         }
         PgType::Int8 => {
-            let off = align_to(off, 8);
-            let s = data.get(off..off + 8).ok_or_else(|| anyhow::anyhow!("truncated int8"))?;
-            Ok((Value::I64(i64::from_le_bytes(s.try_into().unwrap())), off + 8))
+            let (s, off) = fixed::<8>(data, off, 8, "int8")?;
+            Ok((Value::I64(i64::from_le_bytes(s)), off))
+        }
+        PgType::Float4 => {
+            let (s, off) = fixed::<4>(data, off, 4, "float4")?;
+            Ok((Value::F32(f32::from_le_bytes(s)), off))
+        }
+        PgType::Float8 => {
+            let (s, off) = fixed::<8>(data, off, 8, "float8")?;
+            Ok((Value::F64(f64::from_le_bytes(s)), off))
+        }
+        PgType::Date => {
+            let (s, off) = fixed::<4>(data, off, 4, "date")?;
+            Ok((Value::I32(i32::from_le_bytes(s) + PG_EPOCH_DAYS), off))
+        }
+        PgType::Timestamp | PgType::TimestampTz => {
+            let (s, off) = fixed::<8>(data, off, 8, "timestamp")?;
+            Ok((Value::I64(i64::from_le_bytes(s) + PG_EPOCH_MICROS), off))
+        }
+        PgType::Uuid => {
+            // typalign 'c': no padding, 16 raw bytes.
+            let s = data
+                .get(off..off + 16)
+                .ok_or_else(|| anyhow::anyhow!("truncated uuid"))?;
+            let hex: String = s.iter().map(|b| format!("{b:02x}")).collect();
+            let text = format!(
+                "{}-{}-{}-{}-{}",
+                &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]
+            );
+            Ok((Value::Text(text), off + 16))
         }
         PgType::Text => {
             let (bytes, new_off) = decode_varlena(data, off)?;
             Ok((Value::Text(String::from_utf8_lossy(&bytes).into_owned()), new_off))
+        }
+        PgType::Bytea => {
+            let (bytes, new_off) = decode_varlena(data, off)?;
+            Ok((Value::Bytes(bytes), new_off))
         }
     }
 }
@@ -182,14 +268,79 @@ fn decode_varlena(data: &[u8], mut off: usize) -> Result<(Vec<u8>, usize)> {
     let hdr_bytes =
         data.get(off..off + 4).ok_or_else(|| anyhow::anyhow!("truncated varlena header"))?;
     let hdr = u32::from_le_bytes(hdr_bytes.try_into().unwrap());
-    if hdr & 0x03 == 0x02 {
-        bail!("inline-compressed value: unsupported until the TOAST milestone");
-    }
     let total = (hdr >> 2) as usize; // includes the 4 header bytes
     if total < 4 {
         bail!("corrupt varlena length {total}");
     }
+    if hdr & 0x03 == 0x02 {
+        // VARATT_4B_C: inline-compressed. After va_header comes va_tcinfo:
+        // raw (uncompressed) size in the low 30 bits, method in the top 2.
+        let tcinfo_bytes = data
+            .get(off + 4..off + 8)
+            .ok_or_else(|| anyhow::anyhow!("truncated compressed varlena"))?;
+        let tcinfo = u32::from_le_bytes(tcinfo_bytes.try_into().unwrap());
+        let rawsize = (tcinfo & 0x3FFF_FFFF) as usize;
+        let method = tcinfo >> 30;
+        let payload = data
+            .get(off + 8..off + total)
+            .ok_or_else(|| anyhow::anyhow!("truncated compressed varlena body"))?;
+        let out = match method {
+            0 => pglz_decompress(payload, rawsize)?,
+            1 => bail!("lz4-compressed value: set default_toast_compression=pglz (lz4 unsupported)"),
+            m => bail!("unknown toast compression method {m}"),
+        };
+        return Ok((out, off + total));
+    }
     let payload =
         data.get(off + 4..off + total).ok_or_else(|| anyhow::anyhow!("truncated varlena body"))?;
     Ok((payload.to_vec(), off + total))
+}
+
+/// PGLZ decompression (common/pg_lzcompress.c): a control byte governs the
+/// next 8 items; bit set = back-reference (offset 1..4095, length 3..273,
+/// may overlap its own output), bit clear = literal byte.
+fn pglz_decompress(src: &[u8], rawsize: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(rawsize);
+    let mut sp = 0usize;
+    while sp < src.len() && out.len() < rawsize {
+        let ctrl = src[sp];
+        sp += 1;
+        for bit in 0..8 {
+            if sp >= src.len() || out.len() >= rawsize {
+                break;
+            }
+            if ctrl & (1 << bit) != 0 {
+                if sp + 1 >= src.len() {
+                    bail!("pglz: truncated back-reference");
+                }
+                let mut len = ((src[sp] & 0x0F) as usize) + 3;
+                let off = (((src[sp] & 0xF0) as usize) << 4) | src[sp + 1] as usize;
+                sp += 2;
+                if len == 18 {
+                    if sp >= src.len() {
+                        bail!("pglz: truncated extended length");
+                    }
+                    len += src[sp] as usize;
+                    sp += 1;
+                }
+                if off == 0 || off > out.len() {
+                    bail!("pglz: bad back-reference offset {off} at output {}", out.len());
+                }
+                for _ in 0..len {
+                    if out.len() >= rawsize {
+                        break; // PG bounds the copy by the destination, not len
+                    }
+                    let b = out[out.len() - off];
+                    out.push(b);
+                }
+            } else {
+                out.push(src[sp]);
+                sp += 1;
+            }
+        }
+    }
+    if out.len() != rawsize {
+        bail!("pglz: expected {rawsize} bytes, produced {}", out.len());
+    }
+    Ok(out)
 }

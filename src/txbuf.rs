@@ -33,14 +33,26 @@ impl TxBuffer {
             .extend(rows);
     }
 
-    /// Transaction committed: hand back its rows for the sink.
-    pub fn commit(&mut self, xid: u32) -> Vec<Row> {
-        self.open.remove(&xid).map(|t| t.rows).unwrap_or_default()
+    /// Transaction committed: hand back its rows (and those of its committed
+    /// subtransactions, which buffer under their own xids) for the sink.
+    pub fn commit(&mut self, xid: u32, subxids: &[u32]) -> Vec<Row> {
+        let mut rows = self.open.remove(&xid).map(|t| t.rows).unwrap_or_default();
+        for sub in subxids {
+            if let Some(t) = self.open.remove(sub) {
+                rows.extend(t.rows);
+            }
+        }
+        rows
     }
 
-    /// Transaction aborted: its rows must never reach the lake.
-    pub fn abort(&mut self, xid: u32) -> usize {
-        self.open.remove(&xid).map(|t| t.rows.len()).unwrap_or(0)
+    /// Transaction aborted (or savepoint rolled back — the abort record's
+    /// xid is then the subxact's): its rows must never reach the lake.
+    pub fn abort(&mut self, xid: u32, subxids: &[u32]) -> usize {
+        let mut n = self.open.remove(&xid).map(|t| t.rows.len()).unwrap_or(0);
+        for sub in subxids {
+            n += self.open.remove(sub).map(|t| t.rows.len()).unwrap_or(0);
+        }
+        n
     }
 
     /// First-change LSN of the oldest open transaction — the earliest point
