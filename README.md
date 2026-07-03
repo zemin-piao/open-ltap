@@ -26,13 +26,22 @@ cutover ceremony, small-file cleanup, per-table config) just to get operational 
 flow through each stage, with pros/cons of the product track (M0–M4) vs. the storage-level
 future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
 
-## Status: M0 — working vertical slice
+## Status: M1 done, M2 in progress
 
-- ✅ Hand-rolled replication wire client (trust auth, dev)
-- ✅ WAL record reassembly (page headers, records spanning pages, padding/alignment)
-- ✅ Heap `INSERT` decode: bool / int4 / int8 / text / varchar, NULL bitmaps, short + 4-byte varlenas
-- ✅ Transactional correctness: rows buffered per xid; only `COMMIT`ed transactions reach the lake, aborts are discarded
-- ✅ Delta append per committed transaction with `_ltap_lsn` (commit LSN) column
+- ✅ Hand-rolled replication wire client (trust auth, dev) + physical replication slot, so
+  Postgres retains WAL while the transcoder is down
+- ✅ WAL record reassembly (page headers, records and headers spanning pages, padding/alignment)
+  with CRC32C validation of every record
+- ✅ Heap `INSERT` + `COPY` (multi-insert) decode: bool / int2 / int4 / int8 / float4 / float8 /
+  text / varchar / bpchar / bytea / uuid / date / timestamp / timestamptz; NULL bitmaps; short,
+  4-byte, and pglz-compressed varlenas
+- ✅ Transactional correctness: rows buffered per xid; only `COMMIT`ed transactions reach the
+  lake; aborts and `ROLLBACK TO SAVEPOINT` subtransactions are discarded
+- ✅ **Exactly-once across restarts (kill -9 included)**: every Delta commit carries the commit-LSN
+  watermark and a WAL restart position as Delta `txn` actions; on startup the transcoder resumes
+  from the restart LSN and dedupes replayed transactions
+- ✅ Batched sink: many Postgres commits per Delta commit (`LTAP_FLUSH_ROWS` / `LTAP_FLUSH_MS`),
+  each row still tagged with its own commit LSN in `_ltap_lsn`
 - ✅ Readable from DuckDB (`delta_scan`) — see `scripts/verify.sh`
 
 ## Quickstart
@@ -48,17 +57,19 @@ docker exec -i openltap-pg psql -U postgres -d app \
 ./scripts/verify.sh t         # read the Delta table back via DuckDB
 ```
 
-Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLE`,
-`DELTA_URI`, `S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY`.
+Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLE`, `LTAP_SLOT`,
+`LTAP_FLUSH_ROWS`/`LTAP_FLUSH_MS` (batching), `DELTA_URI`,
+`S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY`.
 
 ## Roadmap — the product is M0 → M4, against vanilla Postgres
 
 - **M0 (done)** — single table, INSERT-only, fixed schema, any Postgres
-- **M1** — restart/resume from a persisted LSN (stored in Delta commit metadata → exactly-once),
-  multi-insert (`COPY`), CRC validation, batching (currently one Delta commit per Postgres
-  commit = small files)
-- **M2** — UPDATE/DELETE via Delta deletion vectors; subtransactions; TOAST + inline-compressed
-  values; full-page-image handling (`full_page_writes=on`); initial snapshot + consistent cutover
+- **M1 (done)** — restart/resume from LSN watermarks persisted as Delta `txn` actions
+  (exactly-once), replication slot, multi-insert (`COPY`), CRC32C validation, batched Delta
+  commits
+- **M2 (in progress)** — done: subtransactions, inline-compressed (pglz) values, wider type
+  matrix. Remaining: UPDATE/DELETE via Delta deletion vectors; TOAST (out-of-line) values;
+  full-page-image handling (`full_page_writes=on`); initial snapshot + consistent cutover
 - **M3** — WAL-driven catalog tracking (DDL mid-stream, relfilenode changes, add/drop column),
   multiple tables, every-table-automatically
 - **M4** — the LTAP freshness read path: serve "Delta up to LSN X + in-memory tail" merged reads,
@@ -82,12 +93,15 @@ database platform to adopt.
   also watching for Databricks' announced open-source **LTAP Writer Library**, which would cover
   a large piece of this.
 
-## Known M0 limitations (deliberate)
+## Known limitations (deliberate, tracked by milestone)
 
+- UPDATE/DELETE not yet transcoded (M2: Delta deletion vectors); INSERT/COPY only
 - Dev containers run `full_page_writes=off` so WAL carries plain tuple data;
-  FPI-carried tuples are skipped with a warning
+  FPI-carried tuples are skipped with a warning (M2)
+- TOAST (out-of-line) and lz4-compressed values unsupported (M2); pglz-inline works
 - Schema read once at startup; DDL during streaming will corrupt decoding (M3)
-- No CRC validation, no restart position (starts at current flush LSN)
+- An idle stream doesn't advance the slot's restart position, so a quiet database
+  retains WAL until the next transcoded commit
 - Little-endian hosts only (WAL is server-native-endian)
 - Single writer per Delta table (`AWS_S3_ALLOW_UNSAFE_RENAME`)
 

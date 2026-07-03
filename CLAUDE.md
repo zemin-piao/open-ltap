@@ -23,18 +23,24 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 - **M0 shipped & verified 2026-07-02**: single table, INSERT-only, fixed schema; end-to-end
   Postgres → Delta on MinIO → DuckDB `delta_scan` confirmed (NULLs, multi-row atomic commits,
   rollback exclusion, varlena decoding).
-- Working tree = `main`, pushed. GitHub Pages serves `/docs` on `main`.
+- **M1 shipped & verified 2026-07-03**: replication slot; exactly-once resume (commit + restart
+  LSN persisted as Delta `txn` actions, app ids `open-ltap.commit`/`open-ltap.restart`; restart =
+  oldest in-flight txn's first record; standby status reports Delta-durable restart as flushed);
+  CRC32C; COPY (`XLOG_HEAP2_MULTI_INSERT`); batched Delta commits (`LTAP_FLUSH_ROWS`/`LTAP_FLUSH_MS`).
+  Verified: kill -9 with txn in flight across the crash, 50k-row bulk over a segment boundary,
+  zero dupes.
+- **M2 partial shipped & verified 2026-07-03**: subtransactions (subxact lists parsed from
+  commit/abort main data, savepoint rollback excluded); pglz inline-compressed varlenas;
+  types now bool/int2/int4/int8/float4/float8/text/varchar/bpchar/bytea/uuid/date/timestamp/
+  timestamptz (timestamp→Delta timestampNtz, timestamptz→timestamp UTC, uuid→string).
+- Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
 
-- **M1 (next up)** — resume from persisted LSN (store last-committed LSN in Delta commit
-  metadata → exactly-once across restarts); `XLOG_HEAP2_MULTI_INSERT` (COPY); CRC32C validation
-  of records; batch commits (currently 1 Delta commit per PG commit = small files). Also: create
-  a replication slot so PG retains WAL while we're down.
-- **M2** — UPDATE/DELETE via Delta deletion vectors (needs pre-image strategy: PK from new tuple
-  for updates; for deletes keep a ctid→key map or read old page); subtransactions (parse subxact
-  lists from commit records); TOAST + inline-compressed varlenas; FPI handling
-  (`full_page_writes=on`); initial snapshot + consistent cutover.
+- **M2 (remaining)** — UPDATE/DELETE via Delta deletion vectors (needs pre-image strategy: PK
+  from new tuple for updates; for deletes keep a ctid→key map or read old page); TOAST
+  (out-of-line) values; lz4 inline compression; FPI handling (`full_page_writes=on`);
+  initial snapshot + consistent cutover.
 - **M3** — WAL-driven catalog tracking (DDL mid-stream, relfilenode changes from
   TRUNCATE/rewrite, add/drop column), multi-table, every-table-automatically.
 - **M4** — freshness read path: serve "Delta ≤ LSN + in-memory tail" merged reads
@@ -44,16 +50,20 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 
 ## Code map (src/)
 
-- `pgwire.rs` — hand-rolled replication wire client (frontend protocol v3, trust auth only).
-  Deliberately not libpq/tokio-postgres: official crate lacks replication mode, and the M5
-  safekeeper source will reuse this shape.
+- `pgwire.rs` — hand-rolled replication wire client (frontend protocol v3, trust auth only):
+  IDENTIFY_SYSTEM, CREATE_REPLICATION_SLOT (idempotent), START_REPLICATION SLOT, standby status
+  (flushed = Delta-durable restart LSN). Deliberately not libpq/tokio-postgres: official crate
+  lacks replication mode, and the M5 safekeeper source will reuse this shape.
 - `wal/mod.rs` — `WalReader` (record reassembly across 8KB pages: page headers, continuation,
-  alignment, padding) + `parse_record` (block headers per xlogrecord.h).
-- `wal/heap.rs` — heap INSERT tuple decode (null bitmap, alignment, varlena per varatt.h);
-  bool/int4/int8/text/varchar only so far. XACT opcodes also here.
+  alignment, padding; record *headers* may split across pages — only xl_tot_len is guaranteed
+  on-page) + `parse_record` (block headers per xlogrecord.h, CRC32C validated).
+- `wal/heap.rs` — heap INSERT + multi-insert (COPY) tuple decode (null bitmap, alignment,
+  varlena per varatt.h incl. pglz); XACT opcodes + subxact list parsing also here.
 - `schema.rs` — "catalog lite": table descriptor via SQL at startup (M3 replaces this).
-- `txbuf.rs` — per-xid row buffering; commit ships, abort discards.
-- `sink.rs` — Delta create-if-absent + `RecordBatchWriter` append; `_ltap_lsn` column = commit LSN.
+- `txbuf.rs` — per-xid row buffering (+ first-record LSN per xid for the restart watermark);
+  commit merges subxacts and ships, abort discards.
+- `sink.rs` — Delta create-if-absent + `RecordBatchWriter` write, committed via `CommitBuilder`
+  with `open-ltap.commit`/`open-ltap.restart` txn actions; `_ltap_lsn` column = row's commit LSN.
   Uses `AWS_S3_ALLOW_UNSAFE_RENAME` (single writer, dev).
 - Little-endian only, 64-bit maxalign assumed. Postgres 17 WAL format.
 
