@@ -13,7 +13,8 @@ use bytes::{Buf, BytesMut};
 
 pub const XLOG_PAGE_SIZE: u64 = 8192;
 pub const WAL_SEG_SIZE: u64 = 16 * 1024 * 1024;
-/// SizeOfXLogRecord: the fixed record header. Never split across pages.
+/// SizeOfXLogRecord: the fixed record header. May be split across pages;
+/// only its first field (xl_tot_len) is guaranteed on-page.
 const REC_HDR_LEN: usize = 24;
 const SHORT_PAGE_HDR: usize = 24; // SizeOfXLogShortPHD (maxaligned)
 const LONG_PAGE_HDR: usize = 40; // SizeOfXLogLongPHD (segment start)
@@ -127,14 +128,11 @@ impl WalReader {
                 continue;
             }
 
-            // New record. The header is never split: if the page can't fit
-            // one, the rest of the page is padding.
-            if page_rem < REC_HDR_LEN {
-                let take = page_rem.min(avail);
-                self.pending.advance(take);
-                self.pos += take as u64;
-                continue;
-            }
+            // New record. Records start maxaligned, so the remaining space on
+            // the page is a multiple of 8 and xl_tot_len (the first 4 bytes)
+            // is always on this page — but the REST of the 24-byte header may
+            // continue on the next page (xlogreader.c). The `need` path below
+            // reassembles header and body alike across pages.
             if avail < 4 {
                 break;
             }
@@ -241,7 +239,14 @@ pub fn parse_record(rec: &[u8]) -> Result<Record> {
     let xid = u32::from_le_bytes(rec[4..8].try_into().unwrap());
     let info = rec[16];
     let rmid = rec[17];
-    // TODO(M1): validate xl_crc (crc32c over record).
+
+    // xl_crc covers the record body, then the header up to (not including)
+    // the crc field itself (xloginsert.c).
+    let stored_crc = u32::from_le_bytes(rec[20..24].try_into().unwrap());
+    let crc = crc32c::crc32c_append(crc32c::crc32c(&rec[REC_HDR_LEN..]), &rec[0..20]);
+    if crc != stored_crc {
+        bail!("CRC mismatch: computed {crc:08x}, stored {stored_crc:08x}");
+    }
 
     let mut c = Cursor { buf: rec, off: REC_HDR_LEN };
 

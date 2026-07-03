@@ -117,10 +117,44 @@ impl ReplConn {
         Ok((tli, lsn))
     }
 
+    /// Create a physical replication slot so the server retains WAL while
+    /// we're down. Idempotent: an already-existing slot (42710) is fine.
+    pub async fn create_slot(&mut self, name: &str) -> Result<bool> {
+        let q = format!("CREATE_REPLICATION_SLOT {name} PHYSICAL RESERVE_WAL");
+        self.send_query(&q).await?;
+        let mut created = true;
+        let mut err: Option<String> = None;
+        loop {
+            let (tag, payload) = self.read_msg().await?;
+            match tag {
+                b'T' | b'D' | b'C' | b'N' => {}
+                b'E' => {
+                    let (code, msg) = parse_error_fields(&payload);
+                    if code.as_deref() == Some("42710") {
+                        created = false; // duplicate_object: slot already exists
+                    } else {
+                        err = Some(msg);
+                    }
+                }
+                b'Z' => break,
+                t => bail!("unexpected message '{}' in CREATE_REPLICATION_SLOT", t as char),
+            }
+        }
+        if let Some(e) = err {
+            bail!("CREATE_REPLICATION_SLOT failed: {e}");
+        }
+        Ok(created)
+    }
+
     /// Enter CopyBoth mode streaming physical WAL from `start_lsn`
     /// (must be a WAL page boundary for the reader to sync).
-    pub async fn start_replication(&mut self, start_lsn: u64, timeline: u32) -> Result<()> {
-        let q = format!("START_REPLICATION PHYSICAL {} TIMELINE {}", fmt_lsn(start_lsn), timeline);
+    pub async fn start_replication(&mut self, slot: &str, start_lsn: u64, timeline: u32) -> Result<()> {
+        let q = format!(
+            "START_REPLICATION SLOT {} PHYSICAL {} TIMELINE {}",
+            slot,
+            fmt_lsn(start_lsn),
+            timeline
+        );
         self.send_query(&q).await?;
         loop {
             let (tag, payload) = self.read_msg().await?;
@@ -163,15 +197,17 @@ impl ReplConn {
         }
     }
 
-    /// Standby status update: tells the server what we've received/flushed.
-    pub async fn send_status(&mut self, flushed_lsn: u64) -> Result<()> {
+    /// Standby status update. `flushed` is what the slot's restart_lsn tracks:
+    /// report only what is durably in Delta, so the server retains everything
+    /// we might still need to replay after a crash.
+    pub async fn send_status(&mut self, received: u64, flushed: u64) -> Result<()> {
         let mut msg = BytesMut::new();
         msg.put_u8(b'd');
         msg.put_u32(4 + 1 + 8 * 3 + 8 + 1);
         msg.put_u8(b'r');
-        msg.put_u64(flushed_lsn); // received
-        msg.put_u64(flushed_lsn); // flushed
-        msg.put_u64(flushed_lsn); // applied
+        msg.put_u64(received);
+        msg.put_u64(flushed);
+        msg.put_u64(flushed); // applied
         msg.put_i64(now_pg_micros());
         msg.put_u8(0); // no reply requested
         self.stream.write_all(&msg).await?;
@@ -227,8 +263,14 @@ fn parse_data_row(mut payload: BytesMut) -> Result<Vec<Option<String>>> {
 }
 
 fn parse_error(payload: &[u8]) -> String {
-    // ErrorResponse: sequence of (field_type: u8, cstring) pairs, 0-terminated.
+    parse_error_fields(payload).1
+}
+
+/// ErrorResponse: sequence of (field_type: u8, cstring) pairs, 0-terminated.
+/// Returns (sqlstate code, human-readable message).
+fn parse_error_fields(payload: &[u8]) -> (Option<String>, String) {
     let mut msg = String::new();
+    let mut code = None;
     let mut i = 0;
     while i < payload.len() && payload[i] != 0 {
         let field = payload[i];
@@ -238,13 +280,17 @@ fn parse_error(payload: &[u8]) -> String {
             i += 1;
         }
         let val = String::from_utf8_lossy(&payload[start..i]);
-        if field == b'M' || field == b'S' {
-            if !msg.is_empty() {
-                msg.push_str(": ");
+        match field {
+            b'M' | b'S' => {
+                if !msg.is_empty() {
+                    msg.push_str(": ");
+                }
+                msg.push_str(&val);
             }
-            msg.push_str(&val);
+            b'C' => code = Some(val.into_owned()),
+            _ => {}
         }
         i += 1;
     }
-    if msg.is_empty() { "unknown error".into() } else { msg }
+    (code, if msg.is_empty() { "unknown error".into() } else { msg })
 }

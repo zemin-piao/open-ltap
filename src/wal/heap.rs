@@ -19,6 +19,7 @@ pub const XLOG_HEAP_INSERT: u8 = 0x00;
 pub const XLOG_HEAP_DELETE: u8 = 0x10;
 pub const XLOG_HEAP_UPDATE: u8 = 0x20;
 pub const XLOG_HEAP_HOT_UPDATE: u8 = 0x40;
+pub const XLOG_HEAP2_MULTI_INSERT: u8 = 0x50;
 
 // transam/xact.h
 pub const XLOG_XACT_OPMASK: u8 = 0x70;
@@ -47,8 +48,49 @@ pub fn decode_insert_tuple(block_data: &[u8], desc: &TableDesc) -> Result<Row> {
     let t_infomask2 = u16::from_le_bytes(block_data[0..2].try_into().unwrap());
     let t_infomask = u16::from_le_bytes(block_data[2..4].try_into().unwrap());
     let t_hoff = block_data[4] as usize;
-    let tuple = &block_data[5..];
+    decode_tuple_payload(&block_data[5..], t_infomask2, t_infomask, t_hoff, desc)
+}
 
+/// Decode all tuples of a HEAP2 MULTI_INSERT record (COPY, multi-row INSERT).
+/// Block-0 data is a sequence of xl_multi_insert_tuple structs, each
+/// 2-byte-aligned: { datalen: u16, t_infomask2: u16, t_infomask: u16,
+/// t_hoff: u8 } followed by `datalen` bytes of tuple payload. The tuple
+/// count lives in the record's main data (xl_heap_multi_insert).
+pub fn decode_multi_insert(block_data: &[u8], main_data: &[u8], desc: &TableDesc) -> Result<Vec<Row>> {
+    if main_data.len() < 4 {
+        bail!("multi-insert main data too short");
+    }
+    let ntuples = u16::from_le_bytes(main_data[2..4].try_into().unwrap()) as usize;
+
+    let mut rows = Vec::with_capacity(ntuples);
+    let mut off = 0usize;
+    for i in 0..ntuples {
+        off = align_to(off, 2); // SHORTALIGN between tuples (heapam.c)
+        let hdr = block_data
+            .get(off..off + 7)
+            .ok_or_else(|| anyhow::anyhow!("multi-insert truncated at tuple {i}"))?;
+        let datalen = u16::from_le_bytes(hdr[0..2].try_into().unwrap()) as usize;
+        let t_infomask2 = u16::from_le_bytes(hdr[2..4].try_into().unwrap());
+        let t_infomask = u16::from_le_bytes(hdr[4..6].try_into().unwrap());
+        let t_hoff = hdr[6] as usize;
+        let payload = block_data
+            .get(off + 7..off + 7 + datalen)
+            .ok_or_else(|| anyhow::anyhow!("multi-insert tuple {i} data truncated"))?;
+        rows.push(decode_tuple_payload(payload, t_infomask2, t_infomask, t_hoff, desc)?);
+        off += 7 + datalen;
+    }
+    Ok(rows)
+}
+
+/// Decode a tuple payload: null bitmap + padding + attribute data — i.e. the
+/// on-disk tuple minus its fixed 23-byte HeapTupleHeader.
+fn decode_tuple_payload(
+    tuple: &[u8],
+    t_infomask2: u16,
+    t_infomask: u16,
+    t_hoff: usize,
+    desc: &TableDesc,
+) -> Result<Row> {
     let natts = (t_infomask2 & 0x07FF) as usize;
     if natts != desc.cols.len() {
         bail!(
