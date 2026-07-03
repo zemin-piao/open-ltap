@@ -33,14 +33,19 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   commit/abort main data, savepoint rollback excluded); pglz inline-compressed varlenas;
   types now bool/int2/int4/int8/float4/float8/text/varchar/bpchar/bytea/uuid/date/timestamp/
   timestamptz (timestamp→Delta timestampNtz, timestamptz→timestamp UTC, uuid→string).
+- **M2b shipped & verified 2026-07-03**: FPI handling (tuples extracted from full-page images —
+  dev compose now runs `full_page_writes=on`); out-of-line TOAST (chunks buffered per xid,
+  resolved eagerly at pointer decode; pglz-externalized too); resume falls back to the slot's
+  restart_lsn when Delta has no watermark. Verified byte-identical whole-table md5 vs PG.
+- `examples/walscan.rs` — offline WAL reader harness (feeds a raw segment file, compares against
+  `pg_waldump`; supports chunked feeding to simulate streaming). Invaluable for reader bugs.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
 
 - **M2 (remaining)** — UPDATE/DELETE via Delta deletion vectors (needs pre-image strategy: PK
-  from new tuple for updates; for deletes keep a ctid→key map or read old page); TOAST
-  (out-of-line) values; lz4 inline compression; FPI handling (`full_page_writes=on`);
-  initial snapshot + consistent cutover.
+  from new tuple for updates; for deletes keep a ctid→key map or read old page); lz4/zstd
+  decompression; initial snapshot + consistent cutover.
 - **M3** — WAL-driven catalog tracking (DDL mid-stream, relfilenode changes from
   TRUNCATE/rewrite, add/drop column), multi-table, every-table-automatically.
 - **M4** — freshness read path: serve "Delta ≤ LSN + in-memory tail" merged reads
@@ -88,8 +93,12 @@ Git identity for commits: `zemin-piao <pzm6391@gmail.com>`.
 - The stock postgres image's `pg_hba` `host all` line does NOT match replication connections —
   `scripts/dev-init.sh` appends `host replication all all trust` post-start (initdb-mount scripts
   hit a Docker Desktop exec-permission quirk).
-- Dev runs `full_page_writes=off`; with it on, insert records carry FPIs instead of tuple data
-  (decoder skips them with a warning until M2).
+- Dev now runs `full_page_writes=on`; FPI-carried tuples are decoded from the page image.
+  `wal_compression`/`default_toast_compression` must stay off/pglz (no lz4/zstd).
+- WAL record *headers* can split across page boundaries — only xl_tot_len is guaranteed
+  on-page. Never "skip to next page" when a header doesn't fit.
+- Docker Desktop VM clock jumps on Mac sleep can trip `wal_sender_timeout` on idle streams —
+  a dead transcoder after an idle stretch is usually that, not a code bug.
 - Delta has no unsigned types — LSNs stored as `long` (`_ltap_lsn`).
 - `deltalake` API drifts between minor versions; writes go through `RecordBatchWriter`
   (not `DeltaOps.write`, which needs the heavy `datafusion` feature).

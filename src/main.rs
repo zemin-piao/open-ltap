@@ -133,7 +133,10 @@ async fn main() -> Result<()> {
     if conn.create_slot(&cfg.slot).await? {
         tracing::info!(slot = %cfg.slot, "created replication slot");
     }
-    let resume_from = resume.restart_lsn.unwrap_or(flush_lsn);
+    // Resume priority: Delta watermark > pre-existing slot's retained WAL
+    // (Delta empty but the slot pinned history — don't drop it) > "now".
+    let slot_restart = conn.slot_restart_lsn(&cfg.slot).await?;
+    let resume_from = resume.restart_lsn.or(slot_restart).unwrap_or(flush_lsn);
     let start_lsn = resume_from & !(wal::XLOG_PAGE_SIZE - 1); // page-align: reader syncs via page header
     tracing::info!(
         timeline,
@@ -147,6 +150,7 @@ async fn main() -> Result<()> {
 
     let mut reader = wal::WalReader::new(start_lsn);
     let mut txbuf = txbuf::TxBuffer::default();
+    let mut toast = heap::ToastCache::default();
     let mut pending = PendingBatch::default();
     let mut last_recv_lsn = start_lsn;
     // What the slot may prune up to: only advances when Delta is durable.
@@ -163,7 +167,7 @@ async fn main() -> Result<()> {
                 pgwire::ReplMsg::XLogData(x) => {
                     last_recv_lsn = x.wal_end.max(last_recv_lsn);
                     for (lsn, rec) in reader.feed(x.start_lsn, &x.data)? {
-                        handle_record(lsn, &rec, &desc, &mut txbuf, &mut pending, dedupe_below, &mut warned_unsupported)?;
+                        handle_record(lsn, &rec, &desc, &mut txbuf, &mut toast, &mut pending, dedupe_below, &mut warned_unsupported)?;
                     }
                     if pending.rows.len() >= cfg.flush_rows {
                         flush(&mut sink, &mut pending, &txbuf, &mut persisted_restart).await?;
@@ -227,6 +231,7 @@ fn handle_record(
     rec: &[u8],
     desc: &schema::TableDesc,
     txbuf: &mut txbuf::TxBuffer,
+    toast: &mut heap::ToastCache,
     pending: &mut PendingBatch,
     dedupe_below: u64,
     warned_unsupported: &mut bool,
@@ -245,23 +250,51 @@ fn handle_record(
             let Some(block0) = record.blocks.iter().find(|b| b.id == 0) else {
                 return Ok(());
             };
-            if block0.rel.db != desc.db_oid || block0.rel.rel != desc.rel_node {
+            if block0.rel.db != desc.db_oid {
+                return Ok(());
+            }
+            let is_main = block0.rel.rel == desc.rel_node;
+            let is_toast = desc.toast_rel_node == Some(block0.rel.rel);
+            if !is_main && !is_toast {
                 return Ok(()); // some other relation (indexes, catalogs, other tables)
             }
             match op {
-                heap::XLOG_HEAP_INSERT => {
-                    if block0.data.is_empty() {
-                        // Tuple data can live in the FPI instead; shouldn't
-                        // happen with full_page_writes=off.
-                        tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "insert without tuple data (FPI-only record?) — skipped");
-                        return Ok(());
+                heap::XLOG_HEAP_INSERT if is_toast => {
+                    // A chunk of an out-of-line value; buffer it for the
+                    // pointer tuple that follows in the same transaction.
+                    let chunk = if !block0.data.is_empty() {
+                        heap::decode_toast_chunk_from_wal(&block0.data)
+                    } else if let Some(img) = &block0.image {
+                        img.restore().and_then(|page| {
+                            heap::decode_toast_chunk_from_page(&page, heap::insert_offnum(&record.main_data)?)
+                        })
+                    } else {
+                        Err(anyhow::anyhow!("toast insert with neither data nor image"))
+                    };
+                    match chunk {
+                        Ok((valueid, seq, data)) => toast.add_chunk(record.xid, valueid, seq, data),
+                        Err(e) => tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to decode toast chunk: {e}"),
                     }
-                    match heap::decode_insert_tuple(&block0.data, desc) {
+                }
+                heap::XLOG_HEAP_INSERT => {
+                    let row = if !block0.data.is_empty() {
+                        heap::decode_insert_tuple(&block0.data, desc, toast)
+                    } else if let Some(img) = &block0.image {
+                        // full_page_writes=on: the tuple lives in the image.
+                        img.restore().and_then(|page| {
+                            heap::decode_tuple_from_page(&page, heap::insert_offnum(&record.main_data)?, desc, toast)
+                        })
+                    } else {
+                        Err(anyhow::anyhow!("insert with neither data nor image"))
+                    };
+                    match row {
                         Ok(row) => txbuf.add(record.xid, lsn, row),
                         Err(e) => tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to decode insert: {e}"),
                     }
                 }
-                heap::XLOG_HEAP_DELETE | heap::XLOG_HEAP_UPDATE | heap::XLOG_HEAP_HOT_UPDATE => {
+                heap::XLOG_HEAP_DELETE | heap::XLOG_HEAP_UPDATE | heap::XLOG_HEAP_HOT_UPDATE
+                    if is_main =>
+                {
                     if !*warned_unsupported {
                         *warned_unsupported = true;
                         tracing::warn!(
@@ -284,11 +317,19 @@ fn handle_record(
             if block0.rel.db != desc.db_oid || block0.rel.rel != desc.rel_node {
                 return Ok(());
             }
-            if block0.data.is_empty() {
-                tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "multi-insert without tuple data (FPI-only record?) — skipped");
-                return Ok(());
-            }
-            match heap::decode_multi_insert(&block0.data, &record.main_data, desc) {
+            let rows = if !block0.data.is_empty() {
+                heap::decode_multi_insert(&block0.data, &record.main_data, desc, toast)
+            } else if let Some(img) = &block0.image {
+                img.restore().and_then(|page| {
+                    heap::multi_insert_offsets(&record.main_data, record.info)?
+                        .iter()
+                        .map(|&off| heap::decode_tuple_from_page(&page, off, desc, toast))
+                        .collect()
+                })
+            } else {
+                Err(anyhow::anyhow!("multi-insert with neither data nor image"))
+            };
+            match rows {
                 Ok(rows) => txbuf.add_many(record.xid, lsn, rows),
                 Err(e) => tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to decode multi-insert: {e}"),
             }
@@ -306,6 +347,10 @@ fn handle_record(
             };
             match op {
                 heap::XLOG_XACT_COMMIT => {
+                    toast.gc_xid(record.xid);
+                    for sub in &subxids {
+                        toast.gc_xid(*sub);
+                    }
                     let rows = txbuf.commit(record.xid, &subxids);
                     if rows.is_empty() {
                         return Ok(());
@@ -328,6 +373,10 @@ fn handle_record(
                     pending.push_commit(lsn, rows);
                 }
                 heap::XLOG_XACT_ABORT => {
+                    toast.gc_xid(record.xid);
+                    for sub in &subxids {
+                        toast.gc_xid(*sub);
+                    }
                     let dropped = txbuf.abort(record.xid, &subxids);
                     if dropped > 0 {
                         tracing::info!(xid = record.xid, rows = dropped, "aborted transaction discarded");

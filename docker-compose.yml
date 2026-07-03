@@ -8,10 +8,10 @@ services:
       POSTGRES_DB: app
     command:
       - postgres
-      # Dev-only: avoid full-page images in WAL so the decoder sees plain
-      # tuple records from day one. FPI handling is milestone M2.
+      # Production default: the decoder extracts tuples from full-page
+      # images (M2b). wal_compression off or pglz both work; lz4/zstd don't yet.
       - -c
-      - full_page_writes=off
+      - full_page_writes=on
       - -c
       - wal_level=replica
       - -c

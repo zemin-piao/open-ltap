@@ -9,6 +9,8 @@
 //! varatt.h. Little-endian, 64-bit maxalign assumed (matches the dev
 //! containers and every platform we target).
 
+use std::collections::{BTreeMap, HashMap};
+
 use anyhow::{Result, bail};
 
 use crate::schema::{PgType, TableDesc};
@@ -20,6 +22,8 @@ pub const XLOG_HEAP_DELETE: u8 = 0x10;
 pub const XLOG_HEAP_UPDATE: u8 = 0x20;
 pub const XLOG_HEAP_HOT_UPDATE: u8 = 0x40;
 pub const XLOG_HEAP2_MULTI_INSERT: u8 = 0x50;
+/// Set alongside the opcode when the operation initializes a fresh page.
+pub const XLOG_HEAP_INIT_PAGE: u8 = 0x80;
 
 // transam/xact.h
 pub const XLOG_XACT_OPMASK: u8 = 0x70;
@@ -84,15 +88,79 @@ const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 
 pub type Row = Vec<Option<Value>>;
 
+// ---------------------------------------------------------------------------
+// Extracting tuples out of full-page images (full_page_writes=on)
+// ---------------------------------------------------------------------------
+
+/// Offset number targeted by a heap INSERT (xl_heap_insert main data).
+pub fn insert_offnum(main_data: &[u8]) -> Result<u16> {
+    let s = main_data.get(0..2).ok_or_else(|| anyhow::anyhow!("insert main data too short"))?;
+    Ok(u16::from_le_bytes(s.try_into().unwrap()))
+}
+
+/// Offset numbers targeted by a multi-insert. With INIT_PAGE the offsets
+/// array is elided and the tuples occupy slots 1..=ntuples.
+pub fn multi_insert_offsets(main_data: &[u8], info: u8) -> Result<Vec<u16>> {
+    if main_data.len() < 4 {
+        bail!("multi-insert main data too short");
+    }
+    let ntuples = u16::from_le_bytes(main_data[2..4].try_into().unwrap());
+    if info & XLOG_HEAP_INIT_PAGE != 0 {
+        return Ok((1..=ntuples).collect());
+    }
+    let arr = main_data
+        .get(4..4 + 2 * ntuples as usize)
+        .ok_or_else(|| anyhow::anyhow!("multi-insert offsets truncated"))?;
+    Ok(arr.chunks_exact(2).map(|c| u16::from_le_bytes(c.try_into().unwrap())).collect())
+}
+
+/// Locate a tuple on a restored 8KB heap page via its line pointer and hand
+/// back the same (payload, masks, hoff) shape the WAL-data path produces.
+fn tuple_on_page(page: &[u8], offnum: u16) -> Result<(&[u8], u16, u16, usize)> {
+    if offnum == 0 {
+        bail!("invalid offset number 0");
+    }
+    let idx = 24 + (offnum as usize - 1) * 4; // ItemIdData array after the page header
+    let s = page.get(idx..idx + 4).ok_or_else(|| anyhow::anyhow!("line pointer {offnum} beyond page"))?;
+    let itemid = u32::from_le_bytes(s.try_into().unwrap());
+    let lp_off = (itemid & 0x7FFF) as usize;
+    let lp_flags = (itemid >> 15) & 0x3;
+    let lp_len = (itemid >> 17) as usize;
+    if lp_flags != 1 {
+        bail!("line pointer {offnum} is not LP_NORMAL (flags {lp_flags})");
+    }
+    let tuple = page
+        .get(lp_off..lp_off + lp_len)
+        .ok_or_else(|| anyhow::anyhow!("tuple {offnum} beyond page"))?;
+    if tuple.len() < SIZEOF_HEAP_TUPLE_HEADER {
+        bail!("tuple {offnum} shorter than its header");
+    }
+    let t_infomask2 = u16::from_le_bytes(tuple[18..20].try_into().unwrap());
+    let t_infomask = u16::from_le_bytes(tuple[20..22].try_into().unwrap());
+    let t_hoff = tuple[22] as usize;
+    Ok((&tuple[SIZEOF_HEAP_TUPLE_HEADER..], t_infomask2, t_infomask, t_hoff))
+}
+
+/// Decode one tuple (by offset number) from a restored page image.
+pub fn decode_tuple_from_page(
+    page: &[u8],
+    offnum: u16,
+    desc: &TableDesc,
+    toast: &ToastCache,
+) -> Result<Row> {
+    let (payload, im2, im, hoff) = tuple_on_page(page, offnum)?;
+    decode_tuple_payload(payload, im2, im, hoff, desc, toast)
+}
+
 /// Decode the tuple carried by a heap INSERT record's block-0 data.
-pub fn decode_insert_tuple(block_data: &[u8], desc: &TableDesc) -> Result<Row> {
+pub fn decode_insert_tuple(block_data: &[u8], desc: &TableDesc, toast: &ToastCache) -> Result<Row> {
     if block_data.len() < 5 {
         bail!("heap insert block data too short");
     }
     let t_infomask2 = u16::from_le_bytes(block_data[0..2].try_into().unwrap());
     let t_infomask = u16::from_le_bytes(block_data[2..4].try_into().unwrap());
     let t_hoff = block_data[4] as usize;
-    decode_tuple_payload(&block_data[5..], t_infomask2, t_infomask, t_hoff, desc)
+    decode_tuple_payload(&block_data[5..], t_infomask2, t_infomask, t_hoff, desc, toast)
 }
 
 /// Decode all tuples of a HEAP2 MULTI_INSERT record (COPY, multi-row INSERT).
@@ -100,7 +168,12 @@ pub fn decode_insert_tuple(block_data: &[u8], desc: &TableDesc) -> Result<Row> {
 /// 2-byte-aligned: { datalen: u16, t_infomask2: u16, t_infomask: u16,
 /// t_hoff: u8 } followed by `datalen` bytes of tuple payload. The tuple
 /// count lives in the record's main data (xl_heap_multi_insert).
-pub fn decode_multi_insert(block_data: &[u8], main_data: &[u8], desc: &TableDesc) -> Result<Vec<Row>> {
+pub fn decode_multi_insert(
+    block_data: &[u8],
+    main_data: &[u8],
+    desc: &TableDesc,
+    toast: &ToastCache,
+) -> Result<Vec<Row>> {
     if main_data.len() < 4 {
         bail!("multi-insert main data too short");
     }
@@ -120,7 +193,7 @@ pub fn decode_multi_insert(block_data: &[u8], main_data: &[u8], desc: &TableDesc
         let payload = block_data
             .get(off + 7..off + 7 + datalen)
             .ok_or_else(|| anyhow::anyhow!("multi-insert tuple {i} data truncated"))?;
-        rows.push(decode_tuple_payload(payload, t_infomask2, t_infomask, t_hoff, desc)?);
+        rows.push(decode_tuple_payload(payload, t_infomask2, t_infomask, t_hoff, desc, toast)?);
         off += 7 + datalen;
     }
     Ok(rows)
@@ -134,6 +207,7 @@ fn decode_tuple_payload(
     t_infomask: u16,
     t_hoff: usize,
     desc: &TableDesc,
+    toast: &ToastCache,
 ) -> Result<Row> {
     let natts = (t_infomask2 & 0x07FF) as usize;
     if natts != desc.cols.len() {
@@ -165,7 +239,7 @@ fn decode_tuple_payload(
             row.push(None);
             continue;
         }
-        let (value, new_off) = decode_value(data, off, col.ty)
+        let (value, new_off) = decode_value(data, off, col.ty, toast)
             .map_err(|e| anyhow::anyhow!("column '{}': {}", col.name, e))?;
         row.push(Some(value));
         off = new_off;
@@ -185,7 +259,7 @@ fn fixed<const N: usize>(data: &[u8], off: usize, align: usize, what: &str) -> R
     Ok((s.try_into().unwrap(), off + N))
 }
 
-fn decode_value(data: &[u8], off: usize, ty: PgType) -> Result<(Value, usize)> {
+fn decode_value(data: &[u8], off: usize, ty: PgType, toast: &ToastCache) -> Result<(Value, usize)> {
     match ty {
         PgType::Bool => {
             let b = *data.get(off).ok_or_else(|| anyhow::anyhow!("truncated bool"))?;
@@ -232,11 +306,11 @@ fn decode_value(data: &[u8], off: usize, ty: PgType) -> Result<(Value, usize)> {
             Ok((Value::Text(text), off + 16))
         }
         PgType::Text => {
-            let (bytes, new_off) = decode_varlena(data, off)?;
+            let (bytes, new_off) = decode_varlena(data, off, toast)?;
             Ok((Value::Text(String::from_utf8_lossy(&bytes).into_owned()), new_off))
         }
         PgType::Bytea => {
-            let (bytes, new_off) = decode_varlena(data, off)?;
+            let (bytes, new_off) = decode_varlena(data, off, toast)?;
             Ok((Value::Bytes(bytes), new_off))
         }
     }
@@ -247,10 +321,22 @@ fn decode_value(data: &[u8], off: usize, ty: PgType) -> Result<(Value, usize)> {
 ///  - first byte 0x01 -> external/toast pointer (unsupported here)
 ///  - first byte 0x00 -> alignment padding before a 4-byte header
 ///  - first byte even -> already-aligned 4-byte header
-fn decode_varlena(data: &[u8], mut off: usize) -> Result<(Vec<u8>, usize)> {
+fn decode_varlena(data: &[u8], mut off: usize, toast: &ToastCache) -> Result<(Vec<u8>, usize)> {
     let first = *data.get(off).ok_or_else(|| anyhow::anyhow!("truncated varlena"))?;
     if first == 0x01 {
-        bail!("TOASTed (out-of-line) value: unsupported until the TOAST milestone");
+        // varatt_external pointer: [0x01][vartag][rawsize i32][extinfo u32]
+        // [valueid u32][toastrelid u32], unaligned (18 bytes total).
+        let tag = *data.get(off + 1).ok_or_else(|| anyhow::anyhow!("truncated toast pointer"))?;
+        if tag != 18 {
+            bail!("unsupported varatt tag {tag} (only VARTAG_ONDISK=18)");
+        }
+        let s = data
+            .get(off + 2..off + 18)
+            .ok_or_else(|| anyhow::anyhow!("truncated varatt_external"))?;
+        let rawsize = i32::from_le_bytes(s[0..4].try_into().unwrap());
+        let extinfo = u32::from_le_bytes(s[4..8].try_into().unwrap());
+        let valueid = u32::from_le_bytes(s[8..12].try_into().unwrap());
+        return Ok((toast.resolve(valueid, rawsize, extinfo)?, off + 18));
     }
     if first & 0x01 == 1 {
         // 1-byte header: total length in bytes 1..=126, header included.
@@ -296,10 +382,102 @@ fn decode_varlena(data: &[u8], mut off: usize) -> Result<(Vec<u8>, usize)> {
     Ok((payload.to_vec(), off + total))
 }
 
+// ---------------------------------------------------------------------------
+// TOAST: out-of-line values
+// ---------------------------------------------------------------------------
+
+/// Buffers toast-table chunk inserts until the pointer tuple that references
+/// them is decoded. Chunks for a value are always WAL-logged (same xid)
+/// before the referencing tuple, so resolution at decode time always hits.
+/// Entries are dropped when their owning transaction commits or aborts.
+#[derive(Default)]
+pub struct ToastCache {
+    /// valueid -> (owning xid, chunk_seq -> bytes)
+    vals: HashMap<u32, (u32, BTreeMap<i32, Vec<u8>>)>,
+}
+
+impl ToastCache {
+    pub fn add_chunk(&mut self, xid: u32, valueid: u32, seq: i32, data: Vec<u8>) {
+        self.vals.entry(valueid).or_insert_with(|| (xid, BTreeMap::new())).1.insert(seq, data);
+    }
+
+    /// Drop all chunks owned by a finished (sub)transaction.
+    pub fn gc_xid(&mut self, xid: u32) {
+        self.vals.retain(|_, (owner, _)| *owner != xid);
+    }
+
+    pub fn len(&self) -> usize {
+        self.vals.len()
+    }
+
+    fn resolve(&self, valueid: u32, rawsize: i32, extinfo: u32) -> Result<Vec<u8>> {
+        let (_, chunks) = self
+            .vals
+            .get(&valueid)
+            .ok_or_else(|| anyhow::anyhow!("toast value {valueid} has no buffered chunks"))?;
+        let extsize = (extinfo & 0x3FFF_FFFF) as usize;
+        let mut buf = Vec::with_capacity(extsize);
+        for (i, (seq, chunk)) in chunks.iter().enumerate() {
+            if *seq != i as i32 {
+                bail!("toast value {valueid}: missing chunk {i} (got {seq})");
+            }
+            buf.extend_from_slice(chunk);
+        }
+        if buf.len() != extsize {
+            bail!("toast value {valueid}: {} bytes reassembled, expected {extsize}", buf.len());
+        }
+        let raw_data = rawsize as usize - 4; // va_rawsize includes the 4-byte header
+        if buf.len() == raw_data {
+            return Ok(buf); // stored uncompressed
+        }
+        match extinfo >> 30 {
+            0 => pglz_decompress(&buf, raw_data),
+            1 => bail!("lz4-compressed toast value: set default_toast_compression=pglz"),
+            m => bail!("unknown toast compression method {m}"),
+        }
+    }
+}
+
+/// Decode a toast-table row — (chunk_id oid, chunk_seq int4, chunk_data bytea)
+/// — from a tuple payload (either WAL block data or a page-image tuple).
+pub fn decode_toast_chunk(
+    payload: &[u8],
+    t_hoff: usize,
+) -> Result<(u32, i32, Vec<u8>)> {
+    let bits_len = t_hoff
+        .checked_sub(SIZEOF_HEAP_TUPLE_HEADER)
+        .ok_or_else(|| anyhow::anyhow!("toast tuple t_hoff {t_hoff} < header size"))?;
+    let data = payload
+        .get(bits_len..)
+        .ok_or_else(|| anyhow::anyhow!("toast tuple shorter than its null bitmap"))?;
+    let valueid_bytes = data.get(0..4).ok_or_else(|| anyhow::anyhow!("truncated toast chunk_id"))?;
+    let seq_bytes = data.get(4..8).ok_or_else(|| anyhow::anyhow!("truncated toast chunk_seq"))?;
+    let valueid = u32::from_le_bytes(valueid_bytes.try_into().unwrap());
+    let seq = i32::from_le_bytes(seq_bytes.try_into().unwrap());
+    // chunk_data is a plain (never external/compressed) varlena.
+    let (bytes, _) = decode_varlena(data, 8, &ToastCache::default())?;
+    Ok((valueid, seq, bytes))
+}
+
+/// Decode a toast chunk from an INSERT record's block-0 data.
+pub fn decode_toast_chunk_from_wal(block_data: &[u8]) -> Result<(u32, i32, Vec<u8>)> {
+    if block_data.len() < 5 {
+        bail!("toast insert block data too short");
+    }
+    let t_hoff = block_data[4] as usize;
+    decode_toast_chunk(&block_data[5..], t_hoff)
+}
+
+/// Decode a toast chunk from a restored page image at an offset number.
+pub fn decode_toast_chunk_from_page(page: &[u8], offnum: u16) -> Result<(u32, i32, Vec<u8>)> {
+    let (payload, _, _, t_hoff) = tuple_on_page(page, offnum)?;
+    decode_toast_chunk(payload, t_hoff)
+}
+
 /// PGLZ decompression (common/pg_lzcompress.c): a control byte governs the
 /// next 8 items; bit set = back-reference (offset 1..4095, length 3..273,
 /// may overlap its own output), bit clear = literal byte.
-fn pglz_decompress(src: &[u8], rawsize: usize) -> Result<Vec<u8>> {
+pub fn pglz_decompress(src: &[u8], rawsize: usize) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(rawsize);
     let mut sp = 0usize;
     while sp < src.len() && out.len() < rawsize {

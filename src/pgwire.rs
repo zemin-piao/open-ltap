@@ -146,6 +146,27 @@ impl ReplConn {
         Ok(created)
     }
 
+    /// Where an existing slot retains WAL from (READ_REPLICATION_SLOT, PG15+).
+    pub async fn slot_restart_lsn(&mut self, name: &str) -> Result<Option<u64>> {
+        self.send_query(&format!("READ_REPLICATION_SLOT {name}")).await?;
+        let mut row: Option<Vec<Option<String>>> = None;
+        loop {
+            let (tag, payload) = self.read_msg().await?;
+            match tag {
+                b'T' | b'C' | b'N' => {}
+                b'D' => row = Some(parse_data_row(payload)?),
+                b'Z' => break,
+                b'E' => bail!("READ_REPLICATION_SLOT failed: {}", parse_error(&payload)),
+                t => bail!("unexpected message '{}' in READ_REPLICATION_SLOT", t as char),
+            }
+        }
+        // Columns: slot_type, restart_lsn, restart_tli (all NULL if slot is unused).
+        Ok(match row.and_then(|r| r.into_iter().nth(1).flatten()) {
+            Some(lsn) => Some(parse_lsn(&lsn)?),
+            None => None,
+        })
+    }
+
     /// Enter CopyBoth mode streaming physical WAL from `start_lsn`
     /// (must be a WAL page boundary for the reader to sync).
     pub async fn start_replication(&mut self, slot: &str, start_lsn: u64, timeline: u32) -> Result<()> {

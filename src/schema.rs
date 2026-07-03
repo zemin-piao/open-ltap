@@ -61,6 +61,8 @@ pub struct TableDesc {
     pub name: String,
     pub db_oid: u32,
     pub rel_node: u32,
+    /// relfilenode of the table's toast relation, if it has one.
+    pub toast_rel_node: Option<u32>,
     pub cols: Vec<Col>,
 }
 
@@ -73,9 +75,11 @@ pub async fn discover(conninfo: &str, table: &str) -> Result<TableDesc> {
     let row = client
         .query_opt(
             "SELECT c.relfilenode,
-                    (SELECT d.oid FROM pg_database d WHERE d.datname = current_database())
+                    (SELECT d.oid FROM pg_database d WHERE d.datname = current_database()),
+                    tc.relfilenode
              FROM pg_class c
              JOIN pg_namespace n ON n.oid = c.relnamespace
+             LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid
              WHERE c.relname = $1 AND n.nspname = 'public' AND c.relkind = 'r'",
             &[&table],
         )
@@ -83,6 +87,7 @@ pub async fn discover(conninfo: &str, table: &str) -> Result<TableDesc> {
         .with_context(|| format!("table '{table}' not found"))?;
     let rel_node: u32 = row.get(0);
     let db_oid: u32 = row.get(1);
+    let toast_rel_node: Option<u32> = row.get(2);
 
     let attrs = client
         .query(
@@ -107,5 +112,5 @@ pub async fn discover(conninfo: &str, table: &str) -> Result<TableDesc> {
         bail!("table '{table}' has no columns?");
     }
     handle.abort();
-    Ok(TableDesc { name: table.to_string(), db_oid, rel_node, cols })
+    Ok(TableDesc { name: table.to_string(), db_oid, rel_node, toast_rel_node, cols })
 }

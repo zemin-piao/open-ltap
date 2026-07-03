@@ -12,6 +12,8 @@ use anyhow::{Result, bail};
 use bytes::{Buf, BytesMut};
 
 pub const XLOG_PAGE_SIZE: u64 = 8192;
+/// Heap page size (BLCKSZ); same as the WAL page size on stock builds.
+pub const XLOG_BLCKSZ: usize = 8192;
 pub const WAL_SEG_SIZE: u64 = 16 * 1024 * 1024;
 /// SizeOfXLogRecord: the fixed record header. May be split across pages;
 /// only its first field (xl_tot_len) is guaranteed on-page.
@@ -166,12 +168,45 @@ pub struct RelTag {
     pub rel: u32,
 }
 
+/// A full-page image as carried in the record: possibly compressed, with the
+/// pd_lower..pd_upper "hole" elided. `restore()` yields the 8192-byte page.
+#[derive(Debug)]
+pub struct PageImage {
+    pub data: Vec<u8>,
+    pub hole_offset: u16,
+    pub hole_len: u16,
+    pub bimg_info: u8,
+}
+
+impl PageImage {
+    pub fn restore(&self) -> Result<Vec<u8>> {
+        let body: std::borrow::Cow<[u8]> = match self.bimg_info & BKPIMAGE_COMPRESS_MASK {
+            0 => self.data.as_slice().into(),
+            BKPIMAGE_COMPRESS_PGLZ => {
+                let raw = XLOG_BLCKSZ - self.hole_len as usize;
+                heap::pglz_decompress(&self.data, raw)?.into()
+            }
+            m => bail!("unsupported page-image compression {m:#x} (set wal_compression=off or pglz)"),
+        };
+        let hole_off = self.hole_offset as usize;
+        let hole_len = self.hole_len as usize;
+        if body.len() + hole_len != XLOG_BLCKSZ || hole_off + hole_len > XLOG_BLCKSZ {
+            bail!("bad page image geometry: {} bytes + {hole_len} hole", body.len());
+        }
+        let mut page = Vec::with_capacity(XLOG_BLCKSZ);
+        page.extend_from_slice(&body[..hole_off]);
+        page.resize(hole_off + hole_len, 0);
+        page.extend_from_slice(&body[hole_off..]);
+        Ok(page)
+    }
+}
+
 #[derive(Debug)]
 pub struct BlockRef {
     pub id: u8,
     pub rel: RelTag,
     pub blkno: u32,
-    pub has_image: bool,
+    pub image: Option<PageImage>,
     pub data: Vec<u8>,
 }
 
@@ -196,7 +231,8 @@ const BKPBLOCK_HAS_DATA: u8 = 0x20;
 const BKPBLOCK_SAME_REL: u8 = 0x80;
 // bimg_info bits
 const BKPIMAGE_HAS_HOLE: u8 = 0x01;
-const BKPIMAGE_COMPRESSED_MASK: u8 = 0x04 | 0x08 | 0x10; // pglz | lz4 | zstd
+const BKPIMAGE_COMPRESS_PGLZ: u8 = 0x04;
+const BKPIMAGE_COMPRESS_MASK: u8 = 0x04 | 0x08 | 0x10; // pglz | lz4 | zstd
 
 const XLR_BLOCK_ID_DATA_SHORT: u8 = 255;
 const XLR_BLOCK_ID_DATA_LONG: u8 = 254;
@@ -256,6 +292,9 @@ pub fn parse_record(rec: &[u8]) -> Result<Record> {
         blkno: u32,
         has_image: bool,
         image_len: usize,
+        hole_offset: u16,
+        hole_len: u16,
+        bimg_info: u8,
         has_data: bool,
         data_len: usize,
     }
@@ -287,14 +326,21 @@ pub fn parse_record(rec: &[u8]) -> Result<Record> {
                 let has_image = fork_flags & BKPBLOCK_HAS_IMAGE != 0;
                 let has_data = fork_flags & BKPBLOCK_HAS_DATA != 0;
                 let mut image_len = 0usize;
+                let mut hole_offset = 0u16;
+                let mut hole_len = 0u16;
+                let mut bimg_info = 0u8;
                 if has_image {
                     image_len = c.u16()? as usize;
-                    let _hole_offset = c.u16()?;
-                    let bimg_info = c.u8()?;
-                    if bimg_info & BKPIMAGE_HAS_HOLE != 0
-                        && bimg_info & BKPIMAGE_COMPRESSED_MASK != 0
-                    {
-                        let _hole_len = c.u16()?;
+                    hole_offset = c.u16()?;
+                    bimg_info = c.u8()?;
+                    if bimg_info & BKPIMAGE_HAS_HOLE != 0 {
+                        // Compressed images carry the hole length explicitly;
+                        // raw images imply it from the elided bytes.
+                        hole_len = if bimg_info & BKPIMAGE_COMPRESS_MASK != 0 {
+                            c.u16()?
+                        } else {
+                            (XLOG_BLCKSZ - image_len) as u16
+                        };
                     }
                     datatotal += image_len;
                 }
@@ -308,7 +354,10 @@ pub fn parse_record(rec: &[u8]) -> Result<Record> {
                 if has_data {
                     datatotal += data_len;
                 }
-                hdr_blocks.push(HdrBlock { id, rel, blkno, has_image, image_len, has_data, data_len });
+                hdr_blocks.push(HdrBlock {
+                    id, rel, blkno, has_image, image_len, hole_offset, hole_len, bimg_info,
+                    has_data, data_len,
+                });
             }
             id => bail!("invalid block_id {id} in record"),
         }
@@ -317,11 +366,18 @@ pub fn parse_record(rec: &[u8]) -> Result<Record> {
     // Data section: per block (image then data), then main data.
     let mut blocks = Vec::with_capacity(hdr_blocks.len());
     for hb in hdr_blocks {
-        if hb.has_image {
-            c.take(hb.image_len)?; // full-page image: not needed for decoding
-        }
+        let image = if hb.has_image {
+            Some(PageImage {
+                data: c.take(hb.image_len)?.to_vec(),
+                hole_offset: hb.hole_offset,
+                hole_len: hb.hole_len,
+                bimg_info: hb.bimg_info,
+            })
+        } else {
+            None
+        };
         let data = if hb.has_data { c.take(hb.data_len)?.to_vec() } else { Vec::new() };
-        blocks.push(BlockRef { id: hb.id, rel: hb.rel, blkno: hb.blkno, has_image: hb.has_image, data });
+        blocks.push(BlockRef { id: hb.id, rel: hb.rel, blkno: hb.blkno, image, data });
     }
     let main_data = c.take(main_len)?.to_vec();
 

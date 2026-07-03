@@ -35,6 +35,10 @@ future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
 - ✅ Heap `INSERT` + `COPY` (multi-insert) decode: bool / int2 / int4 / int8 / float4 / float8 /
   text / varchar / bpchar / bytea / uuid / date / timestamp / timestamptz; NULL bitmaps; short,
   4-byte, and pglz-compressed varlenas
+- ✅ **`full_page_writes=on` works** (the production default): tuples are extracted from
+  full-page images via line pointers when WAL carries an FPI instead of tuple data
+- ✅ **TOAST**: out-of-line values reassembled from same-transaction toast-chunk inserts,
+  including compressed-then-externalized values (pglz)
 - ✅ Transactional correctness: rows buffered per xid; only `COMMIT`ed transactions reach the
   lake; aborts and `ROLLBACK TO SAVEPOINT` subtransactions are discarded
 - ✅ **Exactly-once across restarts (kill -9 included)**: every Delta commit carries the commit-LSN
@@ -67,9 +71,9 @@ Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLE`, `LTAP
 - **M1 (done)** — restart/resume from LSN watermarks persisted as Delta `txn` actions
   (exactly-once), replication slot, multi-insert (`COPY`), CRC32C validation, batched Delta
   commits
-- **M2 (in progress)** — done: subtransactions, inline-compressed (pglz) values, wider type
-  matrix. Remaining: UPDATE/DELETE via Delta deletion vectors; TOAST (out-of-line) values;
-  full-page-image handling (`full_page_writes=on`); initial snapshot + consistent cutover
+- **M2 (in progress)** — done: subtransactions, pglz-compressed values (inline and TOAST),
+  out-of-line TOAST, full-page-image handling (`full_page_writes=on`), wider type matrix.
+  Remaining: UPDATE/DELETE via Delta deletion vectors; initial snapshot + consistent cutover
 - **M3** — WAL-driven catalog tracking (DDL mid-stream, relfilenode changes, add/drop column),
   multiple tables, every-table-automatically
 - **M4** — the LTAP freshness read path: serve "Delta up to LSN X + in-memory tail" merged reads,
@@ -96,9 +100,8 @@ database platform to adopt.
 ## Known limitations (deliberate, tracked by milestone)
 
 - UPDATE/DELETE not yet transcoded (M2: Delta deletion vectors); INSERT/COPY only
-- Dev containers run `full_page_writes=off` so WAL carries plain tuple data;
-  FPI-carried tuples are skipped with a warning (M2)
-- TOAST (out-of-line) and lz4-compressed values unsupported (M2); pglz-inline works
+- lz4/zstd compression unsupported (`wal_compression` and `default_toast_compression`
+  must be `off`/`pglz`)
 - Schema read once at startup; DDL during streaming will corrupt decoding (M3)
 - An idle stream doesn't advance the slot's restart position, so a quiet database
   retains WAL until the next transcoded commit
