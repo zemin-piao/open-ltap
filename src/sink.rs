@@ -31,7 +31,11 @@ use deltalake::arrow::datatypes::{DataType as ArrowType, Field, Schema as ArrowS
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::DeltaTable;
 use deltalake::kernel::transaction::{CommitBuilder, CommitProperties};
-use deltalake::kernel::{Action, DataType as DeltaType, PrimitiveType, StructField, Transaction};
+use deltalake::kernel::{
+    Action, DataType as DeltaType, MetadataExt as _, PrimitiveType, StructField, StructType,
+    Transaction,
+};
+use deltalake::writer::WriteMode;
 use deltalake::operations::create::CreateBuilder;
 use deltalake::protocol::{DeltaOperation, SaveMode};
 use deltalake::writer::{DeltaWriter, RecordBatchWriter};
@@ -72,10 +76,55 @@ pub struct ResumeState {
     pub filenode: Option<u32>,
 }
 
+/// A column of the Delta table: its type, and where its values come from in
+/// emitted rows (None = dropped in Postgres, kept in Delta receiving NULLs).
+struct DeltaCol {
+    col: Col,
+    live: Option<usize>,
+}
+
 pub struct DeltaSink {
     table: DeltaTable,
     arrow_schema: Arc<ArrowSchema>,
-    cols: Vec<Col>,
+    delta_cols: Vec<DeltaCol>,
+    /// Delta table schema needs a Metadata action on the next commit.
+    schema_dirty: bool,
+}
+
+/// Reverse of `delta_type`: recover our type tag from an existing Delta
+/// table's schema (uuid round-trips as Text, which is how we store it).
+fn pg_from_delta(dt: &DeltaType) -> Option<PgType> {
+    match dt {
+        DeltaType::Primitive(p) => Some(match p {
+            PrimitiveType::Boolean => PgType::Bool,
+            PrimitiveType::Short => PgType::Int2,
+            PrimitiveType::Integer => PgType::Int4,
+            PrimitiveType::Long => PgType::Int8,
+            PrimitiveType::Float => PgType::Float4,
+            PrimitiveType::Double => PgType::Float8,
+            PrimitiveType::String => PgType::Text,
+            PrimitiveType::Binary => PgType::Bytea,
+            PrimitiveType::Date => PgType::Date,
+            PrimitiveType::TimestampNtz => PgType::Timestamp,
+            PrimitiveType::Timestamp => PgType::TimestampTz,
+            _ => return None,
+        }),
+        _ => None,
+    }
+}
+
+fn build_arrow_schema(delta_cols: &[DeltaCol]) -> Arc<ArrowSchema> {
+    let fields: Vec<Field> = delta_cols
+        .iter()
+        .map(|dc| Field::new(&dc.col.name, arrow_type(dc.col.ty), true))
+        .chain([
+            Field::new(LSN_COL, ArrowType::Int64, false),
+            Field::new(SEQ_COL, ArrowType::Int64, false),
+            Field::new(DELETED_COL, ArrowType::Boolean, false),
+            Field::new(CTID_COL, ArrowType::Int64, false),
+        ])
+        .collect();
+    Arc::new(ArrowSchema::new(fields))
 }
 
 fn delta_type(ty: PgType) -> DeltaType {
@@ -118,19 +167,6 @@ impl DeltaSink {
     ) -> Result<Self> {
         deltalake::aws::register_handlers(None);
 
-        let arrow_fields: Vec<Field> = desc
-            .cols
-            .iter()
-            .map(|c| Field::new(&c.name, arrow_type(c.ty), true))
-            .chain([
-                Field::new(LSN_COL, ArrowType::Int64, false),
-                Field::new(SEQ_COL, ArrowType::Int64, false),
-                Field::new(DELETED_COL, ArrowType::Boolean, false),
-                Field::new(CTID_COL, ArrowType::Int64, false),
-            ])
-            .collect();
-        let arrow_schema = Arc::new(ArrowSchema::new(arrow_fields));
-
         let url = Url::parse(uri).context("parsing Delta table URI")?;
         let table = match deltalake::open_table_with_storage_options(url, storage_options.clone())
             .await
@@ -164,7 +200,74 @@ impl DeltaSink {
             }
         };
 
-        Ok(DeltaSink { table, arrow_schema, cols: desc.cols.clone() })
+        // Delta columns = the table's existing user columns (retired ones —
+        // dropped in PG while we were down — keep receiving NULLs), plus any
+        // live columns Delta doesn't have yet.
+        let mut delta_cols: Vec<DeltaCol> = Vec::new();
+        if let Ok(snapshot) = table.snapshot() {
+            for field in snapshot.schema().fields() {
+                let name = field.name().to_string();
+                if name.starts_with("_ltap_") {
+                    continue;
+                }
+                let ty = pg_from_delta(field.data_type())
+                    .ok_or_else(|| anyhow::anyhow!("Delta column '{name}' has an unsupported type"))?;
+                let live = desc.cols.iter().position(|c| c.name == name);
+                if let Some(li) = live {
+                    if desc.cols[li].ty != ty {
+                        anyhow::bail!(
+                            "column '{name}' changed type (Delta {ty:?} vs PG {:?}) — \
+                             drop the Delta table to re-snapshot",
+                            desc.cols[li].ty
+                        );
+                    }
+                }
+                delta_cols.push(DeltaCol { col: Col { name, ty }, live });
+            }
+        }
+        let mut schema_dirty = false;
+        for (li, c) in desc.cols.iter().enumerate() {
+            if !delta_cols.iter().any(|dc| dc.col.name == c.name) {
+                delta_cols.push(DeltaCol { col: c.clone(), live: Some(li) });
+                schema_dirty = true; // column added while we were down
+            }
+        }
+        let arrow_schema = build_arrow_schema(&delta_cols);
+        Ok(DeltaSink { table, arrow_schema, delta_cols, schema_dirty })
+    }
+
+    /// The open step found live columns Delta didn't know yet (added while
+    /// we were down) — relevant because fast defaults then need a re-snapshot.
+    pub fn schema_added_columns(&self) -> bool {
+        self.schema_dirty
+    }
+
+    /// Adjust to a new live column set (ADD/DROP COLUMN). Additive by name:
+    /// new columns join the Delta schema; columns dropped in PG stay and
+    /// receive NULLs. A type change on an existing name is an error.
+    pub fn evolve(&mut self, cols: &[Col]) -> Result<()> {
+        for dc in &mut self.delta_cols {
+            dc.live = cols.iter().position(|c| c.name == dc.col.name);
+            if let Some(li) = dc.live {
+                if cols[li].ty != dc.col.ty {
+                    anyhow::bail!(
+                        "column '{}' changed type ({:?} -> {:?})",
+                        dc.col.name,
+                        dc.col.ty,
+                        cols[li].ty
+                    );
+                }
+            }
+        }
+        for (li, c) in cols.iter().enumerate() {
+            if !self.delta_cols.iter().any(|dc| dc.col.name == c.name) {
+                tracing::info!(column = %c.name, "adding column to Delta schema");
+                self.delta_cols.push(DeltaCol { col: c.clone(), live: Some(li) });
+                self.schema_dirty = true;
+            }
+        }
+        self.arrow_schema = build_arrow_schema(&self.delta_cols);
+        Ok(())
     }
 
     /// Read back the LSN watermarks persisted with the last Delta commit.
@@ -198,35 +301,43 @@ impl DeltaSink {
         restart_lsn: u64,
         filenode: u32,
     ) -> Result<i64> {
-        // Pull column j out of every row as Option<T>, tolerating type
-        // mismatches as NULL (decode already validated shapes).
+        // Pull a live column out of every row as Option<T>, tolerating rows
+        // shaped under an older schema (short rows read as NULL).
         macro_rules! col_vals {
-            ($j:expr, $variant:ident) => {
+            ($li:expr, $variant:ident) => {
                 rows.iter()
-                    .map(|e| match &e.row[$j] {
+                    .map(|e| match e.row.get($li).and_then(|v| v.as_ref()) {
                         Some(Value::$variant(v)) => Some(v.clone()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
             };
         }
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.cols.len() + 1);
-        for (j, col) in self.cols.iter().enumerate() {
-            let array: ArrayRef = match col.ty {
-                PgType::Bool => Arc::new(BooleanArray::from(col_vals!(j, Bool))),
-                PgType::Int2 => Arc::new(Int16Array::from(col_vals!(j, I16))),
-                PgType::Int4 => Arc::new(Int32Array::from(col_vals!(j, I32))),
-                PgType::Int8 => Arc::new(Int64Array::from(col_vals!(j, I64))),
-                PgType::Float4 => Arc::new(Float32Array::from(col_vals!(j, F32))),
-                PgType::Float8 => Arc::new(Float64Array::from(col_vals!(j, F64))),
-                PgType::Text | PgType::Uuid => Arc::new(StringArray::from(col_vals!(j, Text))),
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.delta_cols.len() + 4);
+        for dc in &self.delta_cols {
+            let Some(li) = dc.live else {
+                // Dropped in Postgres, retained in Delta: NULLs.
+                arrays.push(deltalake::arrow::array::new_null_array(
+                    &arrow_type(dc.col.ty),
+                    rows.len(),
+                ));
+                continue;
+            };
+            let array: ArrayRef = match dc.col.ty {
+                PgType::Bool => Arc::new(BooleanArray::from(col_vals!(li, Bool))),
+                PgType::Int2 => Arc::new(Int16Array::from(col_vals!(li, I16))),
+                PgType::Int4 => Arc::new(Int32Array::from(col_vals!(li, I32))),
+                PgType::Int8 => Arc::new(Int64Array::from(col_vals!(li, I64))),
+                PgType::Float4 => Arc::new(Float32Array::from(col_vals!(li, F32))),
+                PgType::Float8 => Arc::new(Float64Array::from(col_vals!(li, F64))),
+                PgType::Text | PgType::Uuid => Arc::new(StringArray::from(col_vals!(li, Text))),
                 PgType::Bytea => Arc::new(BinaryArray::from(
-                    col_vals!(j, Bytes).iter().map(|o| o.as_deref()).collect::<Vec<_>>(),
+                    col_vals!(li, Bytes).iter().map(|o| o.as_deref()).collect::<Vec<_>>(),
                 )),
-                PgType::Date => Arc::new(Date32Array::from(col_vals!(j, I32))),
-                PgType::Timestamp => Arc::new(TimestampMicrosecondArray::from(col_vals!(j, I64))),
+                PgType::Date => Arc::new(Date32Array::from(col_vals!(li, I32))),
+                PgType::Timestamp => Arc::new(TimestampMicrosecondArray::from(col_vals!(li, I64))),
                 PgType::TimestampTz => Arc::new(
-                    TimestampMicrosecondArray::from(col_vals!(j, I64)).with_timezone("UTC"),
+                    TimestampMicrosecondArray::from(col_vals!(li, I64)).with_timezone("UTC"),
                 ),
             };
             arrays.push(array);
@@ -244,9 +355,42 @@ impl DeltaSink {
             rows.iter().map(|e| txbuf::pack_ctid(e.ctid)).collect::<Vec<_>>(),
         )));
 
+        // Schema evolution must be its own commit BEFORE the data is written:
+        // RecordBatchWriter's MergeSchema places new columns after the meta
+        // columns while the underlying parquet writer keeps the old schema,
+        // silently dropping the new column's values from the first batch.
+        if self.schema_dirty {
+            let fields: Vec<StructField> = self
+                .delta_cols
+                .iter()
+                .map(|dc| StructField::new(dc.col.name.clone(), delta_type(dc.col.ty), true))
+                .chain([
+                    StructField::new(LSN_COL.to_string(), DeltaType::Primitive(PrimitiveType::Long), false),
+                    StructField::new(SEQ_COL.to_string(), DeltaType::Primitive(PrimitiveType::Long), false),
+                    StructField::new(DELETED_COL.to_string(), DeltaType::Primitive(PrimitiveType::Boolean), false),
+                    StructField::new(CTID_COL.to_string(), DeltaType::Primitive(PrimitiveType::Long), false),
+                ])
+                .collect();
+            let schema = StructType::try_new(fields)?;
+            let metadata = self.table.snapshot()?.metadata().clone().with_schema(&schema)?;
+            let operation = DeltaOperation::Write {
+                mode: SaveMode::Append,
+                partition_by: None,
+                predicate: None,
+            };
+            let finalized = CommitBuilder::from(CommitProperties::default())
+                .with_actions(vec![Action::Metadata(metadata)])
+                .build(Some(self.table.snapshot()?), self.table.log_store(), operation)
+                .await
+                .context("committing Delta schema evolution")?;
+            self.table.state = Some(finalized.snapshot());
+            self.schema_dirty = false;
+            tracing::info!("Delta schema evolved (metadata-only commit)");
+        }
+
         let batch = RecordBatch::try_new(self.arrow_schema.clone(), arrays)?;
         let mut writer = RecordBatchWriter::for_table(&self.table)?;
-        writer.write(batch).await?;
+        writer.write_with_mode(batch, WriteMode::MergeSchema).await?;
         let adds: Vec<Action> = writer.flush().await?.into_iter().map(Action::Add).collect();
 
         let props = CommitProperties::default().with_application_transactions(vec![
@@ -310,7 +454,12 @@ impl DeltaSink {
                     }
                     let mut row: Row = Vec::with_capacity(desc.cols.len());
                     for (j, col) in desc.cols.iter().enumerate() {
-                        let arr = batch.column(idx(&col.name)?);
+                        // Column may postdate this parquet file (added later).
+                        let Ok(ci) = batch.schema().index_of(&col.name) else {
+                            row.push(None);
+                            continue;
+                        };
+                        let arr = batch.column(ci);
                         if arr.is_null(i) {
                             row.push(None);
                             continue;

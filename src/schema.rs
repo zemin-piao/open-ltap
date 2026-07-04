@@ -56,6 +56,15 @@ pub struct Col {
     pub ty: PgType,
 }
 
+/// One physical attribute slot as tuples store them — including dropped
+/// columns, which keep their width/alignment so tuples remain walkable.
+#[derive(Debug, Clone)]
+pub enum PhysCol {
+    Live(Col),
+    /// attisdropped: skip `attlen` bytes at `align` (attlen -1 = varlena).
+    Dropped { attlen: i16, align: usize },
+}
+
 #[derive(Debug, Clone)]
 pub struct TableDesc {
     pub name: String,
@@ -63,7 +72,14 @@ pub struct TableDesc {
     pub rel_node: u32,
     /// relfilenode of the table's toast relation, if it has one.
     pub toast_rel_node: Option<u32>,
+    /// Live (non-dropped) columns, in attnum order — the logical row shape.
     pub cols: Vec<Col>,
+    /// All physical attribute slots, in attnum order — the tuple layout.
+    pub phys: Vec<PhysCol>,
+    /// Any live column has a "fast default" (ADD COLUMN ... DEFAULT):
+    /// rows written before it read as NULL from WAL, so the table needs a
+    /// re-snapshot to materialize the defaults.
+    pub has_fast_defaults: bool,
 }
 
 /// Discover every table to transcode. `tables` = None means all ordinary
@@ -107,6 +123,18 @@ pub async fn discover_all(conninfo: &str, tables: Option<&[String]>) -> Result<V
     Ok(descs)
 }
 
+/// relfilenodes of pg_class (1259) and pg_attribute (1249): heap writes to
+/// these are the WAL-visible signature of DDL.
+pub async fn catalog_filenodes(conninfo: &str) -> Result<Vec<u32>> {
+    let (client, conn) = tokio_postgres::connect(conninfo, NoTls).await?;
+    let handle = tokio::spawn(conn);
+    let rows = client
+        .query("SELECT relfilenode FROM pg_class WHERE oid IN (1259, 1249)", &[])
+        .await?;
+    handle.abort();
+    Ok(rows.iter().map(|r| r.get::<_, u32>(0)).collect())
+}
+
 pub async fn discover(conninfo: &str, table: &str) -> Result<TableDesc> {
     let (client, conn) = tokio_postgres::connect(conninfo, NoTls)
         .await
@@ -132,26 +160,46 @@ pub async fn discover(conninfo: &str, table: &str) -> Result<TableDesc> {
 
     let attrs = client
         .query(
-            "SELECT a.attname, a.atttypid
+            "SELECT a.attname, a.atttypid, a.attisdropped, a.attlen::int4, a.attalign::text,
+                    a.atthasmissing
              FROM pg_attribute a
              JOIN pg_class c ON a.attrelid = c.oid
              JOIN pg_namespace n ON n.oid = c.relnamespace
              WHERE c.relname = $1 AND n.nspname = 'public'
-               AND a.attnum > 0 AND NOT a.attisdropped
+               AND a.attnum > 0
              ORDER BY a.attnum",
             &[&table],
         )
         .await?;
 
-    let mut cols = Vec::with_capacity(attrs.len());
+    let mut cols = Vec::new();
+    let mut phys = Vec::with_capacity(attrs.len());
+    let mut has_fast_defaults = false;
     for a in &attrs {
         let name: String = a.get(0);
         let oid: u32 = a.get(1);
-        cols.push(Col { name: name.clone(), ty: PgType::from_oid(oid).with_context(|| format!("column '{name}'"))? });
+        let dropped: bool = a.get(2);
+        let attlen: i32 = a.get(3);
+        let align: &str = a.get(4);
+        let has_missing: bool = a.get(5);
+        let align = match align {
+            "c" => 1,
+            "s" => 2,
+            "i" => 4,
+            _ => 8, // 'd'
+        };
+        if dropped {
+            phys.push(PhysCol::Dropped { attlen: attlen as i16, align });
+            continue;
+        }
+        let col = Col { name: name.clone(), ty: PgType::from_oid(oid).with_context(|| format!("column '{name}'"))? };
+        has_fast_defaults |= has_missing;
+        cols.push(col.clone());
+        phys.push(PhysCol::Live(col));
     }
     if cols.is_empty() {
         bail!("table '{table}' has no columns?");
     }
     handle.abort();
-    Ok(TableDesc { name: table.to_string(), db_oid, rel_node, toast_rel_node, cols })
+    Ok(TableDesc { name: table.to_string(), db_oid, rel_node, toast_rel_node, cols, phys, has_fast_defaults })
 }

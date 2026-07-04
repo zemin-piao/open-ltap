@@ -13,7 +13,21 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Result, bail};
 
-use crate::schema::{PgType, TableDesc};
+use crate::schema::{PgType, PhysCol, TableDesc};
+
+/// A tuple carries more attributes than our descriptor knows: we are
+/// decoding with a stale schema. The engine reacts by re-discovering the
+/// catalog and re-snapshotting the table.
+#[derive(Debug)]
+pub struct SchemaDrift;
+
+impl std::fmt::Display for SchemaDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tuple has more attributes than the descriptor (stale schema)")
+    }
+}
+
+impl std::error::Error for SchemaDrift {}
 
 // heapam_xlog.h: opcode lives in the top bits of xl_info.
 pub const XLOG_HEAP_OPMASK: u8 = 0x70;
@@ -379,13 +393,8 @@ fn decode_tuple_payload(
     old_row: Option<&Row>,
 ) -> Result<(Row, Vec<u8>)> {
     let natts = (t_infomask2 & 0x07FF) as usize;
-    if natts != desc.cols.len() {
-        bail!(
-            "tuple has {} attributes but table '{}' has {} (dropped/added columns are M2)",
-            natts,
-            desc.name,
-            desc.cols.len()
-        );
+    if natts > desc.phys.len() {
+        return Err(anyhow::Error::new(SchemaDrift));
     }
     let has_nulls = t_infomask & HEAP_HASNULL != 0;
 
@@ -401,28 +410,56 @@ fn decode_tuple_payload(
     let bitmap = &tuple[..bits_len];
     let data = &tuple[bits_len..];
 
-    let mut row = Vec::with_capacity(natts);
+    let mut row = Vec::with_capacity(desc.cols.len());
     let mut off = 0usize; // offset into `data`; alignment-correct because t_hoff is maxaligned
-    for (i, col) in desc.cols.iter().enumerate() {
-        if has_nulls && bitmap[i / 8] & (1 << (i % 8)) == 0 {
-            row.push(None);
+    let mut live_i = 0usize;
+    for (i, pc) in desc.phys.iter().enumerate() {
+        // Attributes past the tuple's own count were added after this tuple
+        // was written: NULL (fast defaults are handled by re-snapshotting).
+        if i >= natts {
+            if matches!(pc, PhysCol::Live(_)) {
+                row.push(None);
+                live_i += 1;
+            }
             continue;
         }
-        let (value, new_off) = decode_value(data, off, col.ty, toast)
-            .map_err(|e| anyhow::anyhow!("column '{}': {}", col.name, e))?;
-        match value {
-            Some(v) => row.push(Some(v)),
-            // Unresolved toast pointer: the value is unchanged from the
-            // previous version of this row (UPDATE), so take it from there.
-            None => match old_row.and_then(|r| r.get(i)).and_then(|v| v.clone()) {
-                Some(v) => row.push(Some(v)),
-                None => bail!(
-                    "column '{}': toast value has no buffered chunks and no previous row version",
-                    col.name
-                ),
-            },
+        let is_null = has_nulls && bitmap[i / 8] & (1 << (i % 8)) == 0;
+        match pc {
+            PhysCol::Dropped { attlen, align } => {
+                if !is_null {
+                    // Walk over the dropped column's bytes.
+                    off = if *attlen >= 0 {
+                        align_to(off, *align) + *attlen as usize
+                    } else {
+                        decode_varlena(data, off, toast)?.1
+                    };
+                }
+            }
+            PhysCol::Live(col) => {
+                if is_null {
+                    row.push(None);
+                    live_i += 1;
+                    continue;
+                }
+                let (value, new_off) = decode_value(data, off, col.ty, toast)
+                    .map_err(|e| anyhow::anyhow!("column '{}': {}", col.name, e))?;
+                match value {
+                    Some(v) => row.push(Some(v)),
+                    // Unresolved toast pointer: the value is unchanged from
+                    // the previous version of this row (UPDATE) — take it
+                    // from there.
+                    None => match old_row.and_then(|r| r.get(live_i)).and_then(|v| v.clone()) {
+                        Some(v) => row.push(Some(v)),
+                        None => bail!(
+                            "column '{}': toast value has no buffered chunks and no previous row version",
+                            col.name
+                        ),
+                    },
+                }
+                off = new_off;
+                live_i += 1;
+            }
         }
-        off = new_off;
     }
     Ok((row, data.to_vec()))
 }

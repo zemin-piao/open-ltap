@@ -131,6 +131,9 @@ struct Table {
     /// Commits at or below this are already in this table's Delta log.
     dedupe_below: u64,
     pending: PendingBatch,
+    /// Decode hit a schema-drift or similar inconsistency: converge by
+    /// tombstoning + re-snapshotting at the next catalog check.
+    needs_resnapshot: bool,
 }
 
 /// The whole transcoding state: N tables fed by one WAL stream.
@@ -144,8 +147,10 @@ struct Engine {
     toast: heap::ToastCache,
     /// LSN of the last commit record processed (restart floor when idle).
     last_commit_lsn: u64,
-    /// Transactions that created a new main-fork relfilenode in our DB:
-    /// their commit might be a TRUNCATE / rewrite of a tracked table.
+    /// relfilenodes of pg_class / pg_attribute: writes to them signal DDL.
+    catalog_rels: HashSet<u32>,
+    /// Transactions that created a new main-fork relfilenode in our DB, or
+    /// wrote to the catalogs: their commit might be DDL on a tracked table.
     smgr_suspects: HashSet<u32>,
     /// Set when a suspect committed: (commit LSN) — the main loop runs a
     /// catalog re-check (needs SQL, so it happens outside record handling).
@@ -211,14 +216,26 @@ impl Engine {
         self.toast_rels = self.tables.iter().filter_map(|t| t.desc.toast_rel_node).collect();
     }
 
-    /// A transaction that created relfilenodes committed: re-read the
-    /// catalog and remap any tracked table whose filenode changed
-    /// (TRUNCATE, VACUUM FULL/CLUSTER, ALTER TABLE rewrite).
+    /// A DDL-suspect transaction committed (relfilenode created or catalog
+    /// heap written): re-read the catalog and reconcile every tracked table —
+    /// relfilenode changes remap (TRUNCATE / VACUUM FULL / rewrites), column
+    /// changes evolve the Delta schema in place (ADD/DROP COLUMN).
     async fn remap_check(&mut self, ddl_lsn: u64, conninfo: &str, persisted_restart: &mut u64) -> Result<()> {
+        // Everything pending was decoded and mapped under the old schema:
+        // make it durable before anything changes shape.
+        self.flush_all(persisted_restart).await?;
+        // Catalogs themselves can be rewritten (VACUUM FULL pg_class).
+        if let Ok(nodes) = schema::catalog_filenodes(conninfo).await {
+            self.catalog_rels = nodes.into_iter().collect();
+        }
+
         let mut changed = false;
         for ti in 0..self.tables.len() {
             let name = self.tables[ti].desc.name.clone();
             let old_node = self.tables[ti].desc.rel_node;
+            if old_node == 0 {
+                continue; // already detached
+            }
             let fresh = match schema::discover(conninfo, &name).await {
                 Ok(d) => d,
                 Err(e) => {
@@ -229,35 +246,75 @@ impl Engine {
                     continue;
                 }
             };
-            if fresh.rel_node == old_node {
+            let filenode_changed = fresh.rel_node != old_node;
+            let cols_changed = fresh
+                .cols
+                .iter()
+                .map(|c| (&c.name, c.ty))
+                .ne(self.tables[ti].desc.cols.iter().map(|c| (&c.name, c.ty)));
+            let needs_resnapshot = self.tables[ti].needs_resnapshot
+                || (cols_changed && fresh.cols.len() > self.tables[ti].desc.cols.len() && fresh.has_fast_defaults);
+            if !filenode_changed && !cols_changed && !needs_resnapshot {
+                self.tables[ti].desc = fresh; // phys/dropped bookkeeping may still differ
                 continue;
             }
-            if fresh.cols.iter().map(|c| (&c.name, c.ty)).ne(self.tables[ti].desc.cols.iter().map(|c| (&c.name, c.ty))) {
-                tracing::warn!(
-                    table = %name,
-                    "relfilenode AND schema changed (ALTER TABLE?) — detaching; schema evolution is M3c"
-                );
-                self.tables[ti].desc.rel_node = 0;
-                self.tables[ti].desc.toast_rel_node = None;
-                changed = true;
-                continue;
+            changed = true;
+
+            if cols_changed {
+                if let Err(e) = self.tables[ti].sink.evolve(&fresh.cols) {
+                    tracing::warn!(table = %name, "schema change Delta can't follow — detaching: {e:#}");
+                    self.tables[ti].desc.rel_node = 0;
+                    self.tables[ti].desc.toast_rel_node = None;
+                    continue;
+                }
+                tracing::info!(table = %name, cols = fresh.cols.len(), "column set changed — Delta schema evolved");
+                let old_cols = self.tables[ti].desc.cols.clone();
+                reshape_rows(&mut self.tables[ti].mirror, &old_cols, &fresh.cols);
             }
-            tracing::info!(
-                table = %name,
-                old_filenode = old_node,
-                new_filenode = fresh.rel_node,
-                "relfilenode changed (TRUNCATE / rewrite) — tombstoning and re-snapshotting"
-            );
+
             let restart = self.restart_lsn();
             self.tables[ti].desc = fresh;
-            remap_table(&mut self.tables[ti], ddl_lsn, old_node, restart, conninfo).await?;
-            let _ = &persisted_restart; // slot advances with the next normal flush round
-            changed = true;
+            if filenode_changed || needs_resnapshot {
+                tracing::info!(
+                    table = %name,
+                    old_filenode = old_node,
+                    new_filenode = self.tables[ti].desc.rel_node,
+                    resnapshot = needs_resnapshot,
+                    "remapping (tombstone + re-snapshot)"
+                );
+                // When only the contents are suspect (schema drift / fast
+                // defaults) the filenode is unchanged; stamp the tombstone
+                // flush with filenode 0 so a crash mid-remap is detected at
+                // startup and the remap re-runs.
+                let stamp = if filenode_changed { old_node } else { 0 };
+                remap_table(&mut self.tables[ti], ddl_lsn, stamp, restart, conninfo).await?;
+                self.tables[ti].needs_resnapshot = false;
+            }
         }
         if changed {
             self.rebuild_routing();
         }
         Ok(())
+    }
+
+    /// Log a decode failure; schema drift additionally schedules a catalog
+    /// check + re-snapshot so the table converges instead of diverging.
+    fn note_decode_error(&mut self, ti: usize, lsn: u64, what: &str, e: &anyhow::Error) {
+        if e.downcast_ref::<heap::SchemaDrift>().is_some() {
+            tracing::info!(
+                table = %self.tables[ti].desc.name,
+                lsn = %pgwire::fmt_lsn(lsn),
+                "schema drift detected — scheduling catalog check + re-snapshot"
+            );
+            self.tables[ti].needs_resnapshot = true;
+            self.remap_at.get_or_insert(lsn);
+            return;
+        }
+        if lsn <= self.tables[ti].dedupe_below {
+            tracing::debug!(lsn = %pgwire::fmt_lsn(lsn), "replay: failed to decode {what}: {e}");
+        } else {
+            tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to decode {what}: {e}");
+        }
     }
 
     fn handle_record(&mut self, lsn: u64, rec: &[u8]) -> Result<()> {
@@ -284,6 +341,12 @@ impl Engine {
                 let Some(block0) = record.blocks.iter().find(|b| b.id == 0) else {
                     return Ok(());
                 };
+                if block0.rel.db == self.db_oid && self.catalog_rels.contains(&block0.rel.rel) {
+                    if record.xid != 0 {
+                        self.smgr_suspects.insert(record.xid); // DDL in flight
+                    }
+                    return Ok(());
+                }
                 let main = self.rel_to_table.get(&block0.rel.rel).copied();
                 let is_toast = self.toast_rels.contains(&block0.rel.rel);
                 if main.is_none() && !is_toast {
@@ -329,11 +392,7 @@ impl Engine {
                                 });
                             }
                             (Err(e), _) | (_, Err(e)) => {
-                                if lsn <= self.tables[ti].dedupe_below {
-                                    tracing::debug!(lsn = %pgwire::fmt_lsn(lsn), "replay: failed to decode insert: {e}");
-                                } else {
-                                    tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to decode insert: {e}");
-                                }
+                                self.note_decode_error(ti, lsn, "insert", &e);
                             }
                         }
                     }
@@ -359,11 +418,7 @@ impl Engine {
                     heap::XLOG_HEAP_UPDATE | heap::XLOG_HEAP_HOT_UPDATE if main.is_some() => {
                         let ti = main.unwrap();
                         if let Err(e) = self.handle_update(lsn, &record, block0, ti) {
-                            if lsn <= self.tables[ti].dedupe_below {
-                                tracing::debug!(lsn = %pgwire::fmt_lsn(lsn), "replay: failed to decode update: {e}");
-                            } else {
-                                tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to decode update: {e}");
-                            }
+                            self.note_decode_error(ti, lsn, "update", &e);
                         }
                     }
                     _ => {}
@@ -377,6 +432,12 @@ impl Engine {
                 let Some(block0) = record.blocks.iter().find(|b| b.id == 0) else {
                     return Ok(());
                 };
+                if block0.rel.db == self.db_oid && self.catalog_rels.contains(&block0.rel.rel) {
+                    if record.xid != 0 {
+                        self.smgr_suspects.insert(record.xid);
+                    }
+                    return Ok(());
+                }
                 let Some(ti) = self.rel_to_table.get(&block0.rel.rel).copied() else {
                     return Ok(());
                 };
@@ -406,11 +467,7 @@ impl Engine {
                         tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "multi-insert: {} rows vs {} offsets", rows.len(), offsets.len())
                     }
                     (Err(e), _) | (_, Err(e)) => {
-                        if lsn <= self.tables[ti].dedupe_below {
-                            tracing::debug!(lsn = %pgwire::fmt_lsn(lsn), "replay: failed to decode multi-insert: {e}");
-                        } else {
-                            tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to decode multi-insert: {e}");
-                        }
+                        self.note_decode_error(ti, lsn, "multi-insert", &e);
                     }
                 }
             }
@@ -534,6 +591,16 @@ impl Engine {
     }
 }
 
+/// Re-shape mirror rows from an old live-column order to a new one,
+/// matching by name (new columns read as NULL; dropped ones vanish).
+fn reshape_rows(mirror: &mut Mirror, old_cols: &[schema::Col], new_cols: &[schema::Col]) {
+    let map: Vec<Option<usize>> =
+        new_cols.iter().map(|nc| old_cols.iter().position(|oc| oc.name == nc.name)).collect();
+    for ver in mirror.values_mut() {
+        ver.row = map.iter().map(|oi| oi.and_then(|i| ver.row.get(i).cloned().flatten())).collect();
+    }
+}
+
 /// Tombstone everything the mirror holds (flushed under the OLD filenode's
 /// watermark) and re-snapshot the table at a fresh cutover (committed under
 /// the NEW filenode). Idempotent across crashes: the filenode watermark only
@@ -606,7 +673,14 @@ async fn main() -> Result<()> {
     for desc in descs {
         let uri = format!("{}/{}", cfg.lake.trim_end_matches('/'), desc.name);
         let sink = sink::DeltaSink::open_or_create(&uri, cfg.storage_options(), &desc).await?;
-        tables.push(Table { desc, sink, mirror: Mirror::new(), dedupe_below: 0, pending: PendingBatch::default() });
+        tables.push(Table {
+            desc,
+            sink,
+            mirror: Mirror::new(),
+            dedupe_below: 0,
+            pending: PendingBatch::default(),
+            needs_resnapshot: false,
+        });
     }
 
     // 3. Attach to the WAL stream (slot keeps WAL retained while we're down).
@@ -637,7 +711,14 @@ async fn main() -> Result<()> {
                     }
                 }
                 tracing::info!(table = %t.desc.name, rows = t.mirror.len(), refreshed, "pre-image mirror rebuilt from Delta");
-                if let Some(stored) = resume.filenode {
+                if t.sink.schema_added_columns() && t.desc.has_fast_defaults {
+                    // A column with a fast default was added while we were
+                    // down: WAL can't materialize it for old rows —
+                    // re-snapshot instead.
+                    tracing::warn!(table = %t.desc.name, "column with DEFAULT added while offline — re-snapshotting");
+                    let tomb_lsn = t.dedupe_below + 1;
+                    remap_table(t, tomb_lsn, 0, r, &cfg.sql_conninfo()).await?;
+                } else if let Some(stored) = resume.filenode {
                     if stored != t.desc.rel_node {
                         // TRUNCATE / rewrite happened while we were down (or
                         // a remap was interrupted): tombstone the old state
@@ -696,6 +777,8 @@ async fn main() -> Result<()> {
     conn.start_replication(&cfg.slot, start_lsn, timeline).await?;
 
     let db_oid = tables[0].desc.db_oid;
+    let catalog_rels: HashSet<u32> =
+        schema::catalog_filenodes(&cfg.sql_conninfo()).await?.into_iter().collect();
     let mut engine = Engine {
         rel_to_table: tables.iter().enumerate().map(|(i, t)| (t.desc.rel_node, i)).collect(),
         toast_rels: tables.iter().filter_map(|t| t.desc.toast_rel_node).collect(),
@@ -703,6 +786,7 @@ async fn main() -> Result<()> {
         txbuf: txbuf::TxBuffer::default(),
         toast: heap::ToastCache::default(),
         last_commit_lsn: resume_from,
+        catalog_rels,
         smgr_suspects: HashSet::new(),
         remap_at: None,
         db_oid,
