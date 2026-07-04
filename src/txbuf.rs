@@ -43,6 +43,9 @@ pub enum Op {
 
 pub struct PendingOp {
     pub lsn: u64,
+    /// Index into the tracked-table list (multi-table: one transaction's
+    /// ops may span several tables).
+    pub table: usize,
     pub op: Op,
 }
 
@@ -50,7 +53,7 @@ pub struct PendingOp {
 struct OpenTx {
     first_lsn: u64,
     ops: Vec<PendingOp>,
-    overlay: HashMap<Ctid, RowVersion>,
+    overlay: HashMap<(usize, Ctid), RowVersion>,
 }
 
 #[derive(Default)]
@@ -59,26 +62,26 @@ pub struct TxBuffer {
 }
 
 impl TxBuffer {
-    pub fn add_op(&mut self, xid: u32, lsn: u64, op: Op) {
+    pub fn add_op(&mut self, xid: u32, lsn: u64, table: usize, op: Op) {
         let tx = self.open.entry(xid).or_insert_with(|| OpenTx { first_lsn: lsn, ..Default::default() });
         match &op {
             Op::Insert { ctid, ver } => {
-                tx.overlay.insert(*ctid, ver.clone());
+                tx.overlay.insert((table, *ctid), ver.clone());
             }
             Op::Update { old_ctid, ctid, ver } => {
-                tx.overlay.remove(old_ctid);
-                tx.overlay.insert(*ctid, ver.clone());
+                tx.overlay.remove(&(table, *old_ctid));
+                tx.overlay.insert((table, *ctid), ver.clone());
             }
             Op::Delete { ctid, .. } => {
-                tx.overlay.remove(ctid);
+                tx.overlay.remove(&(table, *ctid));
             }
         }
-        tx.ops.push(PendingOp { lsn, op });
+        tx.ops.push(PendingOp { lsn, table, op });
     }
 
     /// Find an uncommitted version of a row across all open transactions.
-    pub fn lookup(&self, ctid: Ctid) -> Option<&RowVersion> {
-        self.open.values().find_map(|tx| tx.overlay.get(&ctid))
+    pub fn lookup(&self, table: usize, ctid: Ctid) -> Option<&RowVersion> {
+        self.open.values().find_map(|tx| tx.overlay.get(&(table, ctid)))
     }
 
     /// Transaction committed: hand back its ops (and its committed

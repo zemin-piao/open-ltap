@@ -39,6 +39,10 @@ future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
   full-page images via line pointers when WAL carries an FPI instead of tuple data
 - ✅ **TOAST**: out-of-line values reassembled from same-transaction toast-chunk inserts,
   including compressed-then-externalized values (pglz)
+- ✅ **Multi-table**: one replication slot and one WAL stream feed every table (auto-discovered
+  from `public`, or `LTAP_TABLES=a,b,c` / CLI args); records route by relfilenode; a transaction
+  spanning tables lands in each table's Delta log under the same commit LSN. Tables with
+  unsupported column types are skipped with a warning
 - ✅ **UPDATE and DELETE** transcoded as an append-only change log: updates append the new row
   version, deletes append a tombstone (`_ltap_deleted`); current state is one `QUALIFY
   latest-per-key` view away (see `scripts/verify.sh`). Pre-images come from an in-memory mirror
@@ -61,7 +65,7 @@ future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
 ```sh
 docker compose up -d          # Postgres 17 + MinIO
 ./scripts/dev-init.sh         # replication trust (dev!) + demo table `t`
-cargo run -- t                # start transcoding table `t`
+cargo run                     # transcode EVERY public table (or: cargo run -- t)
 
 # in another shell:
 docker exec -i openltap-pg psql -U postgres -d app \
@@ -69,9 +73,10 @@ docker exec -i openltap-pg psql -U postgres -d app \
 ./scripts/verify.sh t         # read the Delta table back via DuckDB
 ```
 
-Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLE`, `LTAP_SLOT`,
-`LTAP_FLUSH_ROWS`/`LTAP_FLUSH_MS` (batching), `LTAP_SNAPSHOT=off` (skip initial snapshot),
-`DELTA_URI`, `S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY`.
+Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLES` (csv; default: all
+public tables), `LTAP_SLOT` (default `ltap_<db>`), `LTAP_LAKE` (default `s3://lake`; each table
+lands at `{lake}/{table}`), `LTAP_FLUSH_ROWS`/`LTAP_FLUSH_MS` (batching), `LTAP_SNAPSHOT=off`
+(skip initial snapshot), `S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY`.
 
 ## Roadmap — the product is M0 → M4, against vanilla Postgres
 
@@ -83,8 +88,9 @@ Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLE`, `LTAP
   subtransactions; pglz-compressed values (inline and TOAST); out-of-line TOAST;
   full-page-image handling (`full_page_writes=on`); initial snapshot + consistent cutover;
   wider type matrix
-- **M3** — WAL-driven catalog tracking (DDL mid-stream, relfilenode changes, add/drop column),
-  multiple tables, every-table-automatically
+- **M3 (in progress)** — done: multiple tables, every-table-automatically (one slot, one
+  stream). Remaining: WAL-driven catalog tracking — DDL mid-stream, relfilenode changes
+  (TRUNCATE/VACUUM FULL), add/drop column, table create/drop/rename auto-attach
 - **M4** — the LTAP freshness read path: serve "Delta up to LSN X + in-memory tail" merged reads,
   so analytics get read-your-writes without touching Postgres. This is the feature no
   Apache-licensed alternative has.
@@ -117,7 +123,7 @@ database platform to adopt.
   row after a snapshot/restart may be skipped with a warning
 - lz4/zstd compression unsupported (`wal_compression` and `default_toast_compression`
   must be `off`/`pglz`)
-- Schema read once at startup; DDL during streaming will corrupt decoding (M3)
+- Schema read once at startup; DDL during streaming will corrupt decoding (M3b/M3c)
 - An idle stream doesn't advance the slot's restart position, so a quiet database
   retains WAL until the next transcoded commit
 - Little-endian hosts only (WAL is server-native-endian)

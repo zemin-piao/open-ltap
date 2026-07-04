@@ -66,6 +66,47 @@ pub struct TableDesc {
     pub cols: Vec<Col>,
 }
 
+/// Discover every table to transcode. `tables` = None means all ordinary
+/// tables in the public schema. Tables with unsupported column types are
+/// skipped with a warning rather than failing the run.
+pub async fn discover_all(conninfo: &str, tables: Option<&[String]>) -> Result<Vec<TableDesc>> {
+    let names: Vec<String> = match tables {
+        Some(list) => list.to_vec(),
+        None => {
+            let (client, conn) = tokio_postgres::connect(conninfo, NoTls)
+                .await
+                .context("connecting for table discovery")?;
+            let handle = tokio::spawn(conn);
+            let rows = client
+                .query(
+                    "SELECT c.relname FROM pg_class c
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = 'public' AND c.relkind = 'r'
+                     ORDER BY c.relname",
+                    &[],
+                )
+                .await?;
+            handle.abort();
+            rows.iter().map(|r| r.get::<_, String>(0)).collect()
+        }
+    };
+
+    let mut descs = Vec::with_capacity(names.len());
+    for name in &names {
+        match discover(conninfo, name).await {
+            Ok(d) => descs.push(d),
+            Err(e) if tables.is_none() => {
+                tracing::warn!(table = %name, "skipping table: {e:#}");
+            }
+            Err(e) => return Err(e), // explicitly requested table must work
+        }
+    }
+    if descs.is_empty() {
+        bail!("no transcodable tables found");
+    }
+    Ok(descs)
+}
+
 pub async fn discover(conninfo: &str, table: &str) -> Result<TableDesc> {
     let (client, conn) = tokio_postgres::connect(conninfo, NoTls)
         .await
