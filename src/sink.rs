@@ -292,15 +292,9 @@ impl DeltaSink {
         Ok(ResumeState { commit_lsn, restart_lsn, filenode })
     }
 
-    /// Append a batch of committed rows (possibly spanning many PG commits)
-    /// as ONE Delta commit, carrying the new LSN watermarks atomically.
-    pub async fn append(
-        &mut self,
-        rows: &[EmitRow],
-        commit_lsn: u64,
-        restart_lsn: u64,
-        filenode: u32,
-    ) -> Result<i64> {
+    /// Build an Arrow batch in this table's Delta shape from emitted rows.
+    /// Also used by the freshness endpoint to serve the in-memory tail.
+    pub fn make_batch(&self, rows: &[EmitRow]) -> Result<RecordBatch> {
         // Pull a live column out of every row as Option<T>, tolerating rows
         // shaped under an older schema (short rows read as NULL).
         macro_rules! col_vals {
@@ -354,6 +348,19 @@ impl DeltaSink {
         arrays.push(Arc::new(Int64Array::from(
             rows.iter().map(|e| txbuf::pack_ctid(e.ctid)).collect::<Vec<_>>(),
         )));
+        Ok(RecordBatch::try_new(self.arrow_schema.clone(), arrays)?)
+    }
+
+    /// Append a batch of committed rows (possibly spanning many PG commits)
+    /// as ONE Delta commit, carrying the new LSN watermarks atomically.
+    pub async fn append(
+        &mut self,
+        rows: &[EmitRow],
+        commit_lsn: u64,
+        restart_lsn: u64,
+        filenode: u32,
+    ) -> Result<i64> {
+        let batch = self.make_batch(rows)?;
 
         // Schema evolution must be its own commit BEFORE the data is written:
         // RecordBatchWriter's MergeSchema places new columns after the meta
@@ -388,7 +395,6 @@ impl DeltaSink {
             tracing::info!("Delta schema evolved (metadata-only commit)");
         }
 
-        let batch = RecordBatch::try_new(self.arrow_schema.clone(), arrays)?;
         let mut writer = RecordBatchWriter::for_table(&self.table)?;
         writer.write_with_mode(batch, WriteMode::MergeSchema).await?;
         let adds: Vec<Action> = writer.flush().await?.into_iter().map(Action::Add).collect();

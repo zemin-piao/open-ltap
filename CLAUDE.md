@@ -93,6 +93,15 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   declaring a table vanished (Delta path keeps the first-seen name). Unattachable tables
   (type conflicts, unsupported types) warn once and are skipped (attach_failed set); auto-mode
   startup skips tables whose Delta can't open instead of dying. M3 COMPLETE.
+- **M4 core shipped & verified 2026-07-04 — freshness read path** (`serve.rs`): TailStore
+  (std RwLock, guards never held across await) fed by the engine — per-commit RecordBatches
+  (sink.make_batch), flushed batches retained LTAP_TAIL_RETAIN_MS so Delta+tail merges are
+  gap-free in any query order (overlap collapses via the latest-(lsn,seq) dedupe). Hand-rolled
+  HTTP/1.1: GET /tail/<table>.parquet (?min_lsn long-poll → 200/408; 204 = empty tail),
+  /status JSON, X-Ltap-Applied-Lsn header; applied_lsn = last_recv after each batch. DuckDB
+  needs `SET force_download=true` + httpfs (no Range support served). Verified: 2-min flush lag
+  where delta_scan misses rows the merged read sees; min_lsn RYW (200 instant / 408 timeout);
+  flush-overlap dedupe (7/7 distinct). `scripts/verify-fresh.sh` = demo reader.
 - `examples/walscan.rs` — offline WAL reader harness (feeds a raw segment file, compares against
   `pg_waldump`; supports chunked feeding to simulate streaming). Invaluable for reader bugs.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
@@ -105,8 +114,8 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   A→B followed by CREATE A would confuse name-based tracking); attach_failed retry policy.
   Notes: rewrites are handled by re-snapshot, not by decoding XLOG_FPI page loads; rapid
   consecutive DDL on one table remains the known race window (mitigated by drift self-healing).
-- **M4** — freshness read path: serve "Delta ≤ LSN + in-memory tail" merged reads
-  (Arrow Flight or DuckDB table function). Headline feature; no Apache-licensed competitor has it.
+- **M4 leftovers** — Arrow Flight endpoint (pyarrow/ADBC clients); bound tail memory for very
+  large pending sets; Range support if force_download ever hurts.
 - **M5 / v2 (future work)** — Neon safekeeper source; pageserver as GetPage@LSN oracle;
   eventually transcoding inside pageserver compaction (canonical columnar).
 

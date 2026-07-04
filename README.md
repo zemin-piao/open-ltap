@@ -74,6 +74,10 @@ future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
   copied (binary COPY under a brief write lock) as one Delta commit, and the WAL stream takes
   over at exactly the cutover LSN — no gap, no overlap, crash-safe
 - ✅ Readable from DuckDB (`delta_scan`) — see `scripts/verify.sh`
+- ✅ **Freshness read path**: the transcoder serves its in-memory tail (committed in Postgres,
+  not yet flushed to Delta) over HTTP as Parquet; `delta_scan + tail` merged reads see every
+  committed transaction seconds after commit, with `?min_lsn=` long-polling for hard
+  read-your-writes — see `scripts/verify-fresh.sh` and `GET /status`
 
 ## Quickstart
 
@@ -91,7 +95,9 @@ docker exec -i openltap-pg psql -U postgres -d app \
 Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLES` (csv; default: all
 public tables), `LTAP_SLOT` (default `ltap_<db>`), `LTAP_LAKE` (default `s3://lake`; each table
 lands at `{lake}/{table}`), `LTAP_FLUSH_ROWS`/`LTAP_FLUSH_MS` (batching), `LTAP_SNAPSHOT=off`
-(skip initial snapshot), `S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY`.
+(skip initial snapshot), `LTAP_HTTP_PORT` (freshness endpoint, default 8088, 0 = off),
+`LTAP_TAIL_RETAIN_MS` (how long flushed rows stay in the served tail, default 60000),
+`S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY`.
 
 ## Roadmap — the product is M0 → M4, against vanilla Postgres
 
@@ -107,9 +113,10 @@ lands at `{lake}/{table}`), `LTAP_FLUSH_ROWS`/`LTAP_FLUSH_MS` (batching), `LTAP_
   every-table-automatically (one slot, one stream); relfilenode changes (TRUNCATE / VACUUM
   FULL / CLUSTER, online and offline); ADD/DROP COLUMN with Delta schema evolution;
   CREATE/DROP/RENAME table lifecycle
-- **M4** — the LTAP freshness read path: serve "Delta up to LSN X + in-memory tail" merged reads,
-  so analytics get read-your-writes without touching Postgres. This is the feature no
-  Apache-licensed alternative has.
+- **M4 (core done)** — the LTAP freshness read path: the transcoder serves "Delta + in-memory
+  tail" merged reads over HTTP/Parquet, so analytics get read-your-writes (`?min_lsn=`
+  long-poll) without touching Postgres. Remaining polish: Arrow Flight endpoint, tail serving
+  for very large pending sets.
 
 At M4 the tool is complete for its primary audience: existing Postgres, existing lake, no new
 database platform to adopt.

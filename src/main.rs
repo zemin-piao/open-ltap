@@ -8,12 +8,14 @@
 
 mod pgwire;
 mod schema;
+mod serve;
 mod sink;
 mod snapshot;
 mod txbuf;
 mod wal;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -40,6 +42,10 @@ struct Config {
     flush_interval: Duration,
     /// Take an initial snapshot when a Delta table has no watermark yet.
     snapshot: bool,
+    /// Port for the freshness endpoint (0 disables).
+    http_port: u16,
+    /// How long flushed rows stay in the served tail (gap-free merges).
+    tail_retain: Duration,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -70,6 +76,10 @@ impl Config {
                 env_or("LTAP_FLUSH_MS", "750").parse().expect("LTAP_FLUSH_MS"),
             ),
             snapshot: !matches!(env_or("LTAP_SNAPSHOT", "on").as_str(), "off" | "0" | "false"),
+            http_port: env_or("LTAP_HTTP_PORT", "8088").parse().expect("LTAP_HTTP_PORT"),
+            tail_retain: Duration::from_millis(
+                env_or("LTAP_TAIL_RETAIN_MS", "60000").parse().expect("LTAP_TAIL_RETAIN_MS"),
+            ),
             tables: if tables.is_empty() { None } else { Some(tables) },
             pg_db,
         }
@@ -157,6 +167,9 @@ struct Engine {
     remap_at: Option<u64>,
     /// Tables that failed to attach (unsupported/conflicting): warn once.
     attach_failed: HashSet<String>,
+    /// Freshness endpoint's view of the world.
+    tail: serve::SharedTail,
+    tail_retain: Duration,
     db_oid: u32,
 }
 
@@ -201,6 +214,7 @@ impl Engine {
             );
             t.pending.rows.clear();
             t.pending.first_at = None;
+            self.tail.write().unwrap().mark_flushed(&t.desc.name, self.tail_retain);
         }
         *persisted_restart = restart;
         Ok(())
@@ -534,6 +548,7 @@ impl Engine {
                         for sub in &subxids {
                             self.toast.gc_xid(*sub);
                         }
+                        let mut emitted: HashMap<usize, usize> = HashMap::new();
                         for pending_op in ops {
                             let t = &mut self.tables[pending_op.table];
                             if lsn <= t.dedupe_below {
@@ -541,6 +556,10 @@ impl Engine {
                                 // Delta log AND in the mirror rebuilt from it.
                                 continue;
                             }
+                            let start = *emitted
+                                .entry(pending_op.table)
+                                .or_insert_with(|| t.pending.rows.len());
+                            let _ = start;
                             match pending_op.op {
                                 txbuf::Op::Insert { ctid, ver } => {
                                     t.pending.emit(lsn, false, ctid, ver.row.clone());
@@ -557,6 +576,15 @@ impl Engine {
                                         .unwrap_or_else(|| vec![None; t.desc.cols.len()]);
                                     t.mirror.remove(&ctid);
                                     t.pending.emit(lsn, true, ctid, row);
+                                }
+                            }
+                        }
+                        // Publish this commit's rows to the freshness tail.
+                        for (ti, start) in emitted {
+                            let t = &self.tables[ti];
+                            if t.pending.rows.len() > start {
+                                if let Ok(batch) = t.sink.make_batch(&t.pending.rows[start..]) {
+                                    self.tail.write().unwrap().push(&t.desc.name, batch);
                                 }
                             }
                         }
@@ -856,6 +884,16 @@ async fn main() -> Result<()> {
     );
     conn.start_replication(&cfg.slot, start_lsn, timeline).await?;
 
+    let tail: serve::SharedTail = Arc::new(std::sync::RwLock::new(serve::TailStore::default()));
+    if cfg.http_port != 0 {
+        let t = tail.clone();
+        let port = cfg.http_port;
+        tokio::spawn(async move {
+            if let Err(e) = serve::serve(t, port).await {
+                tracing::error!("freshness endpoint failed: {e:#}");
+            }
+        });
+    }
     let db_oid = tables[0].desc.db_oid;
     let catalog_rels: HashSet<u32> =
         schema::catalog_filenodes(&cfg.sql_conninfo()).await?.into_iter().collect();
@@ -870,6 +908,8 @@ async fn main() -> Result<()> {
         smgr_suspects: HashSet::new(),
         remap_at: None,
         attach_failed: HashSet::new(),
+        tail: tail.clone(),
+        tail_retain: cfg.tail_retain,
         db_oid,
     };
 
@@ -893,12 +933,14 @@ async fn main() -> Result<()> {
                     if let Some(ddl_lsn) = engine.remap_at.take() {
                         engine.remap_check(ddl_lsn, &cfg, &mut persisted_restart).await?;
                     }
+                    engine.tail.write().unwrap().applied_lsn = last_recv_lsn;
                     if engine.pending_total() >= cfg.flush_rows {
                         engine.flush_all(&mut persisted_restart).await?;
                     }
                 }
                 pgwire::ReplMsg::Keepalive { wal_end, reply_requested } => {
                     last_recv_lsn = wal_end.max(last_recv_lsn);
+                    engine.tail.write().unwrap().applied_lsn = last_recv_lsn;
                     if reply_requested {
                         conn.send_status(last_recv_lsn, persisted_restart).await?;
                     }
