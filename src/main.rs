@@ -155,6 +155,8 @@ struct Engine {
     /// Set when a suspect committed: (commit LSN) — the main loop runs a
     /// catalog re-check (needs SQL, so it happens outside record handling).
     remap_at: Option<u64>,
+    /// Tables that failed to attach (unsupported/conflicting): warn once.
+    attach_failed: HashSet<String>,
     db_oid: u32,
 }
 
@@ -220,7 +222,8 @@ impl Engine {
     /// heap written): re-read the catalog and reconcile every tracked table —
     /// relfilenode changes remap (TRUNCATE / VACUUM FULL / rewrites), column
     /// changes evolve the Delta schema in place (ADD/DROP COLUMN).
-    async fn remap_check(&mut self, ddl_lsn: u64, conninfo: &str, persisted_restart: &mut u64) -> Result<()> {
+    async fn remap_check(&mut self, ddl_lsn: u64, cfg: &Config, persisted_restart: &mut u64) -> Result<()> {
+        let conninfo = &cfg.sql_conninfo();
         // Everything pending was decoded and mapped under the old schema:
         // make it durable before anything changes shape.
         self.flush_all(persisted_restart).await?;
@@ -231,12 +234,26 @@ impl Engine {
 
         let mut changed = false;
         for ti in 0..self.tables.len() {
-            let name = self.tables[ti].desc.name.clone();
+            let mut name = self.tables[ti].desc.name.clone();
             let old_node = self.tables[ti].desc.rel_node;
             if old_node == 0 {
                 continue; // already detached
             }
-            let fresh = match schema::discover(conninfo, &name).await {
+            let mut fresh = schema::discover(conninfo, &name).await;
+            if fresh.is_err() {
+                // Renamed rather than dropped? The filenode survives a rename.
+                if let Ok(Some(new_name)) = schema::table_name_by_filenode(conninfo, old_node).await {
+                    tracing::warn!(
+                        table = %name,
+                        renamed_to = %new_name,
+                        "table renamed — following it (the Delta table stays at its original path)"
+                    );
+                    self.tables[ti].desc.name = new_name.clone();
+                    name = new_name;
+                    fresh = schema::discover(conninfo, &name).await;
+                }
+            }
+            let fresh = match fresh {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(table = %name, "table vanished from catalog — detaching: {e:#}");
@@ -289,6 +306,28 @@ impl Engine {
                 let stamp = if filenode_changed { old_node } else { 0 };
                 remap_table(&mut self.tables[ti], ddl_lsn, stamp, restart, conninfo).await?;
                 self.tables[ti].needs_resnapshot = false;
+            }
+        }
+        // Auto mode: attach tables created since startup (their pre-attach
+        // DML is covered by the snapshot cutover + dedupe, like at startup).
+        if cfg.tables.is_none() {
+            if let Ok(names) = schema::list_tables(conninfo).await {
+                for n in names {
+                    if self.tables.iter().any(|t| t.desc.name == n) || self.attach_failed.contains(&n) {
+                        continue;
+                    }
+                    match attach_table(&n, cfg).await {
+                        Ok(t) => {
+                            tracing::info!(table = %n, "new table attached");
+                            self.tables.push(t);
+                            changed = true;
+                        }
+                        Err(e) => {
+                            tracing::warn!(table = %n, "cannot attach new table (won't retry): {e:#}");
+                            self.attach_failed.insert(n);
+                        }
+                    }
+                }
             }
         }
         if changed {
@@ -591,6 +630,40 @@ impl Engine {
     }
 }
 
+/// Bring a table under management mid-stream: open its Delta table and
+/// snapshot it at a fresh cutover. Anything the stream already passed for
+/// this table is covered by the snapshot; anything after the cutover is
+/// replayed against dedupe. (Same reasoning as the startup snapshot.)
+async fn attach_table(name: &str, cfg: &Config) -> Result<Table> {
+    let conninfo = cfg.sql_conninfo();
+    let desc = schema::discover(&conninfo, name).await?;
+    let uri = format!("{}/{}", cfg.lake.trim_end_matches('/'), desc.name);
+    let sink = sink::DeltaSink::open_or_create(&uri, cfg.storage_options(), &desc).await?;
+    let mut t = Table {
+        desc,
+        sink,
+        mirror: Mirror::new(),
+        dedupe_below: 0,
+        pending: PendingBatch::default(),
+        needs_resnapshot: false,
+    };
+    let resume = t.sink.resume_state().await?;
+    t.dedupe_below = resume.commit_lsn.unwrap_or(0);
+    let (cutover, rows, mut raw_attrs) = snapshot::take(&conninfo, &t.desc).await?;
+    for (ctid, row) in &rows {
+        let attrs = raw_attrs.remove(ctid).or_else(|| heap::encode_attrs(row, &t.desc));
+        t.mirror.insert(*ctid, txbuf::RowVersion { row: row.clone(), attrs });
+    }
+    let emits: Vec<sink::EmitRow> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, (ctid, row))| sink::EmitRow { lsn: cutover, seq: i as u64, deleted: false, ctid, row })
+        .collect();
+    t.sink.append(&emits, cutover, cutover, t.desc.rel_node).await?;
+    t.dedupe_below = cutover;
+    Ok(t)
+}
+
 /// Re-shape mirror rows from an old live-column order to a new one,
 /// matching by name (new columns read as NULL; dropped ones vanish).
 fn reshape_rows(mirror: &mut Mirror, old_cols: &[schema::Col], new_cols: &[schema::Col]) {
@@ -672,7 +745,14 @@ async fn main() -> Result<()> {
     let mut tables = Vec::with_capacity(descs.len());
     for desc in descs {
         let uri = format!("{}/{}", cfg.lake.trim_end_matches('/'), desc.name);
-        let sink = sink::DeltaSink::open_or_create(&uri, cfg.storage_options(), &desc).await?;
+        let sink = match sink::DeltaSink::open_or_create(&uri, cfg.storage_options(), &desc).await {
+            Ok(s) => s,
+            Err(e) if cfg.tables.is_none() => {
+                tracing::warn!(table = %desc.name, "skipping table (Delta open failed): {e:#}");
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         tables.push(Table {
             desc,
             sink,
@@ -789,6 +869,7 @@ async fn main() -> Result<()> {
         catalog_rels,
         smgr_suspects: HashSet::new(),
         remap_at: None,
+        attach_failed: HashSet::new(),
         db_oid,
     };
 
@@ -810,7 +891,7 @@ async fn main() -> Result<()> {
                         engine.handle_record(lsn, &rec)?;
                     }
                     if let Some(ddl_lsn) = engine.remap_at.take() {
-                        engine.remap_check(ddl_lsn, &cfg.sql_conninfo(), &mut persisted_restart).await?;
+                        engine.remap_check(ddl_lsn, &cfg, &mut persisted_restart).await?;
                     }
                     if engine.pending_total() >= cfg.flush_rows {
                         engine.flush_all(&mut persisted_restart).await?;

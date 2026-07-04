@@ -43,6 +43,10 @@ future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
   from `public`, or `LTAP_TABLES=a,b,c` / CLI args); records route by relfilenode; a transaction
   spanning tables lands in each table's Delta log under the same commit LSN. Tables with
   unsupported column types are skipped with a warning
+- ✅ **Tables come and go**: in auto mode, `CREATE TABLE` attaches automatically (snapshot at a
+  fresh cutover — inserts racing the attach are never lost or doubled), `DROP TABLE` detaches
+  (the Delta table stays, frozen), and `ALTER TABLE RENAME` is followed (the Delta path keeps
+  the original name)
 - ✅ **ADD/DROP COLUMN mid-stream**: DDL is detected from the WAL itself (catalog heap writes
   mark the transaction; its commit triggers a re-read); the Delta schema evolves additively by
   name (dropped columns stay, receiving NULLs), dropped slots keep tuples walkable, and
@@ -99,10 +103,10 @@ lands at `{lake}/{table}`), `LTAP_FLUSH_ROWS`/`LTAP_FLUSH_MS` (batching), `LTAP_
   subtransactions; pglz-compressed values (inline and TOAST); out-of-line TOAST;
   full-page-image handling (`full_page_writes=on`); initial snapshot + consistent cutover;
   wider type matrix
-- **M3 (in progress)** — done: multiple tables every-table-automatically (one slot, one
-  stream); relfilenode changes (TRUNCATE / VACUUM FULL / CLUSTER, online and offline);
-  ADD/DROP COLUMN with Delta schema evolution. Remaining: table create/drop/rename
-  auto-attach (M3d)
+- **M3 (done)** — WAL-driven catalog tracking against a live stream: multiple tables
+  every-table-automatically (one slot, one stream); relfilenode changes (TRUNCATE / VACUUM
+  FULL / CLUSTER, online and offline); ADD/DROP COLUMN with Delta schema evolution;
+  CREATE/DROP/RENAME table lifecycle
 - **M4** — the LTAP freshness read path: serve "Delta up to LSN X + in-memory tail" merged reads,
   so analytics get read-your-writes without touching Postgres. This is the feature no
   Apache-licensed alternative has.
@@ -136,7 +140,7 @@ database platform to adopt.
 - lz4/zstd compression unsupported (`wal_compression` and `default_toast_compression`
   must be `off`/`pglz`)
 - Column type changes (`ALTER TABLE ... TYPE`) detach the table (Delta cannot retype a
-  column); table CREATE/DROP/RENAME need a restart to pick up (M3d)
+  column); renamed tables keep their original Delta path
 - An idle stream doesn't advance the slot's restart position, so a quiet database
   retains WAL until the next transcoded commit
 - Little-endian hosts only (WAL is server-native-endian)

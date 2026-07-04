@@ -87,6 +87,12 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   Verified: live ADD (drift self-heal for same-batch DML), DROP mid-row (walk over dropped
   slot), ADD DEFAULT 42 materialized via re-snapshot, offline plain ADD + offline ADD DEFAULT,
   per-table md5 identical throughout.
+- **M3d shipped & verified 2026-07-04 — table lifecycle**: auto mode attaches new tables at the
+  catalog check (attach_table = sink open + snapshot at fresh cutover + dedupe, same reasoning
+  as startup); DROP detaches (Delta frozen); RENAME followed via relfilenode→name lookup before
+  declaring a table vanished (Delta path keeps the first-seen name). Unattachable tables
+  (type conflicts, unsupported types) warn once and are skipped (attach_failed set); auto-mode
+  startup skips tables whose Delta can't open instead of dying. M3 COMPLETE.
 - `examples/walscan.rs` — offline WAL reader harness (feeds a raw segment file, compares against
   `pg_waldump`; supports chunked feeding to simulate streaming). Invaluable for reader bugs.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
@@ -95,11 +101,10 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 
 - **M2 leftovers (nice-to-have)** — lz4/zstd decompression; change-log compaction (rewrite to
   deletion vectors or periodic OPTIMIZE); mirror memory bounds.
-- **M3 remaining** — M3d: CREATE/DROP/RENAME table auto-attach (detection already free via the
-  catalog-suspect flow; needs attach/detach lifecycle + rename handling, ideally re-keying
-  discovery by table OID instead of name). Notes: rewrites are handled by re-snapshot, not by
-  decoding XLOG_FPI page loads; rapid consecutive DDL on one table remains the known race
-  window (mitigated by drift self-healing).
+- **M3 leftovers (nice-to-have)** — discovery re-keyed by table OID instead of name (rename of
+  A→B followed by CREATE A would confuse name-based tracking); attach_failed retry policy.
+  Notes: rewrites are handled by re-snapshot, not by decoding XLOG_FPI page loads; rapid
+  consecutive DDL on one table remains the known race window (mitigated by drift self-healing).
 - **M4** — freshness read path: serve "Delta ≤ LSN + in-memory tail" merged reads
   (Arrow Flight or DuckDB table function). Headline feature; no Apache-licensed competitor has it.
 - **M5 / v2 (future work)** — Neon safekeeper source; pageserver as GetPage@LSN oracle;

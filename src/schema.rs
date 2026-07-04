@@ -123,6 +123,39 @@ pub async fn discover_all(conninfo: &str, tables: Option<&[String]>) -> Result<V
     Ok(descs)
 }
 
+/// All ordinary tables in the public schema.
+pub async fn list_tables(conninfo: &str) -> Result<Vec<String>> {
+    let (client, conn) = tokio_postgres::connect(conninfo, NoTls).await?;
+    let handle = tokio::spawn(conn);
+    let rows = client
+        .query(
+            "SELECT c.relname FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relkind = 'r'
+             ORDER BY c.relname",
+            &[],
+        )
+        .await?;
+    handle.abort();
+    Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+}
+
+/// Current name of the table owning a relfilenode (rename detection).
+pub async fn table_name_by_filenode(conninfo: &str, node: u32) -> Result<Option<String>> {
+    let (client, conn) = tokio_postgres::connect(conninfo, NoTls).await?;
+    let handle = tokio::spawn(conn);
+    let row = client
+        .query_opt(
+            "SELECT c.relname FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.relfilenode = $1 AND n.nspname = 'public' AND c.relkind = 'r'",
+            &[&node],
+        )
+        .await?;
+    handle.abort();
+    Ok(row.map(|r| r.get(0)))
+}
+
 /// relfilenodes of pg_class (1259) and pg_attribute (1249): heap writes to
 /// these are the WAL-visible signature of DDL.
 pub async fn catalog_filenodes(conninfo: &str) -> Result<Vec<u32>> {
