@@ -20,6 +20,9 @@ pub const WAL_SEG_SIZE: u64 = 16 * 1024 * 1024;
 const REC_HDR_LEN: usize = 24;
 const SHORT_PAGE_HDR: usize = 24; // SizeOfXLogShortPHD (maxaligned)
 const LONG_PAGE_HDR: usize = 40; // SizeOfXLogLongPHD (segment start)
+/// xlp_magic values we have verified the decoder against (both versions
+/// share the record, heap, and xact layouts we parse).
+const XLOG_PAGE_MAGICS: &[(u16, u32)] = &[(0xD116, 17), (0xD118, 18)];
 
 fn maxalign(v: u64) -> u64 {
     (v + 7) & !7
@@ -81,6 +84,21 @@ impl WalReader {
                     if self.pos % WAL_SEG_SIZE == 0 { LONG_PAGE_HDR } else { SHORT_PAGE_HDR };
                 if avail < hdr_len {
                     break;
+                }
+                // xlp_magic: bumped every major release. Checking every page
+                // both rejects unsupported server versions up front and acts
+                // as a desync guard for the reader's position tracking.
+                let magic = u16::from_le_bytes(self.pending[0..2].try_into().unwrap());
+                if !XLOG_PAGE_MAGICS.iter().any(|(m, _)| *m == magic) {
+                    bail!(
+                        "unsupported WAL page magic {magic:#06x} at {} (supported: {})",
+                        crate::pgwire::fmt_lsn(self.pos),
+                        XLOG_PAGE_MAGICS
+                            .iter()
+                            .map(|(m, v)| format!("{m:#06x}=PG{v}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                 }
                 let rem_len =
                     u32::from_le_bytes(self.pending[16..20].try_into().unwrap()) as u64;

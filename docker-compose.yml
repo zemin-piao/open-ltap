@@ -1,6 +1,7 @@
 services:
   postgres:
-    image: postgres:17
+    # Override with LTAP_PG=18 to test against another major version.
+    image: postgres:${LTAP_PG:-17}
     container_name: openltap-pg
     environment:
       POSTGRES_USER: postgres

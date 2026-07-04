@@ -121,6 +121,8 @@ database platform to adopt.
 - An idle stream doesn't advance the slot's restart position, so a quiet database
   retains WAL until the next transcoded commit
 - Little-endian hosts only (WAL is server-native-endian)
+- Postgres 17 and 18 supported (WAL page magic is validated per page; other majors are
+  rejected up front rather than misparsed). Test another major with `LTAP_PG=18 docker compose up`
 - Single writer per Delta table (`AWS_S3_ALLOW_UNSAFE_RENAME`)
 
 ## Design notes

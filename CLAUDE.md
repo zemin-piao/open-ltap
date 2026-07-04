@@ -87,7 +87,11 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 - `sink.rs` — Delta create-if-absent + `RecordBatchWriter` write, committed via `CommitBuilder`
   with `open-ltap.commit`/`open-ltap.restart` txn actions; `_ltap_lsn` column = row's commit LSN.
   Uses `AWS_S3_ALLOW_UNSAFE_RENAME` (single writer, dev).
-- Little-endian only, 64-bit maxalign assumed. Postgres 17 WAL format.
+- Little-endian only, 64-bit maxalign assumed. **PG17 + PG18 verified** (2026-07-04: full M2
+  gauntlet incl. FPI/COPY/TOAST/restart passed identically on 18.4; every layout we parse is
+  unchanged between 17 and 18). `XLOG_PAGE_MAGICS` in `wal/mod.rs` allowlists verified majors
+  (0xD116=17, 0xD118=18) — checked on every page header, which doubles as a desync guard.
+  New major = run the gauntlet, add the magic. Dev compose: `LTAP_PG=18 docker compose up`.
 
 ## Dev loop
 
