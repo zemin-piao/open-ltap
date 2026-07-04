@@ -62,6 +62,16 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   toast + cross-table txns (committed, aborted, and spanning a kill -9), per-table md5 identical.
   Note: mirror rebuild from Delta includes stale ctid versions (log has no old→new link) —
   correct (WAL refreshes reused ctids) but memory grows with change-log size until compaction.
+- **M3b shipped & verified 2026-07-04 — relfilenode changes**: XLOG_SMGR_CREATE (main fork, our
+  db) marks the xid suspect; at that txn's commit the catalog is re-read (SQL) and any tracked
+  table whose filenode changed is remapped: tombstone-all from the mirror (at the DDL commit
+  LSN, flushed under the OLD filenode watermark) + re-snapshot at a fresh cutover (committed
+  under the NEW filenode, dedupe=cutover) — one mechanism covers TRUNCATE, TRUNCATE+INSERT
+  same-txn, VACUUM FULL, CLUSTER, and ALTER rewrites. `open-ltap.filenode` txn action per Delta
+  commit; startup mismatch vs live catalog = offline truncate → same remap (idempotent: the
+  filenode watermark only advances with the snapshot commit). Schema-changing rewrites detach
+  the table with a warning (M3c). Verified: all of the above live + offline + aborted TRUNCATE
+  no-op, per-table md5 identical after each.
 - `examples/walscan.rs` — offline WAL reader harness (feeds a raw segment file, compares against
   `pg_waldump`; supports chunked feeding to simulate streaming). Invaluable for reader bugs.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
@@ -70,12 +80,12 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 
 - **M2 leftovers (nice-to-have)** — lz4/zstd decompression; change-log compaction (rewrite to
   deletion vectors or periodic OPTIMIZE); mirror memory bounds.
-- **M3 remaining** — M3b: relfilenode changes (TRUNCATE tombstones-all; VACUUM FULL/CLUSTER
-  rewrites arrive as XLOG_FPI page loads into the new filenode — decode whole pages as inserts;
-  remap via SQL at the DDL commit). M3c: column DDL (physical-vs-logical column model,
-  attisdropped skip-entries keep attlen/attalign, attmissingval fast defaults, Delta
-  MergeSchema, invalidation messages from commit records trigger re-discovery; rapid
-  consecutive DDL on one table is the known race window). M3d: CREATE/DROP/RENAME auto-attach.
+- **M3 remaining** — M3c: column DDL (physical-vs-logical column model, attisdropped
+  skip-entries keep attlen/attalign, attmissingval fast defaults, Delta MergeSchema,
+  invalidation messages from commit records trigger re-discovery; rapid consecutive DDL on one
+  table is the known race window). M3d: CREATE/DROP/RENAME auto-attach. Note the M3b shortcut:
+  rewrites are handled by re-snapshot, NOT by decoding the rewrite's XLOG_FPI page loads — fine
+  for the product, revisit only if re-snapshot cost ever matters.
 - **M4** — freshness read path: serve "Delta ≤ LSN + in-memory tail" merged reads
   (Arrow Flight or DuckDB table function). Headline feature; no Apache-licensed competitor has it.
 - **M5 / v2 (future work)** — Neon safekeeper source; pageserver as GetPage@LSN oracle;

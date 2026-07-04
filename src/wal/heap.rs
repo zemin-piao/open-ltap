@@ -70,6 +70,21 @@ pub const XLH_UPDATE_CONTAINS_NEW_TUPLE: u8 = 1 << 4;
 pub const XLH_UPDATE_PREFIX_FROM_OLD: u8 = 1 << 5;
 pub const XLH_UPDATE_SUFFIX_FROM_OLD: u8 = 1 << 6;
 
+/// XLOG_SMGR_CREATE (storage rmgr): a new relfilenode came into existence.
+/// Main data: RelFileLocator { spc u32, db u32, rel u32 } + ForkNumber i32.
+/// Returns (db oid, relfilenode) for main-fork creates.
+pub const XLOG_SMGR_CREATE: u8 = 0x10;
+
+pub fn parse_smgr_create(main_data: &[u8]) -> Result<Option<(u32, u32)>> {
+    if main_data.len() < 16 {
+        bail!("smgr create record too short");
+    }
+    let db = u32::from_le_bytes(main_data[4..8].try_into().unwrap());
+    let rel = u32::from_le_bytes(main_data[8..12].try_into().unwrap());
+    let fork = i32::from_le_bytes(main_data[12..16].try_into().unwrap());
+    Ok(if fork == 0 { Some((db, rel)) } else { None })
+}
+
 // htup_details.h
 const HEAP_HASNULL: u16 = 0x0001;
 const SIZEOF_HEAP_TUPLE_HEADER: usize = 23;

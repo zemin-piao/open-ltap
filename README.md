@@ -43,6 +43,12 @@ future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
   from `public`, or `LTAP_TABLES=a,b,c` / CLI args); records route by relfilenode; a transaction
   spanning tables lands in each table's Delta log under the same commit LSN. Tables with
   unsupported column types are skipped with a warning
+- ✅ **TRUNCATE and VACUUM FULL / CLUSTER survive**: a relfilenode change is detected from the
+  WAL (smgr-create + catalog re-check at that commit), the old state is tombstoned and the
+  table re-snapshotted at a fresh cutover — including TRUNCATE+INSERT in one transaction, and
+  truncates that happen while the transcoder is down (a filenode watermark in each Delta
+  commit catches the mismatch at startup). Schema-changing rewrites (`ALTER TABLE ... TYPE`)
+  detach the table with a warning until M3c
 - ✅ **UPDATE and DELETE** transcoded as an append-only change log: updates append the new row
   version, deletes append a tombstone (`_ltap_deleted`); current state is one `QUALIFY
   latest-per-key` view away (see `scripts/verify.sh`). Pre-images come from an in-memory mirror
@@ -88,9 +94,10 @@ lands at `{lake}/{table}`), `LTAP_FLUSH_ROWS`/`LTAP_FLUSH_MS` (batching), `LTAP_
   subtransactions; pglz-compressed values (inline and TOAST); out-of-line TOAST;
   full-page-image handling (`full_page_writes=on`); initial snapshot + consistent cutover;
   wider type matrix
-- **M3 (in progress)** — done: multiple tables, every-table-automatically (one slot, one
-  stream). Remaining: WAL-driven catalog tracking — DDL mid-stream, relfilenode changes
-  (TRUNCATE/VACUUM FULL), add/drop column, table create/drop/rename auto-attach
+- **M3 (in progress)** — done: multiple tables every-table-automatically (one slot, one
+  stream); relfilenode changes (TRUNCATE / VACUUM FULL / CLUSTER, online and offline).
+  Remaining: column DDL (add/drop column, schema evolution → Delta MergeSchema), table
+  create/drop/rename auto-attach
 - **M4** — the LTAP freshness read path: serve "Delta up to LSN X + in-memory tail" merged reads,
   so analytics get read-your-writes without touching Postgres. This is the feature no
   Apache-licensed alternative has.

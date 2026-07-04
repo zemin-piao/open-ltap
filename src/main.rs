@@ -144,6 +144,13 @@ struct Engine {
     toast: heap::ToastCache,
     /// LSN of the last commit record processed (restart floor when idle).
     last_commit_lsn: u64,
+    /// Transactions that created a new main-fork relfilenode in our DB:
+    /// their commit might be a TRUNCATE / rewrite of a tracked table.
+    smgr_suspects: HashSet<u32>,
+    /// Set when a suspect committed: (commit LSN) — the main loop runs a
+    /// catalog re-check (needs SQL, so it happens outside record handling).
+    remap_at: Option<u64>,
+    db_oid: u32,
 }
 
 impl Engine {
@@ -176,7 +183,7 @@ impl Engine {
             }
             let commit_lsn = t.pending.max_commit_lsn;
             let n = t.pending.rows.len();
-            let version = t.sink.append(&t.pending.rows, commit_lsn, restart).await?;
+            let version = t.sink.append(&t.pending.rows, commit_lsn, restart, t.desc.rel_node).await?;
             tracing::info!(
                 table = %t.desc.name,
                 rows = n,
@@ -198,6 +205,61 @@ impl Engine {
         self.txbuf.lookup(table, ctid).or_else(|| self.tables[table].mirror.get(&ctid))
     }
 
+    fn rebuild_routing(&mut self) {
+        self.rel_to_table =
+            self.tables.iter().enumerate().map(|(i, t)| (t.desc.rel_node, i)).collect();
+        self.toast_rels = self.tables.iter().filter_map(|t| t.desc.toast_rel_node).collect();
+    }
+
+    /// A transaction that created relfilenodes committed: re-read the
+    /// catalog and remap any tracked table whose filenode changed
+    /// (TRUNCATE, VACUUM FULL/CLUSTER, ALTER TABLE rewrite).
+    async fn remap_check(&mut self, ddl_lsn: u64, conninfo: &str, persisted_restart: &mut u64) -> Result<()> {
+        let mut changed = false;
+        for ti in 0..self.tables.len() {
+            let name = self.tables[ti].desc.name.clone();
+            let old_node = self.tables[ti].desc.rel_node;
+            let fresh = match schema::discover(conninfo, &name).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(table = %name, "table vanished from catalog — detaching: {e:#}");
+                    self.tables[ti].desc.rel_node = 0; // routes nowhere (0 = invalid filenode)
+                    self.tables[ti].desc.toast_rel_node = None;
+                    changed = true;
+                    continue;
+                }
+            };
+            if fresh.rel_node == old_node {
+                continue;
+            }
+            if fresh.cols.iter().map(|c| (&c.name, c.ty)).ne(self.tables[ti].desc.cols.iter().map(|c| (&c.name, c.ty))) {
+                tracing::warn!(
+                    table = %name,
+                    "relfilenode AND schema changed (ALTER TABLE?) — detaching; schema evolution is M3c"
+                );
+                self.tables[ti].desc.rel_node = 0;
+                self.tables[ti].desc.toast_rel_node = None;
+                changed = true;
+                continue;
+            }
+            tracing::info!(
+                table = %name,
+                old_filenode = old_node,
+                new_filenode = fresh.rel_node,
+                "relfilenode changed (TRUNCATE / rewrite) — tombstoning and re-snapshotting"
+            );
+            let restart = self.restart_lsn();
+            self.tables[ti].desc = fresh;
+            remap_table(&mut self.tables[ti], ddl_lsn, old_node, restart, conninfo).await?;
+            let _ = &persisted_restart; // slot advances with the next normal flush round
+            changed = true;
+        }
+        if changed {
+            self.rebuild_routing();
+        }
+        Ok(())
+    }
+
     fn handle_record(&mut self, lsn: u64, rec: &[u8]) -> Result<()> {
         let record = match wal::parse_record(rec) {
             Ok(r) => r,
@@ -208,6 +270,15 @@ impl Engine {
         };
 
         match record.rmid {
+            rmgr::SMGR => {
+                if record.info & 0xF0 == heap::XLOG_SMGR_CREATE {
+                    if let Ok(Some((db, _rel))) = heap::parse_smgr_create(&record.main_data) {
+                        if db == self.db_oid && record.xid != 0 {
+                            self.smgr_suspects.insert(record.xid);
+                        }
+                    }
+                }
+            }
             rmgr::HEAP => {
                 let op = record.info & heap::XLOG_HEAP_OPMASK;
                 let Some(block0) = record.blocks.iter().find(|b| b.id == 0) else {
@@ -357,6 +428,11 @@ impl Engine {
                 match op {
                     heap::XLOG_XACT_COMMIT => {
                         self.last_commit_lsn = lsn;
+                        if self.smgr_suspects.remove(&record.xid)
+                            || subxids.iter().any(|x| self.smgr_suspects.remove(x))
+                        {
+                            self.remap_at = Some(lsn);
+                        }
                         let ops = self.txbuf.commit(record.xid, &subxids);
                         self.toast.gc_xid(record.xid);
                         for sub in &subxids {
@@ -390,6 +466,10 @@ impl Engine {
                         }
                     }
                     heap::XLOG_XACT_ABORT => {
+                        self.smgr_suspects.remove(&record.xid);
+                        for sub in &subxids {
+                            self.smgr_suspects.remove(sub);
+                        }
                         self.toast.gc_xid(record.xid);
                         for sub in &subxids {
                             self.toast.gc_xid(*sub);
@@ -454,6 +534,56 @@ impl Engine {
     }
 }
 
+/// Tombstone everything the mirror holds (flushed under the OLD filenode's
+/// watermark) and re-snapshot the table at a fresh cutover (committed under
+/// the NEW filenode). Idempotent across crashes: the filenode watermark only
+/// advances with the snapshot commit, so an interrupted remap re-runs.
+/// `t.desc` must already be the fresh descriptor.
+async fn remap_table(
+    t: &mut Table,
+    tombstone_lsn: u64,
+    old_filenode: u32,
+    restart_lsn: u64,
+    conninfo: &str,
+) -> Result<()> {
+    let entries: Vec<_> = t.mirror.drain().collect();
+    for (ctid, ver) in entries {
+        t.pending.emit(tombstone_lsn, true, ctid, ver.row);
+    }
+    if !t.pending.rows.is_empty() {
+        let commit_lsn = t.pending.max_commit_lsn;
+        let n = t.pending.rows.len();
+        t.sink.append(&t.pending.rows, commit_lsn, restart_lsn, old_filenode).await?;
+        tracing::info!(table = %t.desc.name, tombstones = n, "flushed pre-remap state");
+        t.pending.rows.clear();
+        t.pending.first_at = None;
+    }
+
+    let (cutover, rows, mut raw_attrs) = snapshot::take(conninfo, &t.desc).await?;
+    tracing::info!(
+        table = %t.desc.name,
+        rows = rows.len(),
+        cutover = %pgwire::fmt_lsn(cutover),
+        "post-remap snapshot taken"
+    );
+    for (ctid, row) in &rows {
+        let attrs = raw_attrs.remove(ctid).or_else(|| heap::encode_attrs(row, &t.desc));
+        t.mirror.insert(*ctid, txbuf::RowVersion { row: row.clone(), attrs });
+    }
+    let emits: Vec<sink::EmitRow> = rows
+        .into_iter()
+        .map(|(ctid, row)| {
+            t.pending.seq += 1;
+            sink::EmitRow { lsn: cutover, seq: t.pending.seq, deleted: false, ctid, row }
+        })
+        .collect();
+    // Commit even when empty (plain TRUNCATE): the filenode watermark must
+    // advance to the new node or restart would re-run the remap forever.
+    t.sink.append(&emits, cutover, restart_lsn, t.desc.rel_node).await?;
+    t.dedupe_below = cutover;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -507,6 +637,22 @@ async fn main() -> Result<()> {
                     }
                 }
                 tracing::info!(table = %t.desc.name, rows = t.mirror.len(), refreshed, "pre-image mirror rebuilt from Delta");
+                if let Some(stored) = resume.filenode {
+                    if stored != t.desc.rel_node {
+                        // TRUNCATE / rewrite happened while we were down (or
+                        // a remap was interrupted): tombstone the old state
+                        // and re-snapshot. Idempotent — the filenode
+                        // watermark only advances with the snapshot commit.
+                        tracing::warn!(
+                            table = %t.desc.name,
+                            stored_filenode = stored,
+                            live_filenode = t.desc.rel_node,
+                            "relfilenode changed while offline — re-snapshotting"
+                        );
+                        let tomb_lsn = t.dedupe_below + 1;
+                        remap_table(t, tomb_lsn, stored, r, &cfg.sql_conninfo()).await?;
+                    }
+                }
                 restart_candidates.push(r);
             }
             None if cfg.snapshot => {
@@ -527,7 +673,7 @@ async fn main() -> Result<()> {
                         .enumerate()
                         .map(|(i, (ctid, row))| sink::EmitRow { lsn: cutover, seq: i as u64, deleted: false, ctid, row })
                         .collect();
-                    let version = t.sink.append(&emits, cutover, cutover).await?;
+                    let version = t.sink.append(&emits, cutover, cutover, t.desc.rel_node).await?;
                     tracing::info!(table = %t.desc.name, delta_version = version, "initial snapshot committed to Delta");
                 }
                 t.dedupe_below = cutover;
@@ -549,6 +695,7 @@ async fn main() -> Result<()> {
     );
     conn.start_replication(&cfg.slot, start_lsn, timeline).await?;
 
+    let db_oid = tables[0].desc.db_oid;
     let mut engine = Engine {
         rel_to_table: tables.iter().enumerate().map(|(i, t)| (t.desc.rel_node, i)).collect(),
         toast_rels: tables.iter().filter_map(|t| t.desc.toast_rel_node).collect(),
@@ -556,6 +703,9 @@ async fn main() -> Result<()> {
         txbuf: txbuf::TxBuffer::default(),
         toast: heap::ToastCache::default(),
         last_commit_lsn: resume_from,
+        smgr_suspects: HashSet::new(),
+        remap_at: None,
+        db_oid,
     };
 
     let mut reader = wal::WalReader::new(start_lsn);
@@ -574,6 +724,9 @@ async fn main() -> Result<()> {
                     last_recv_lsn = x.wal_end.max(last_recv_lsn);
                     for (lsn, rec) in reader.feed(x.start_lsn, &x.data)? {
                         engine.handle_record(lsn, &rec)?;
+                    }
+                    if let Some(ddl_lsn) = engine.remap_at.take() {
+                        engine.remap_check(ddl_lsn, &cfg.sql_conninfo(), &mut persisted_restart).await?;
                     }
                     if engine.pending_total() >= cfg.flush_rows {
                         engine.flush_all(&mut persisted_restart).await?;

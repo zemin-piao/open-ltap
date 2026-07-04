@@ -239,6 +239,7 @@ pub struct Record {
 
 pub mod rmgr {
     pub const XACT: u8 = 1;
+    pub const SMGR: u8 = 2;
     pub const HEAP2: u8 = 9;
     pub const HEAP: u8 = 10;
 }

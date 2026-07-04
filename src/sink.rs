@@ -49,6 +49,7 @@ pub const DELETED_COL: &str = "_ltap_deleted";
 pub const CTID_COL: &str = "_ltap_ctid";
 const TXN_COMMIT: &str = "open-ltap.commit";
 const TXN_RESTART: &str = "open-ltap.restart";
+const TXN_FILENODE: &str = "open-ltap.filenode";
 
 /// One change-log entry bound for the lake.
 pub struct EmitRow {
@@ -65,6 +66,10 @@ pub struct ResumeState {
     pub commit_lsn: Option<u64>,
     /// WAL position to resume reading from.
     pub restart_lsn: Option<u64>,
+    /// relfilenode the table state corresponds to — a mismatch with the
+    /// live catalog at startup means a TRUNCATE/rewrite happened while we
+    /// were down (or mid-remap) and the table must be re-snapshotted.
+    pub filenode: Option<u32>,
 }
 
 pub struct DeltaSink {
@@ -177,7 +182,11 @@ impl DeltaSink {
             .transaction_version(log_store.as_ref(), TXN_RESTART)
             .await?
             .map(|v| v as u64);
-        Ok(ResumeState { commit_lsn, restart_lsn })
+        let filenode = snapshot
+            .transaction_version(log_store.as_ref(), TXN_FILENODE)
+            .await?
+            .map(|v| v as u32);
+        Ok(ResumeState { commit_lsn, restart_lsn, filenode })
     }
 
     /// Append a batch of committed rows (possibly spanning many PG commits)
@@ -187,6 +196,7 @@ impl DeltaSink {
         rows: &[EmitRow],
         commit_lsn: u64,
         restart_lsn: u64,
+        filenode: u32,
     ) -> Result<i64> {
         // Pull column j out of every row as Option<T>, tolerating type
         // mismatches as NULL (decode already validated shapes).
@@ -242,6 +252,7 @@ impl DeltaSink {
         let props = CommitProperties::default().with_application_transactions(vec![
             Transaction::new(TXN_COMMIT, commit_lsn as i64),
             Transaction::new(TXN_RESTART, restart_lsn as i64),
+            Transaction::new(TXN_FILENODE, filenode as i64),
         ]);
         let operation =
             DeltaOperation::Write { mode: SaveMode::Append, partition_by: None, predicate: None };
