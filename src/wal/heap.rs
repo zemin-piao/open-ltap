@@ -82,11 +82,17 @@ pub enum Value {
 }
 
 /// Days between 1970-01-01 (unix/Delta epoch) and 2000-01-01 (PG epoch).
-const PG_EPOCH_DAYS: i32 = 10_957;
+pub const PG_EPOCH_DAYS: i32 = 10_957;
 /// Microseconds between the same two epochs.
-const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
+pub const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 
 pub type Row = Vec<Option<Value>>;
+
+/// Hyphenated text form of a 16-byte uuid.
+pub fn format_uuid(bytes: &[u8]) -> String {
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+}
 
 // ---------------------------------------------------------------------------
 // Extracting tuples out of full-page images (full_page_writes=on)
@@ -298,12 +304,7 @@ fn decode_value(data: &[u8], off: usize, ty: PgType, toast: &ToastCache) -> Resu
             let s = data
                 .get(off..off + 16)
                 .ok_or_else(|| anyhow::anyhow!("truncated uuid"))?;
-            let hex: String = s.iter().map(|b| format!("{b:02x}")).collect();
-            let text = format!(
-                "{}-{}-{}-{}-{}",
-                &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]
-            );
-            Ok((Value::Text(text), off + 16))
+            Ok((Value::Text(format_uuid(s)), off + 16))
         }
         PgType::Text => {
             let (bytes, new_off) = decode_varlena(data, off, toast)?;

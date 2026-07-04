@@ -9,6 +9,7 @@
 mod pgwire;
 mod schema;
 mod sink;
+mod snapshot;
 mod txbuf;
 mod wal;
 
@@ -35,6 +36,8 @@ struct Config {
     flush_rows: usize,
     /// ...or this much time has passed since the first pending row.
     flush_interval: Duration,
+    /// Take an initial snapshot when the Delta table has no watermark yet.
+    snapshot: bool,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -59,6 +62,7 @@ impl Config {
             flush_interval: Duration::from_millis(
                 env_or("LTAP_FLUSH_MS", "750").parse().expect("LTAP_FLUSH_MS"),
             ),
+            snapshot: !matches!(env_or("LTAP_SNAPSHOT", "on").as_str(), "off" | "0" | "false"),
             table,
         }
     }
@@ -125,7 +129,7 @@ async fn main() -> Result<()> {
     let mut sink = sink::DeltaSink::open_or_create(&cfg.delta_uri, cfg.storage_options(), &desc).await?;
     let resume = sink.resume_state().await?;
     // Commits at or below this LSN are already in Delta: drop them on replay.
-    let dedupe_below = resume.commit_lsn.unwrap_or(0);
+    let mut dedupe_below = resume.commit_lsn.unwrap_or(0);
 
     // 3. Attach to the WAL stream (slot keeps WAL retained while we're down).
     let mut conn = pgwire::ReplConn::connect(&cfg.pg_host, cfg.pg_port, &cfg.pg_user).await?;
@@ -133,10 +137,28 @@ async fn main() -> Result<()> {
     if conn.create_slot(&cfg.slot).await? {
         tracing::info!(slot = %cfg.slot, "created replication slot");
     }
-    // Resume priority: Delta watermark > pre-existing slot's retained WAL
-    // (Delta empty but the slot pinned history — don't drop it) > "now".
+    // Resume priority: Delta watermark > fresh snapshot > pre-existing
+    // slot's retained WAL (snapshot disabled) > "now".
     let slot_restart = conn.slot_restart_lsn(&cfg.slot).await?;
-    let resume_from = resume.restart_lsn.or(slot_restart).unwrap_or(flush_lsn);
+    let resume_from = match resume.restart_lsn {
+        Some(r) => r,
+        None if cfg.snapshot => {
+            let (cutover, rows) = snapshot::take(&cfg.sql_conninfo(), &desc).await?;
+            tracing::info!(
+                rows = rows.len(),
+                cutover = %pgwire::fmt_lsn(cutover),
+                "initial snapshot taken (table was write-locked until here)"
+            );
+            if !rows.is_empty() {
+                let tagged: Vec<sink::TaggedRow> = rows.into_iter().map(|r| (cutover, r)).collect();
+                let version = sink.append(&tagged, cutover, cutover).await?;
+                tracing::info!(delta_version = version, "initial snapshot committed to Delta");
+            }
+            dedupe_below = cutover;
+            cutover
+        }
+        None => slot_restart.unwrap_or(flush_lsn),
+    };
     let start_lsn = resume_from & !(wal::XLOG_PAGE_SIZE - 1); // page-align: reader syncs via page header
     tracing::info!(
         timeline,

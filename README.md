@@ -46,6 +46,9 @@ future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
   from the restart LSN and dedupes replayed transactions
 - ✅ Batched sink: many Postgres commits per Delta commit (`LTAP_FLUSH_ROWS` / `LTAP_FLUSH_MS`),
   each row still tagged with its own commit LSN in `_ltap_lsn`
+- ✅ **Initial snapshot + consistent cutover**: on first run the existing table contents are
+  copied (binary COPY under a brief write lock) as one Delta commit, and the WAL stream takes
+  over at exactly the cutover LSN — no gap, no overlap, crash-safe
 - ✅ Readable from DuckDB (`delta_scan`) — see `scripts/verify.sh`
 
 ## Quickstart
@@ -62,8 +65,8 @@ docker exec -i openltap-pg psql -U postgres -d app \
 ```
 
 Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLE`, `LTAP_SLOT`,
-`LTAP_FLUSH_ROWS`/`LTAP_FLUSH_MS` (batching), `DELTA_URI`,
-`S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY`.
+`LTAP_FLUSH_ROWS`/`LTAP_FLUSH_MS` (batching), `LTAP_SNAPSHOT=off` (skip initial snapshot),
+`DELTA_URI`, `S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY`.
 
 ## Roadmap — the product is M0 → M4, against vanilla Postgres
 
@@ -72,8 +75,8 @@ Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLE`, `LTAP
   (exactly-once), replication slot, multi-insert (`COPY`), CRC32C validation, batched Delta
   commits
 - **M2 (in progress)** — done: subtransactions, pglz-compressed values (inline and TOAST),
-  out-of-line TOAST, full-page-image handling (`full_page_writes=on`), wider type matrix.
-  Remaining: UPDATE/DELETE via Delta deletion vectors; initial snapshot + consistent cutover
+  out-of-line TOAST, full-page-image handling (`full_page_writes=on`), initial snapshot +
+  consistent cutover, wider type matrix. Remaining: UPDATE/DELETE via Delta deletion vectors
 - **M3** — WAL-driven catalog tracking (DDL mid-stream, relfilenode changes, add/drop column),
   multiple tables, every-table-automatically
 - **M4** — the LTAP freshness read path: serve "Delta up to LSN X + in-memory tail" merged reads,

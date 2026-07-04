@@ -37,6 +37,11 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   dev compose now runs `full_page_writes=on`); out-of-line TOAST (chunks buffered per xid,
   resolved eagerly at pointer decode; pglz-externalized too); resume falls back to the slot's
   restart_lsn when Delta has no watermark. Verified byte-identical whole-table md5 vs PG.
+- **M2c shipped & verified 2026-07-04**: initial snapshot + consistent cutover (`snapshot.rs`):
+  binary COPY under `LOCK TABLE IN EXCLUSIVE MODE`, cutover = `pg_current_wal_insert_lsn()` under
+  the lock, snapshot ships as one Delta commit with both watermarks = cutover; stream dedupes
+  everything ≤ cutover. `LTAP_SNAPSHOT=off` disables. Verified against concurrent writers
+  racing the lock and restart-after-kill (no re-snapshot, no dupes).
 - `examples/walscan.rs` — offline WAL reader harness (feeds a raw segment file, compares against
   `pg_waldump`; supports chunked feeding to simulate streaming). Invaluable for reader bugs.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
@@ -45,7 +50,7 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 
 - **M2 (remaining)** — UPDATE/DELETE via Delta deletion vectors (needs pre-image strategy: PK
   from new tuple for updates; for deletes keep a ctid→key map or read old page); lz4/zstd
-  decompression; initial snapshot + consistent cutover.
+  decompression.
 - **M3** — WAL-driven catalog tracking (DDL mid-stream, relfilenode changes from
   TRUNCATE/rewrite, add/drop column), multi-table, every-table-automatically.
 - **M4** — freshness read path: serve "Delta ≤ LSN + in-memory tail" merged reads
