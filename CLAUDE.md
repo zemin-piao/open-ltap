@@ -37,6 +37,17 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   dev compose now runs `full_page_writes=on`); out-of-line TOAST (chunks buffered per xid,
   resolved eagerly at pointer decode; pglz-externalized too); resume falls back to the slot's
   restart_lsn when Delta has no watermark. Verified byte-identical whole-table md5 vs PG.
+- **M2d shipped & verified 2026-07-04 — UPDATE/DELETE**: append-only change log; Delta schema
+  gains `_ltap_seq` (intra-commit order), `_ltap_deleted` (tombstones), `_ltap_ctid` (mirror
+  rebuild key). Pre-images from an in-memory ctid→(row, on-page attr bytes) mirror: seeded by
+  snapshot (raw bytes via pageinspect when available), maintained from WAL ops, rebuilt from the
+  Delta change log on restart (+ pageinspect refresh for long rows — safe because replay
+  refreshes any reused ctid before an update can reference it). Update records with
+  XLH_UPDATE_PREFIX/SUFFIX_FROM_OLD are reconstructed against the old attr bytes; unchanged
+  toast values carry over from the old decoded row. Per-txn overlays give intra-txn chains and
+  cross-subxact visibility (safe: row locks). Current-state read = QUALIFY latest (lsn,seq) per
+  key, NOT _ltap_deleted. Verified byte-identical vs PG across updates/HOT/toast-kept/
+  toast-changed/double-update-one-txn/savepoint-rollback/delete + kill-9 restart mid-scenario.
 - **M2c shipped & verified 2026-07-04**: initial snapshot + consistent cutover (`snapshot.rs`):
   binary COPY under `LOCK TABLE IN EXCLUSIVE MODE`, cutover = `pg_current_wal_insert_lsn()` under
   the lock, snapshot ships as one Delta commit with both watermarks = cutover; stream dedupes
@@ -48,9 +59,8 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 
 ## Next: milestone plan
 
-- **M2 (remaining)** — UPDATE/DELETE via Delta deletion vectors (needs pre-image strategy: PK
-  from new tuple for updates; for deletes keep a ctid→key map or read old page); lz4/zstd
-  decompression.
+- **M2 leftovers (nice-to-have)** — lz4/zstd decompression; change-log compaction (rewrite to
+  deletion vectors or periodic OPTIMIZE); mirror memory bounds.
 - **M3** — WAL-driven catalog tracking (DDL mid-stream, relfilenode changes from
   TRUNCATE/rewrite, add/drop column), multi-table, every-table-automatically.
 - **M4** — freshness read path: serve "Delta ≤ LSN + in-memory tail" merged reads
@@ -70,8 +80,10 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 - `wal/heap.rs` — heap INSERT + multi-insert (COPY) tuple decode (null bitmap, alignment,
   varlena per varatt.h incl. pglz); XACT opcodes + subxact list parsing also here.
 - `schema.rs` — "catalog lite": table descriptor via SQL at startup (M3 replaces this).
-- `txbuf.rs` — per-xid row buffering (+ first-record LSN per xid for the restart watermark);
-  commit merges subxacts and ships, abort discards.
+- `txbuf.rs` — per-xid op buffering (Insert/Update/Delete with ctids + RowVersion) + per-txn
+  overlays for intra-txn pre-images; commit merges subxacts LSN-sorted, abort discards.
+- `snapshot.rs` — initial snapshot (binary COPY with ctid under EXCLUSIVE lock, cutover LSN)
+  + pageinspect raw-attr capture (also used standalone at restart).
 - `sink.rs` — Delta create-if-absent + `RecordBatchWriter` write, committed via `CommitBuilder`
   with `open-ltap.commit`/`open-ltap.restart` txn actions; `_ltap_lsn` column = row's commit LSN.
   Uses `AWS_S3_ALLOW_UNSAFE_RENAME` (single writer, dev).

@@ -39,6 +39,11 @@ future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
   full-page images via line pointers when WAL carries an FPI instead of tuple data
 - ✅ **TOAST**: out-of-line values reassembled from same-transaction toast-chunk inserts,
   including compressed-then-externalized values (pglz)
+- ✅ **UPDATE and DELETE** transcoded as an append-only change log: updates append the new row
+  version, deletes append a tombstone (`_ltap_deleted`); current state is one `QUALIFY
+  latest-per-key` view away (see `scripts/verify.sh`). Pre-images come from an in-memory mirror
+  maintained from the WAL itself (prefix/suffix-compressed update records are reconstructed
+  against it), seeded by the snapshot and rebuilt from the Delta table on restart
 - ✅ Transactional correctness: rows buffered per xid; only `COMMIT`ed transactions reach the
   lake; aborts and `ROLLBACK TO SAVEPOINT` subtransactions are discarded
 - ✅ **Exactly-once across restarts (kill -9 included)**: every Delta commit carries the commit-LSN
@@ -74,9 +79,10 @@ Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLE`, `LTAP
 - **M1 (done)** — restart/resume from LSN watermarks persisted as Delta `txn` actions
   (exactly-once), replication slot, multi-insert (`COPY`), CRC32C validation, batched Delta
   commits
-- **M2 (in progress)** — done: subtransactions, pglz-compressed values (inline and TOAST),
-  out-of-line TOAST, full-page-image handling (`full_page_writes=on`), initial snapshot +
-  consistent cutover, wider type matrix. Remaining: UPDATE/DELETE via Delta deletion vectors
+- **M2 (done)** — UPDATE/DELETE (append-only change log with tombstones + LSN/seq ordering);
+  subtransactions; pglz-compressed values (inline and TOAST); out-of-line TOAST;
+  full-page-image handling (`full_page_writes=on`); initial snapshot + consistent cutover;
+  wider type matrix
 - **M3** — WAL-driven catalog tracking (DDL mid-stream, relfilenode changes, add/drop column),
   multiple tables, every-table-automatically
 - **M4** — the LTAP freshness read path: serve "Delta up to LSN X + in-memory tail" merged reads,
@@ -102,7 +108,13 @@ database platform to adopt.
 
 ## Known limitations (deliberate, tracked by milestone)
 
-- UPDATE/DELETE not yet transcoded (M2: Delta deletion vectors); INSERT/COPY only
+- The change log grows forever (no compaction yet); readers use the latest-per-key view.
+  Delta deletion-vector compaction is future work
+- The pre-image mirror lives in memory: one entry per live row (decoded values + on-page
+  bytes). Very large tables need RAM to match; the M5 pageserver oracle is the real fix
+- Pre-image bytes for rows with long (>126 B) values come from `pageinspect` when available
+  (in-tree extension, superuser); without it, the first prefix-compressed UPDATE of such a
+  row after a snapshot/restart may be skipped with a warning
 - lz4/zstd compression unsupported (`wal_compression` and `default_toast_compression`
   must be `off`/`pglz`)
 - Schema read once at startup; DDL during streaming will corrupt decoding (M3)

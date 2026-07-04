@@ -1,6 +1,15 @@
-//! Delta Lake sink: create-if-absent, then append batches of committed rows.
-//! Every row carries `_ltap_lsn` — its transaction's commit LSN — which is
-//! what later makes LSN-consistent snapshot reads possible.
+//! Delta Lake sink: create-if-absent, then append batches of committed
+//! changes as an append-only change log. Every change row carries:
+//!   `_ltap_lsn`     — its transaction's commit LSN
+//!   `_ltap_seq`     — tie-break ordering within one commit
+//!   `_ltap_deleted` — tombstone flag (UPDATEs append the new version;
+//!                     DELETEs append the old row with this set)
+//!   `_ltap_ctid`    — the row's physical address, used to rebuild the
+//!                     in-memory pre-image mirror after a restart
+//! Current state = latest (_ltap_lsn, _ltap_seq) per key, minus tombstones:
+//!   SELECT * FROM delta_scan(...) QUALIFY row_number() OVER
+//!     (PARTITION BY <pk> ORDER BY _ltap_lsn DESC, _ltap_seq DESC) = 1
+//!     AND NOT _ltap_deleted
 //!
 //! Exactly-once across restarts: every Delta commit also records two
 //! app-level `txn` actions (Delta's idempotent-streaming mechanism):
@@ -26,17 +35,29 @@ use deltalake::kernel::{Action, DataType as DeltaType, PrimitiveType, StructFiel
 use deltalake::operations::create::CreateBuilder;
 use deltalake::protocol::{DeltaOperation, SaveMode};
 use deltalake::writer::{DeltaWriter, RecordBatchWriter};
+use deltalake::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use deltalake::logstore::object_store::ObjectStoreExt as _;
 use url::Url;
 
 use crate::schema::{Col, PgType, TableDesc};
-use crate::wal::heap::{Row, Value};
+use crate::txbuf::{self, Ctid, RowVersion};
+use crate::wal::heap::{self, Row, Value};
 
 pub const LSN_COL: &str = "_ltap_lsn";
+pub const SEQ_COL: &str = "_ltap_seq";
+pub const DELETED_COL: &str = "_ltap_deleted";
+pub const CTID_COL: &str = "_ltap_ctid";
 const TXN_COMMIT: &str = "open-ltap.commit";
 const TXN_RESTART: &str = "open-ltap.restart";
 
-/// A committed PG row tagged with its transaction's commit LSN.
-pub type TaggedRow = (u64, Row);
+/// One change-log entry bound for the lake.
+pub struct EmitRow {
+    pub lsn: u64,
+    pub seq: u64,
+    pub deleted: bool,
+    pub ctid: Ctid,
+    pub row: Row,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ResumeState {
@@ -96,7 +117,12 @@ impl DeltaSink {
             .cols
             .iter()
             .map(|c| Field::new(&c.name, arrow_type(c.ty), true))
-            .chain([Field::new(LSN_COL, ArrowType::Int64, false)])
+            .chain([
+                Field::new(LSN_COL, ArrowType::Int64, false),
+                Field::new(SEQ_COL, ArrowType::Int64, false),
+                Field::new(DELETED_COL, ArrowType::Boolean, false),
+                Field::new(CTID_COL, ArrowType::Int64, false),
+            ])
             .collect();
         let arrow_schema = Arc::new(ArrowSchema::new(arrow_fields));
 
@@ -113,7 +139,12 @@ impl DeltaSink {
                     .cols
                     .iter()
                     .map(|c| StructField::new(c.name.clone(), delta_type(c.ty), true))
-                    .chain([StructField::new(LSN_COL.to_string(), DeltaType::Primitive(PrimitiveType::Long), false)])
+                    .chain([
+                        StructField::new(LSN_COL.to_string(), DeltaType::Primitive(PrimitiveType::Long), false),
+                        StructField::new(SEQ_COL.to_string(), DeltaType::Primitive(PrimitiveType::Long), false),
+                        StructField::new(DELETED_COL.to_string(), DeltaType::Primitive(PrimitiveType::Boolean), false),
+                        StructField::new(CTID_COL.to_string(), DeltaType::Primitive(PrimitiveType::Long), false),
+                    ])
                     .collect();
                 let t = CreateBuilder::new()
                     .with_location(uri)
@@ -153,7 +184,7 @@ impl DeltaSink {
     /// as ONE Delta commit, carrying the new LSN watermarks atomically.
     pub async fn append(
         &mut self,
-        rows: &[TaggedRow],
+        rows: &[EmitRow],
         commit_lsn: u64,
         restart_lsn: u64,
     ) -> Result<i64> {
@@ -162,7 +193,7 @@ impl DeltaSink {
         macro_rules! col_vals {
             ($j:expr, $variant:ident) => {
                 rows.iter()
-                    .map(|(_, r)| match &r[$j] {
+                    .map(|e| match &e.row[$j] {
                         Some(Value::$variant(v)) => Some(v.clone()),
                         _ => None,
                     })
@@ -191,7 +222,16 @@ impl DeltaSink {
             arrays.push(array);
         }
         arrays.push(Arc::new(Int64Array::from(
-            rows.iter().map(|(lsn, _)| *lsn as i64).collect::<Vec<_>>(),
+            rows.iter().map(|e| e.lsn as i64).collect::<Vec<_>>(),
+        )));
+        arrays.push(Arc::new(Int64Array::from(
+            rows.iter().map(|e| e.seq as i64).collect::<Vec<_>>(),
+        )));
+        arrays.push(Arc::new(BooleanArray::from(
+            rows.iter().map(|e| e.deleted).collect::<Vec<_>>(),
+        )));
+        arrays.push(Arc::new(Int64Array::from(
+            rows.iter().map(|e| txbuf::pack_ctid(e.ctid)).collect::<Vec<_>>(),
         )));
 
         let batch = RecordBatch::try_new(self.arrow_schema.clone(), arrays)?;
@@ -213,5 +253,90 @@ impl DeltaSink {
         let version = finalized.version();
         self.table.state = Some(finalized.snapshot());
         Ok(version as i64)
+    }
+
+    /// Rebuild the in-memory pre-image mirror from the change log: the
+    /// latest (_ltap_lsn, _ltap_seq) entry per ctid, tombstones removed.
+    /// This is exactly the table state at the dedupe watermark, which is
+    /// what replay-after-restart needs pre-images against.
+    pub async fn load_mirror(&self, desc: &TableDesc) -> Result<HashMap<Ctid, RowVersion>> {
+        use deltalake::arrow::array::{
+            Array, BinaryArray as ABin, BooleanArray as ABool, Date32Array as ADate,
+            Float32Array as AF32, Float64Array as AF64, Int16Array as AI16, Int32Array as AI32,
+            Int64Array as AI64, StringArray as AStr, TimestampMicrosecondArray as ATs,
+        };
+
+        let files = self.table.get_files_by_partitions(&[]).await?;
+        let store = self.table.log_store().object_store(None);
+        // ctid -> (lsn, seq, deleted, row); keep the max (lsn, seq).
+        let mut latest: HashMap<Ctid, (i64, i64, bool, Row)> = HashMap::new();
+
+        for path in files {
+            let bytes = store.get(&path).await?.bytes().await?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
+            for batch in reader {
+                let batch = batch?;
+                let idx = |name: &str| -> Result<usize> {
+                    batch.schema().index_of(name).map_err(Into::into)
+                };
+                let lsns = batch.column(idx(LSN_COL)?).as_any().downcast_ref::<AI64>()
+                    .ok_or_else(|| anyhow::anyhow!("bad {LSN_COL} type"))?.clone();
+                let seqs = batch.column(idx(SEQ_COL)?).as_any().downcast_ref::<AI64>()
+                    .ok_or_else(|| anyhow::anyhow!("bad {SEQ_COL} type"))?.clone();
+                let dels = batch.column(idx(DELETED_COL)?).as_any().downcast_ref::<ABool>()
+                    .ok_or_else(|| anyhow::anyhow!("bad {DELETED_COL} type"))?.clone();
+                let ctids = batch.column(idx(CTID_COL)?).as_any().downcast_ref::<AI64>()
+                    .ok_or_else(|| anyhow::anyhow!("bad {CTID_COL} type"))?.clone();
+
+                for i in 0..batch.num_rows() {
+                    let key = txbuf::unpack_ctid(ctids.value(i));
+                    let lsn = lsns.value(i);
+                    let seq = seqs.value(i);
+                    if let Some((l, s, _, _)) = latest.get(&key) {
+                        if (lsn, seq) <= (*l, *s) {
+                            continue;
+                        }
+                    }
+                    let mut row: Row = Vec::with_capacity(desc.cols.len());
+                    for (j, col) in desc.cols.iter().enumerate() {
+                        let arr = batch.column(idx(&col.name)?);
+                        if arr.is_null(i) {
+                            row.push(None);
+                            continue;
+                        }
+                        let any = arr.as_any();
+                        let v = match col.ty {
+                            PgType::Bool => Value::Bool(any.downcast_ref::<ABool>().unwrap().value(i)),
+                            PgType::Int2 => Value::I16(any.downcast_ref::<AI16>().unwrap().value(i)),
+                            PgType::Int4 => Value::I32(any.downcast_ref::<AI32>().unwrap().value(i)),
+                            PgType::Int8 => Value::I64(any.downcast_ref::<AI64>().unwrap().value(i)),
+                            PgType::Float4 => Value::F32(any.downcast_ref::<AF32>().unwrap().value(i)),
+                            PgType::Float8 => Value::F64(any.downcast_ref::<AF64>().unwrap().value(i)),
+                            PgType::Text | PgType::Uuid => {
+                                Value::Text(any.downcast_ref::<AStr>().unwrap().value(i).to_string())
+                            }
+                            PgType::Bytea => Value::Bytes(any.downcast_ref::<ABin>().unwrap().value(i).to_vec()),
+                            PgType::Date => Value::I32(any.downcast_ref::<ADate>().unwrap().value(i)),
+                            PgType::Timestamp | PgType::TimestampTz => {
+                                Value::I64(any.downcast_ref::<ATs>().unwrap().value(i))
+                            }
+                        };
+                        let _ = j;
+                        row.push(Some(v));
+                    }
+                    latest.insert(key, (lsn, seq, dels.value(i), row));
+                }
+            }
+        }
+
+        let mut mirror = HashMap::new();
+        for (ctid, (_, _, deleted, row)) in latest {
+            if deleted {
+                continue;
+            }
+            let attrs = heap::encode_attrs(&row, desc);
+            mirror.insert(ctid, RowVersion { row, attrs });
+        }
+        Ok(mirror)
     }
 }

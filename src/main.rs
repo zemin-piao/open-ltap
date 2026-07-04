@@ -87,24 +87,33 @@ impl Config {
     }
 }
 
-/// Committed rows waiting to be flushed to Delta as one commit.
+/// Committed change rows waiting to be flushed to Delta as one commit.
 #[derive(Default)]
 struct PendingBatch {
-    rows: Vec<sink::TaggedRow>,
+    rows: Vec<sink::EmitRow>,
     first_at: Option<Instant>,
     /// Highest PG commit LSN among the pending rows.
     max_commit_lsn: u64,
+    /// Global tie-break counter within equal commit LSNs.
+    seq: u64,
 }
 
 impl PendingBatch {
-    fn push_commit(&mut self, commit_lsn: u64, rows: Vec<heap::Row>) {
+    fn emit(&mut self, lsn: u64, deleted: bool, ctid: txbuf::Ctid, row: heap::Row) {
         if self.first_at.is_none() {
             self.first_at = Some(Instant::now());
         }
-        self.max_commit_lsn = self.max_commit_lsn.max(commit_lsn);
-        self.rows.extend(rows.into_iter().map(|r| (commit_lsn, r)));
+        self.max_commit_lsn = self.max_commit_lsn.max(lsn);
+        self.seq += 1;
+        self.rows.push(sink::EmitRow { lsn, seq: self.seq, deleted, ctid, row });
     }
 }
+
+/// Last committed version of every live row, keyed by physical address.
+/// Pre-images for DELETE (row content for the tombstone) and UPDATE
+/// (prefix/suffix reconstruction, unchanged-toast carry-over) come from
+/// here (or from an open transaction's overlay for intra-txn chains).
+type Mirror = std::collections::HashMap<txbuf::Ctid, txbuf::RowVersion>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -140,18 +149,53 @@ async fn main() -> Result<()> {
     // Resume priority: Delta watermark > fresh snapshot > pre-existing
     // slot's retained WAL (snapshot disabled) > "now".
     let slot_restart = conn.slot_restart_lsn(&cfg.slot).await?;
+    let mut mirror: Mirror = Mirror::new();
     let resume_from = match resume.restart_lsn {
-        Some(r) => r,
+        Some(r) => {
+            // The change log IS the table state at the dedupe watermark —
+            // rebuild the pre-image mirror from it before replaying, and
+            // refresh raw pre-image bytes the log can't reproduce (toast
+            // pointers, inline compression) from live pages.
+            mirror = sink.load_mirror(&desc).await?;
+            let raw = snapshot::read_raw_attrs_conn(&cfg.sql_conninfo(), &desc).await?;
+            let mut refreshed = 0usize;
+            for (ctid, ver) in mirror.iter_mut() {
+                if ver.attrs.is_none() {
+                    if let Some(bytes) = raw.get(ctid) {
+                        ver.attrs = Some(bytes.clone());
+                        refreshed += 1;
+                    }
+                }
+            }
+            tracing::info!(rows = mirror.len(), refreshed, "pre-image mirror rebuilt from Delta");
+            r
+        }
         None if cfg.snapshot => {
-            let (cutover, rows) = snapshot::take(&cfg.sql_conninfo(), &desc).await?;
+            let (cutover, rows, mut raw_attrs) = snapshot::take(&cfg.sql_conninfo(), &desc).await?;
             tracing::info!(
                 rows = rows.len(),
                 cutover = %pgwire::fmt_lsn(cutover),
                 "initial snapshot taken (table was write-locked until here)"
             );
+            for (ctid, row) in &rows {
+                // Exact on-page bytes if pageinspect provided them; else a
+                // re-encoding (faithful only when every varlena is short).
+                let attrs = raw_attrs.remove(ctid).or_else(|| heap::encode_attrs(row, &desc));
+                mirror.insert(*ctid, txbuf::RowVersion { row: row.clone(), attrs });
+            }
             if !rows.is_empty() {
-                let tagged: Vec<sink::TaggedRow> = rows.into_iter().map(|r| (cutover, r)).collect();
-                let version = sink.append(&tagged, cutover, cutover).await?;
+                let emits: Vec<sink::EmitRow> = rows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (ctid, row))| sink::EmitRow {
+                        lsn: cutover,
+                        seq: i as u64,
+                        deleted: false,
+                        ctid,
+                        row,
+                    })
+                    .collect();
+                let version = sink.append(&emits, cutover, cutover).await?;
                 tracing::info!(delta_version = version, "initial snapshot committed to Delta");
             }
             dedupe_below = cutover;
@@ -177,7 +221,6 @@ async fn main() -> Result<()> {
     let mut last_recv_lsn = start_lsn;
     // What the slot may prune up to: only advances when Delta is durable.
     let mut persisted_restart = resume_from;
-    let mut warned_unsupported = false;
     let mut status_interval = tokio::time::interval(Duration::from_secs(10));
     status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut flush_tick = tokio::time::interval(cfg.flush_interval.min(Duration::from_millis(250)));
@@ -189,7 +232,7 @@ async fn main() -> Result<()> {
                 pgwire::ReplMsg::XLogData(x) => {
                     last_recv_lsn = x.wal_end.max(last_recv_lsn);
                     for (lsn, rec) in reader.feed(x.start_lsn, &x.data)? {
-                        handle_record(lsn, &rec, &desc, &mut txbuf, &mut toast, &mut pending, dedupe_below, &mut warned_unsupported)?;
+                        handle_record(lsn, &rec, &desc, &mut txbuf, &mut toast, &mut mirror, &mut pending, dedupe_below)?;
                     }
                     if pending.rows.len() >= cfg.flush_rows {
                         flush(&mut sink, &mut pending, &txbuf, &mut persisted_restart).await?;
@@ -248,15 +291,21 @@ async fn flush(
     Ok(())
 }
 
+/// Pre-image lookup: an open transaction's own uncommitted version wins
+/// over the last committed one.
+fn preimage<'a>(txbuf: &'a txbuf::TxBuffer, mirror: &'a Mirror, ctid: txbuf::Ctid) -> Option<&'a txbuf::RowVersion> {
+    txbuf.lookup(ctid).or_else(|| mirror.get(&ctid))
+}
+
 fn handle_record(
     lsn: u64,
     rec: &[u8],
     desc: &schema::TableDesc,
     txbuf: &mut txbuf::TxBuffer,
     toast: &mut heap::ToastCache,
+    mirror: &mut Mirror,
     pending: &mut PendingBatch,
     dedupe_below: u64,
-    warned_unsupported: &mut bool,
 ) -> Result<()> {
     let record = match wal::parse_record(rec) {
         Ok(r) => r,
@@ -299,7 +348,7 @@ fn handle_record(
                     }
                 }
                 heap::XLOG_HEAP_INSERT => {
-                    let row = if !block0.data.is_empty() {
+                    let decoded = if !block0.data.is_empty() {
                         heap::decode_insert_tuple(&block0.data, desc, toast)
                     } else if let Some(img) = &block0.image {
                         // full_page_writes=on: the tuple lives in the image.
@@ -309,20 +358,47 @@ fn handle_record(
                     } else {
                         Err(anyhow::anyhow!("insert with neither data nor image"))
                     };
-                    match row {
-                        Ok(row) => txbuf.add(record.xid, lsn, row),
-                        Err(e) => tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to decode insert: {e}"),
+                    match (decoded, heap::insert_offnum(&record.main_data)) {
+                        (Ok((row, attrs)), Ok(offnum)) => {
+                            let ctid = (block0.blkno, offnum);
+                            txbuf.add_op(record.xid, lsn, txbuf::Op::Insert {
+                                ctid,
+                                ver: txbuf::RowVersion { row, attrs: Some(attrs) },
+                            });
+                        }
+                        (Err(e), _) | (_, Err(e)) => {
+                            if lsn <= dedupe_below {
+                                tracing::debug!(lsn = %pgwire::fmt_lsn(lsn), "replay: failed to decode insert: {e}");
+                            } else {
+                                tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to decode insert: {e}");
+                            }
+                        }
                     }
                 }
-                heap::XLOG_HEAP_DELETE | heap::XLOG_HEAP_UPDATE | heap::XLOG_HEAP_HOT_UPDATE
-                    if is_main =>
-                {
-                    if !*warned_unsupported {
-                        *warned_unsupported = true;
-                        tracing::warn!(
-                            "UPDATE/DELETE on '{}' observed — not yet transcoded (milestone M2: deletion vectors)",
-                            desc.name
-                        );
+                heap::XLOG_HEAP_DELETE if is_main => {
+                    match heap::delete_offnum(&record.main_data) {
+                        Ok(offnum) => {
+                            let ctid = (block0.blkno, offnum);
+                            let old_row = preimage(txbuf, mirror, ctid).map(|v| v.row.clone());
+                            if old_row.is_none() && lsn > dedupe_below {
+                                tracing::warn!(
+                                    lsn = %pgwire::fmt_lsn(lsn),
+                                    ctid = ?ctid,
+                                    "DELETE of a row not in the mirror — tombstone will be empty"
+                                );
+                            }
+                            txbuf.add_op(record.xid, lsn, txbuf::Op::Delete { ctid, old_row });
+                        }
+                        Err(e) => tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to parse delete: {e}"),
+                    }
+                }
+                heap::XLOG_HEAP_UPDATE | heap::XLOG_HEAP_HOT_UPDATE if is_main => {
+                    if let Err(e) = handle_update(lsn, &record, block0, desc, txbuf, toast, mirror) {
+                        if lsn <= dedupe_below {
+                            tracing::debug!(lsn = %pgwire::fmt_lsn(lsn), "replay: failed to decode update: {e}");
+                        } else {
+                            tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to decode update: {e}");
+                        }
                     }
                 }
                 _ => {}
@@ -351,9 +427,21 @@ fn handle_record(
             } else {
                 Err(anyhow::anyhow!("multi-insert with neither data nor image"))
             };
-            match rows {
-                Ok(rows) => txbuf.add_many(record.xid, lsn, rows),
-                Err(e) => tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to decode multi-insert: {e}"),
+            match (rows, heap::multi_insert_offsets(&record.main_data, record.info)) {
+                (Ok(rows), Ok(offsets)) if rows.len() == offsets.len() => {
+                    for ((row, attrs), offnum) in rows.into_iter().zip(offsets) {
+                        txbuf.add_op(record.xid, lsn, txbuf::Op::Insert {
+                            ctid: (block0.blkno, offnum),
+                            ver: txbuf::RowVersion { row, attrs: Some(attrs) },
+                        });
+                    }
+                }
+                (Ok(rows), Ok(offsets)) => {
+                    tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "multi-insert: {} rows vs {} offsets", rows.len(), offsets.len())
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::warn!(lsn = %pgwire::fmt_lsn(lsn), "failed to decode multi-insert: {e}")
+                }
             }
         }
         rmgr::XACT => {
@@ -369,18 +457,20 @@ fn handle_record(
             };
             match op {
                 heap::XLOG_XACT_COMMIT => {
+                    let ops = txbuf.commit(record.xid, &subxids);
                     toast.gc_xid(record.xid);
                     for sub in &subxids {
                         toast.gc_xid(*sub);
                     }
-                    let rows = txbuf.commit(record.xid, &subxids);
-                    if rows.is_empty() {
+                    if ops.is_empty() {
                         return Ok(());
                     }
                     if lsn <= dedupe_below {
+                        // Replay of a commit whose effects are both in Delta
+                        // AND in the mirror rebuilt from it: skip entirely.
                         tracing::debug!(
                             xid = record.xid,
-                            rows = rows.len(),
+                            ops = ops.len(),
                             commit_lsn = %pgwire::fmt_lsn(lsn),
                             "replayed commit already in Delta — skipped"
                         );
@@ -388,11 +478,30 @@ fn handle_record(
                     }
                     tracing::debug!(
                         xid = record.xid,
-                        rows = rows.len(),
+                        ops = ops.len(),
                         commit_lsn = %pgwire::fmt_lsn(lsn),
-                        "transaction committed — buffered for flush"
+                        "transaction committed — applying"
                     );
-                    pending.push_commit(lsn, rows);
+                    for pending_op in ops {
+                        match pending_op.op {
+                            txbuf::Op::Insert { ctid, ver } => {
+                                pending.emit(lsn, false, ctid, ver.row.clone());
+                                mirror.insert(ctid, ver);
+                            }
+                            txbuf::Op::Update { old_ctid, ctid, ver } => {
+                                mirror.remove(&old_ctid);
+                                pending.emit(lsn, false, ctid, ver.row.clone());
+                                mirror.insert(ctid, ver);
+                            }
+                            txbuf::Op::Delete { ctid, old_row } => {
+                                let row = old_row
+                                    .or_else(|| mirror.get(&ctid).map(|v| v.row.clone()))
+                                    .unwrap_or_else(|| vec![None; desc.cols.len()]);
+                                mirror.remove(&ctid);
+                                pending.emit(lsn, true, ctid, row);
+                            }
+                        }
+                    }
                 }
                 heap::XLOG_XACT_ABORT => {
                     toast.gc_xid(record.xid);
@@ -401,7 +510,7 @@ fn handle_record(
                     }
                     let dropped = txbuf.abort(record.xid, &subxids);
                     if dropped > 0 {
-                        tracing::info!(xid = record.xid, rows = dropped, "aborted transaction discarded");
+                        tracing::info!(xid = record.xid, ops = dropped, "aborted transaction discarded");
                     }
                 }
                 _ => {}
@@ -409,5 +518,55 @@ fn handle_record(
         }
         _ => {}
     }
+    Ok(())
+}
+
+/// Decode an UPDATE/HOT UPDATE: find the pre-image, reconstruct the new
+/// tuple (prefix/suffix bytes come from the old tuple; unchanged toast
+/// values from the old row), and buffer the op.
+fn handle_update(
+    lsn: u64,
+    record: &wal::Record,
+    block0: &wal::BlockRef,
+    desc: &schema::TableDesc,
+    txbuf: &mut txbuf::TxBuffer,
+    toast: &heap::ToastCache,
+    mirror: &Mirror,
+) -> Result<()> {
+    let info = heap::parse_update_main(&record.main_data)?;
+    // Block 0 = the new tuple's page; block 1 (if present) = the old page.
+    let old_blkno = record.blocks.iter().find(|b| b.id == 1).map(|b| b.blkno).unwrap_or(block0.blkno);
+    let old_ctid = (old_blkno, info.old_offnum);
+    let new_ctid = (block0.blkno, info.new_offnum);
+
+    let old = preimage(txbuf, mirror, old_ctid);
+    let (old_attrs, old_row) = match old {
+        Some(v) => (v.attrs.clone(), Some(v.row.clone())),
+        None => (None, None),
+    };
+
+    let (row, attrs) = if !block0.data.is_empty() {
+        heap::decode_update_new_tuple(
+            &block0.data,
+            info.flags,
+            old_attrs.as_deref(),
+            old_row.as_ref(),
+            desc,
+            toast,
+        )?
+    } else if let Some(img) = &block0.image {
+        // FPI carries the complete new tuple; prefix/suffix never apply here.
+        let page = img.restore()?;
+        let (row, attrs) = heap::decode_tuple_from_page(&page, info.new_offnum, desc, toast)?;
+        (row, attrs)
+    } else {
+        anyhow::bail!("update with neither data nor image");
+    };
+    let _ = lsn;
+    txbuf.add_op(record.xid, lsn, txbuf::Op::Update {
+        old_ctid,
+        ctid: new_ctid,
+        ver: txbuf::RowVersion { row, attrs: Some(attrs) },
+    });
     Ok(())
 }

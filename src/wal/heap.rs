@@ -65,6 +65,11 @@ pub fn parse_xact_subxacts(info: u8, main_data: &[u8]) -> Result<Vec<u32>> {
     Ok(xids_bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
 }
 
+// heapam_xlog.h: xl_heap_update flags
+pub const XLH_UPDATE_CONTAINS_NEW_TUPLE: u8 = 1 << 4;
+pub const XLH_UPDATE_PREFIX_FROM_OLD: u8 = 1 << 5;
+pub const XLH_UPDATE_SUFFIX_FROM_OLD: u8 = 1 << 6;
+
 // htup_details.h
 const HEAP_HASNULL: u16 = 0x0001;
 const SIZEOF_HEAP_TUPLE_HEADER: usize = 23;
@@ -97,6 +102,31 @@ pub fn format_uuid(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 // Extracting tuples out of full-page images (full_page_writes=on)
 // ---------------------------------------------------------------------------
+
+/// xl_heap_delete: { xmax u32, offnum u16, infobits u8, flags u8 }.
+pub fn delete_offnum(main_data: &[u8]) -> Result<u16> {
+    let s = main_data.get(4..6).ok_or_else(|| anyhow::anyhow!("delete main data too short"))?;
+    Ok(u16::from_le_bytes(s.try_into().unwrap()))
+}
+
+/// xl_heap_update: { old_xmax u32, old_offnum u16, old_infobits u8,
+/// flags u8, new_xmax u32, new_offnum u16 } (14 bytes).
+pub struct UpdateInfo {
+    pub old_offnum: u16,
+    pub new_offnum: u16,
+    pub flags: u8,
+}
+
+pub fn parse_update_main(main_data: &[u8]) -> Result<UpdateInfo> {
+    if main_data.len() < 14 {
+        bail!("update main data too short");
+    }
+    Ok(UpdateInfo {
+        old_offnum: u16::from_le_bytes(main_data[4..6].try_into().unwrap()),
+        flags: main_data[7],
+        new_offnum: u16::from_le_bytes(main_data[12..14].try_into().unwrap()),
+    })
+}
 
 /// Offset number targeted by a heap INSERT (xl_heap_insert main data).
 pub fn insert_offnum(main_data: &[u8]) -> Result<u16> {
@@ -153,20 +183,137 @@ pub fn decode_tuple_from_page(
     offnum: u16,
     desc: &TableDesc,
     toast: &ToastCache,
-) -> Result<Row> {
+) -> Result<(Row, Vec<u8>)> {
     let (payload, im2, im, hoff) = tuple_on_page(page, offnum)?;
-    decode_tuple_payload(payload, im2, im, hoff, desc, toast)
+    decode_tuple_payload(payload, im2, im, hoff, desc, toast, None)
 }
 
 /// Decode the tuple carried by a heap INSERT record's block-0 data.
-pub fn decode_insert_tuple(block_data: &[u8], desc: &TableDesc, toast: &ToastCache) -> Result<Row> {
+pub fn decode_insert_tuple(
+    block_data: &[u8],
+    desc: &TableDesc,
+    toast: &ToastCache,
+) -> Result<(Row, Vec<u8>)> {
     if block_data.len() < 5 {
         bail!("heap insert block data too short");
     }
     let t_infomask2 = u16::from_le_bytes(block_data[0..2].try_into().unwrap());
     let t_infomask = u16::from_le_bytes(block_data[2..4].try_into().unwrap());
     let t_hoff = block_data[4] as usize;
-    decode_tuple_payload(&block_data[5..], t_infomask2, t_infomask, t_hoff, desc, toast)
+    decode_tuple_payload(&block_data[5..], t_infomask2, t_infomask, t_hoff, desc, toast, None)
+}
+
+/// Decode the new tuple of an UPDATE from block-0 data. Layout
+/// (log_heap_update): [prefix_len u16 if PREFIX flag][suffix_len u16 if
+/// SUFFIX flag] xl_heap_header, null bitmap (+padding), then the attribute
+/// data minus the prefix/suffix shared with the old tuple's attribute bytes.
+pub fn decode_update_new_tuple(
+    block_data: &[u8],
+    flags: u8,
+    old_attrs: Option<&[u8]>,
+    old_row: Option<&Row>,
+    desc: &TableDesc,
+    toast: &ToastCache,
+) -> Result<(Row, Vec<u8>)> {
+    let mut off = 0usize;
+    let mut prefix = 0usize;
+    let mut suffix = 0usize;
+    if flags & XLH_UPDATE_PREFIX_FROM_OLD != 0 {
+        prefix = u16::from_le_bytes(
+            block_data.get(0..2).ok_or_else(|| anyhow::anyhow!("truncated prefix len"))?.try_into().unwrap(),
+        ) as usize;
+        off += 2;
+    }
+    if flags & XLH_UPDATE_SUFFIX_FROM_OLD != 0 {
+        suffix = u16::from_le_bytes(
+            block_data.get(off..off + 2).ok_or_else(|| anyhow::anyhow!("truncated suffix len"))?.try_into().unwrap(),
+        ) as usize;
+        off += 2;
+    }
+    let hdr = block_data
+        .get(off..off + 5)
+        .ok_or_else(|| anyhow::anyhow!("update block data too short"))?;
+    let t_infomask2 = u16::from_le_bytes(hdr[0..2].try_into().unwrap());
+    let t_infomask = u16::from_le_bytes(hdr[2..4].try_into().unwrap());
+    let t_hoff = hdr[4] as usize;
+    off += 5;
+
+    let bits_len = t_hoff
+        .checked_sub(SIZEOF_HEAP_TUPLE_HEADER)
+        .ok_or_else(|| anyhow::anyhow!("t_hoff {t_hoff} < header size"))?;
+    let bitmap = block_data
+        .get(off..off + bits_len)
+        .ok_or_else(|| anyhow::anyhow!("update tuple shorter than its null bitmap"))?;
+    let partial = &block_data[off + bits_len..];
+
+    let payload: std::borrow::Cow<[u8]> = if prefix == 0 && suffix == 0 {
+        block_data[off..].into()
+    } else {
+        let old = old_attrs.ok_or_else(|| {
+            anyhow::anyhow!("update shares {prefix}+{suffix} bytes with an old tuple we don't have")
+        })?;
+        if prefix + suffix > old.len() {
+            bail!("prefix {prefix} + suffix {suffix} exceed old tuple ({} bytes)", old.len());
+        }
+        let mut buf = Vec::with_capacity(bits_len + prefix + partial.len() + suffix);
+        buf.extend_from_slice(bitmap);
+        buf.extend_from_slice(&old[..prefix]);
+        buf.extend_from_slice(partial);
+        buf.extend_from_slice(&old[old.len() - suffix..]);
+        buf.into()
+    };
+    decode_tuple_payload(&payload, t_infomask2, t_infomask, t_hoff, desc, toast, old_row)
+}
+
+/// Re-encode a decoded row into on-page attribute bytes — the pre-image
+/// prefix/suffix compression works against. Only possible when every varlena
+/// is short enough for the 1-byte-header form (payload <= 126 bytes): longer
+/// values may be stored inline-compressed or toasted, whose bytes we cannot
+/// reproduce. Returns None when re-encoding would be unfaithful.
+pub fn encode_attrs(row: &Row, desc: &TableDesc) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    for (i, col) in desc.cols.iter().enumerate() {
+        let Some(v) = row.get(i)?.as_ref() else { continue };
+        match (col.ty, v) {
+            (PgType::Bool, Value::Bool(b)) => buf.push(*b as u8),
+            (PgType::Int2, Value::I16(x)) => pad_put(&mut buf, 2, &x.to_le_bytes()),
+            (PgType::Int4, Value::I32(x)) => pad_put(&mut buf, 4, &x.to_le_bytes()),
+            (PgType::Int8, Value::I64(x)) => pad_put(&mut buf, 8, &x.to_le_bytes()),
+            (PgType::Float4, Value::F32(x)) => pad_put(&mut buf, 4, &x.to_le_bytes()),
+            (PgType::Float8, Value::F64(x)) => pad_put(&mut buf, 8, &x.to_le_bytes()),
+            (PgType::Date, Value::I32(x)) => pad_put(&mut buf, 4, &(x - PG_EPOCH_DAYS).to_le_bytes()),
+            (PgType::Timestamp | PgType::TimestampTz, Value::I64(x)) => {
+                pad_put(&mut buf, 8, &(x - PG_EPOCH_MICROS).to_le_bytes())
+            }
+            (PgType::Uuid, Value::Text(t)) => {
+                let hex: String = t.chars().filter(|c| *c != '-').collect();
+                if hex.len() != 32 {
+                    return None;
+                }
+                for j in (0..32).step_by(2) {
+                    buf.push(u8::from_str_radix(&hex[j..j + 2], 16).ok()?);
+                }
+            }
+            (PgType::Text, Value::Text(t)) => encode_short_varlena(&mut buf, t.as_bytes())?,
+            (PgType::Bytea, Value::Bytes(b)) => encode_short_varlena(&mut buf, b)?,
+            _ => return None, // type/value mismatch
+        }
+    }
+    Some(buf)
+}
+
+fn pad_put(buf: &mut Vec<u8>, align: usize, bytes: &[u8]) {
+    buf.resize(align_to(buf.len(), align), 0);
+    buf.extend_from_slice(bytes);
+}
+
+fn encode_short_varlena(buf: &mut Vec<u8>, payload: &[u8]) -> Option<()> {
+    if payload.len() > 126 {
+        return None; // could be inline-compressed or toasted on page
+    }
+    buf.push((((payload.len() + 1) << 1) | 1) as u8);
+    buf.extend_from_slice(payload);
+    Some(())
 }
 
 /// Decode all tuples of a HEAP2 MULTI_INSERT record (COPY, multi-row INSERT).
@@ -179,7 +326,7 @@ pub fn decode_multi_insert(
     main_data: &[u8],
     desc: &TableDesc,
     toast: &ToastCache,
-) -> Result<Vec<Row>> {
+) -> Result<Vec<(Row, Vec<u8>)>> {
     if main_data.len() < 4 {
         bail!("multi-insert main data too short");
     }
@@ -199,7 +346,7 @@ pub fn decode_multi_insert(
         let payload = block_data
             .get(off + 7..off + 7 + datalen)
             .ok_or_else(|| anyhow::anyhow!("multi-insert tuple {i} data truncated"))?;
-        rows.push(decode_tuple_payload(payload, t_infomask2, t_infomask, t_hoff, desc, toast)?);
+        rows.push(decode_tuple_payload(payload, t_infomask2, t_infomask, t_hoff, desc, toast, None)?);
         off += 7 + datalen;
     }
     Ok(rows)
@@ -214,7 +361,8 @@ fn decode_tuple_payload(
     t_hoff: usize,
     desc: &TableDesc,
     toast: &ToastCache,
-) -> Result<Row> {
+    old_row: Option<&Row>,
+) -> Result<(Row, Vec<u8>)> {
     let natts = (t_infomask2 & 0x07FF) as usize;
     if natts != desc.cols.len() {
         bail!(
@@ -247,10 +395,21 @@ fn decode_tuple_payload(
         }
         let (value, new_off) = decode_value(data, off, col.ty, toast)
             .map_err(|e| anyhow::anyhow!("column '{}': {}", col.name, e))?;
-        row.push(Some(value));
+        match value {
+            Some(v) => row.push(Some(v)),
+            // Unresolved toast pointer: the value is unchanged from the
+            // previous version of this row (UPDATE), so take it from there.
+            None => match old_row.and_then(|r| r.get(i)).and_then(|v| v.clone()) {
+                Some(v) => row.push(Some(v)),
+                None => bail!(
+                    "column '{}': toast value has no buffered chunks and no previous row version",
+                    col.name
+                ),
+            },
+        }
         off = new_off;
     }
-    Ok(row)
+    Ok((row, data.to_vec()))
 }
 
 fn align_to(off: usize, align: usize) -> usize {
@@ -265,54 +424,55 @@ fn fixed<const N: usize>(data: &[u8], off: usize, align: usize, what: &str) -> R
     Ok((s.try_into().unwrap(), off + N))
 }
 
-fn decode_value(data: &[u8], off: usize, ty: PgType, toast: &ToastCache) -> Result<(Value, usize)> {
+/// `Ok((None, _))` means an unresolved toast pointer (offset still advanced).
+fn decode_value(data: &[u8], off: usize, ty: PgType, toast: &ToastCache) -> Result<(Option<Value>, usize)> {
     match ty {
         PgType::Bool => {
             let b = *data.get(off).ok_or_else(|| anyhow::anyhow!("truncated bool"))?;
-            Ok((Value::Bool(b != 0), off + 1))
+            Ok((Some(Value::Bool(b != 0)), off + 1))
         }
         PgType::Int2 => {
             let (s, off) = fixed::<2>(data, off, 2, "int2")?;
-            Ok((Value::I16(i16::from_le_bytes(s)), off))
+            Ok((Some(Value::I16(i16::from_le_bytes(s))), off))
         }
         PgType::Int4 => {
             let (s, off) = fixed::<4>(data, off, 4, "int4")?;
-            Ok((Value::I32(i32::from_le_bytes(s)), off))
+            Ok((Some(Value::I32(i32::from_le_bytes(s))), off))
         }
         PgType::Int8 => {
             let (s, off) = fixed::<8>(data, off, 8, "int8")?;
-            Ok((Value::I64(i64::from_le_bytes(s)), off))
+            Ok((Some(Value::I64(i64::from_le_bytes(s))), off))
         }
         PgType::Float4 => {
             let (s, off) = fixed::<4>(data, off, 4, "float4")?;
-            Ok((Value::F32(f32::from_le_bytes(s)), off))
+            Ok((Some(Value::F32(f32::from_le_bytes(s))), off))
         }
         PgType::Float8 => {
             let (s, off) = fixed::<8>(data, off, 8, "float8")?;
-            Ok((Value::F64(f64::from_le_bytes(s)), off))
+            Ok((Some(Value::F64(f64::from_le_bytes(s))), off))
         }
         PgType::Date => {
             let (s, off) = fixed::<4>(data, off, 4, "date")?;
-            Ok((Value::I32(i32::from_le_bytes(s) + PG_EPOCH_DAYS), off))
+            Ok((Some(Value::I32(i32::from_le_bytes(s) + PG_EPOCH_DAYS)), off))
         }
         PgType::Timestamp | PgType::TimestampTz => {
             let (s, off) = fixed::<8>(data, off, 8, "timestamp")?;
-            Ok((Value::I64(i64::from_le_bytes(s) + PG_EPOCH_MICROS), off))
+            Ok((Some(Value::I64(i64::from_le_bytes(s) + PG_EPOCH_MICROS)), off))
         }
         PgType::Uuid => {
             // typalign 'c': no padding, 16 raw bytes.
             let s = data
                 .get(off..off + 16)
                 .ok_or_else(|| anyhow::anyhow!("truncated uuid"))?;
-            Ok((Value::Text(format_uuid(s)), off + 16))
+            Ok((Some(Value::Text(format_uuid(s))), off + 16))
         }
         PgType::Text => {
             let (bytes, new_off) = decode_varlena(data, off, toast)?;
-            Ok((Value::Text(String::from_utf8_lossy(&bytes).into_owned()), new_off))
+            Ok((bytes.map(|b| Value::Text(String::from_utf8_lossy(&b).into_owned())), new_off))
         }
         PgType::Bytea => {
             let (bytes, new_off) = decode_varlena(data, off, toast)?;
-            Ok((Value::Bytes(bytes), new_off))
+            Ok((bytes.map(Value::Bytes), new_off))
         }
     }
 }
@@ -322,7 +482,7 @@ fn decode_value(data: &[u8], off: usize, ty: PgType, toast: &ToastCache) -> Resu
 ///  - first byte 0x01 -> external/toast pointer (unsupported here)
 ///  - first byte 0x00 -> alignment padding before a 4-byte header
 ///  - first byte even -> already-aligned 4-byte header
-fn decode_varlena(data: &[u8], mut off: usize, toast: &ToastCache) -> Result<(Vec<u8>, usize)> {
+fn decode_varlena(data: &[u8], mut off: usize, toast: &ToastCache) -> Result<(Option<Vec<u8>>, usize)> {
     let first = *data.get(off).ok_or_else(|| anyhow::anyhow!("truncated varlena"))?;
     if first == 0x01 {
         // varatt_external pointer: [0x01][vartag][rawsize i32][extinfo u32]
@@ -337,7 +497,12 @@ fn decode_varlena(data: &[u8], mut off: usize, toast: &ToastCache) -> Result<(Ve
         let rawsize = i32::from_le_bytes(s[0..4].try_into().unwrap());
         let extinfo = u32::from_le_bytes(s[4..8].try_into().unwrap());
         let valueid = u32::from_le_bytes(s[8..12].try_into().unwrap());
-        return Ok((toast.resolve(valueid, rawsize, extinfo)?, off + 18));
+        if !toast.contains(valueid) {
+            // Chunks not buffered: an UPDATE keeping an old toast value
+            // unchanged. Caller substitutes the previous row's value.
+            return Ok((None, off + 18));
+        }
+        return Ok((Some(toast.resolve(valueid, rawsize, extinfo)?), off + 18));
     }
     if first & 0x01 == 1 {
         // 1-byte header: total length in bytes 1..=126, header included.
@@ -348,7 +513,7 @@ fn decode_varlena(data: &[u8], mut off: usize, toast: &ToastCache) -> Result<(Ve
         let payload = data
             .get(off + 1..off + total)
             .ok_or_else(|| anyhow::anyhow!("truncated short varlena"))?;
-        return Ok((payload.to_vec(), off + total));
+        return Ok((Some(payload.to_vec()), off + total));
     }
     // 4-byte header (possibly after padding).
     off = align_to(off, 4);
@@ -376,11 +541,11 @@ fn decode_varlena(data: &[u8], mut off: usize, toast: &ToastCache) -> Result<(Ve
             1 => bail!("lz4-compressed value: set default_toast_compression=pglz (lz4 unsupported)"),
             m => bail!("unknown toast compression method {m}"),
         };
-        return Ok((out, off + total));
+        return Ok((Some(out), off + total));
     }
     let payload =
         data.get(off + 4..off + total).ok_or_else(|| anyhow::anyhow!("truncated varlena body"))?;
-    Ok((payload.to_vec(), off + total))
+    Ok((Some(payload.to_vec()), off + total))
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +574,10 @@ impl ToastCache {
 
     pub fn len(&self) -> usize {
         self.vals.len()
+    }
+
+    pub fn contains(&self, valueid: u32) -> bool {
+        self.vals.contains_key(&valueid)
     }
 
     fn resolve(&self, valueid: u32, rawsize: i32, extinfo: u32) -> Result<Vec<u8>> {
@@ -457,6 +626,7 @@ pub fn decode_toast_chunk(
     let seq = i32::from_le_bytes(seq_bytes.try_into().unwrap());
     // chunk_data is a plain (never external/compressed) varlena.
     let (bytes, _) = decode_varlena(data, 8, &ToastCache::default())?;
+    let bytes = bytes.ok_or_else(|| anyhow::anyhow!("toast chunk_data is itself a toast pointer"))?;
     Ok((valueid, seq, bytes))
 }
 
