@@ -102,14 +102,26 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   needs `SET force_download=true` + httpfs (no Range support served). Verified: 2-min flush lag
   where delta_scan misses rows the merged read sees; min_lsn RYW (200 instant / 408 timeout);
   flush-overlap dedupe (7/7 distinct). `scripts/verify-fresh.sh` = demo reader.
+- **M4b shipped & verified 2026-07-06 — change-log compaction** (`sink.rs::compact`): inline in
+  the single writer (so NO commit coordinator / Unity Catalog / conditional-put needed), collapse
+  the append-only log to latest-(lsn,seq)-per-PK, drop tombstoned + superseded, rewrite as
+  remove-all-adds-in-one-commit preserving the commit/restart/filenode txn actions. Works in
+  Arrow space (conform each file to current schema + concat + group-by-PK + `take`) so retired
+  (PG-dropped, Delta-retained) columns survive byte-for-byte. Trigger: per-table rows-written
+  counter >= LTAP_COMPACT_ROWS (default 1e6, 0=off), checked after flush; needs a PK (pg_index
+  indisprimary) else skipped. Mirror rebuild off a compacted table is CLEANER (no stale ctids).
+  Verified: 1811→189 rows, current-state md5 identical, post-compaction UPDATE/DELETE/INSERT +
+  kill-9 restart all exact; keyless table skipped without error. NOTE: DV-based collapse now
+  feasible (buoyant_kernel `deletion_vector_writer` is DataFusion-free) — would cut write amp.
 - `examples/walscan.rs` — offline WAL reader harness (feeds a raw segment file, compares against
   `pg_waldump`; supports chunked feeding to simulate streaming). Invaluable for reader bugs.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
 
-- **M2 leftovers (nice-to-have)** — lz4/zstd decompression; change-log compaction (rewrite to
-  deletion vectors or periodic OPTIMIZE); mirror memory bounds.
+- **M2 leftovers (nice-to-have)** — lz4/zstd decompression; mirror memory bounds.
+- **Compaction leftovers** — DV-based collapse (less write amp than replace-based); streaming
+  compaction for tables too big to hold in memory; optional VACUUM with a safe retention floor.
 - **M3 leftovers (nice-to-have)** — discovery re-keyed by table OID instead of name (rename of
   A→B followed by CREATE A would confuse name-based tracking); attach_failed retry policy.
   Notes: rewrites are handled by re-snapshot, not by decoding XLOG_FPI page loads; rapid

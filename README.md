@@ -74,6 +74,11 @@ future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
   copied (binary COPY under a brief write lock) as one Delta commit, and the WAL stream takes
   over at exactly the cutover LSN — no gap, no overlap, crash-safe
 - ✅ Readable from DuckDB (`delta_scan`) — see `scripts/verify.sh`
+- ✅ **Change-log compaction**: the append-only log is periodically collapsed to current state
+  (latest version per primary key, tombstones and superseded versions dropped) in one atomic
+  remove-all + add-compacted commit that preserves the exactly-once watermarks. Runs inline in
+  the single writer (no commit coordinator needed) and bounds both read cost and restart time.
+  `LTAP_COMPACT_ROWS` sets the threshold; tables without a primary key are left as a full log
 - ✅ **Freshness read path**: the transcoder serves its in-memory tail (committed in Postgres,
   not yet flushed to Delta) over HTTP as Parquet; `delta_scan + tail` merged reads see every
   committed transaction seconds after commit, with `?min_lsn=` long-polling for hard
@@ -96,7 +101,8 @@ Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLES` (csv;
 public tables), `LTAP_SLOT` (default `ltap_<db>`), `LTAP_LAKE` (default `s3://lake`; each table
 lands at `{lake}/{table}`), `LTAP_FLUSH_ROWS`/`LTAP_FLUSH_MS` (batching), `LTAP_SNAPSHOT=off`
 (skip initial snapshot), `LTAP_HTTP_PORT` (freshness endpoint, default 8088, 0 = off),
-`LTAP_TAIL_RETAIN_MS` (how long flushed rows stay in the served tail, default 60000),
+`LTAP_TAIL_RETAIN_MS` (served-tail retention, default 60000), `LTAP_COMPACT_ROWS`
+(change-log rows before a table is compacted, default 1000000, 0 = off),
 `S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY`.
 
 ## Roadmap — the product is M0 → M4, against vanilla Postgres
@@ -137,8 +143,9 @@ database platform to adopt.
 
 ## Known limitations (deliberate, tracked by milestone)
 
-- The change log grows forever (no compaction yet); readers use the latest-per-key view.
-  Delta deletion-vector compaction is future work
+- Compaction rewrites the whole table in memory (matches the mirror's in-memory assumption)
+  and is replace-based; a deletion-vector variant (now feasible — the kernel exposes a
+  DataFusion-free DV writer) would cut write amplification
 - The pre-image mirror lives in memory: one entry per live row (decoded values + on-page
   bytes). Very large tables need RAM to match; the M5 pageserver oracle is the real fix
 - Pre-image bytes for rows with long (>126 B) values come from `pageinspect` when available

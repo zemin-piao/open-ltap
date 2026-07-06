@@ -46,6 +46,9 @@ struct Config {
     http_port: u16,
     /// How long flushed rows stay in the served tail (gap-free merges).
     tail_retain: Duration,
+    /// Compact a table's change log once this many rows have accumulated
+    /// since its last compaction (0 disables).
+    compact_rows: u64,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -80,6 +83,7 @@ impl Config {
             tail_retain: Duration::from_millis(
                 env_or("LTAP_TAIL_RETAIN_MS", "60000").parse().expect("LTAP_TAIL_RETAIN_MS"),
             ),
+            compact_rows: env_or("LTAP_COMPACT_ROWS", "1000000").parse().expect("LTAP_COMPACT_ROWS"),
             tables: if tables.is_empty() { None } else { Some(tables) },
             pg_db,
         }
@@ -144,6 +148,8 @@ struct Table {
     /// Decode hit a schema-drift or similar inconsistency: converge by
     /// tombstoning + re-snapshotting at the next catalog check.
     needs_resnapshot: bool,
+    /// Change-log rows written since the last compaction of this table.
+    rows_since_compaction: u64,
 }
 
 /// The whole transcoding state: N tables fed by one WAL stream.
@@ -170,6 +176,7 @@ struct Engine {
     /// Freshness endpoint's view of the world.
     tail: serve::SharedTail,
     tail_retain: Duration,
+    compact_rows: u64,
     db_oid: u32,
 }
 
@@ -212,11 +219,38 @@ impl Engine {
                 delta_version = version,
                 "flushed batch to Delta"
             );
+            t.rows_since_compaction += n as u64;
             t.pending.rows.clear();
             t.pending.first_at = None;
             self.tail.write().unwrap().mark_flushed(&t.desc.name, self.tail_retain);
         }
         *persisted_restart = restart;
+        Ok(())
+    }
+
+    /// Collapse any table whose change log has grown past the threshold.
+    /// Inline in the single writer — no concurrent-writer coordination.
+    async fn maybe_compact(&mut self) -> Result<()> {
+        if self.compact_rows == 0 {
+            return Ok(());
+        }
+        for ti in 0..self.tables.len() {
+            if self.tables[ti].rows_since_compaction < self.compact_rows
+                || self.tables[ti].desc.pk.is_empty()
+            {
+                continue;
+            }
+            let name = self.tables[ti].desc.name.clone();
+            let desc = self.tables[ti].desc.clone();
+            match self.tables[ti].sink.compact(&desc).await {
+                Ok(Some((before, after))) => {
+                    tracing::info!(table = %name, rows_before = before, rows_after = after, "compacted change log");
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(table = %name, "compaction failed: {e:#}"),
+            }
+            self.tables[ti].rows_since_compaction = 0;
+        }
         Ok(())
     }
 
@@ -674,6 +708,7 @@ async fn attach_table(name: &str, cfg: &Config) -> Result<Table> {
         dedupe_below: 0,
         pending: PendingBatch::default(),
         needs_resnapshot: false,
+        rows_since_compaction: 0,
     };
     let resume = t.sink.resume_state().await?;
     t.dedupe_below = resume.commit_lsn.unwrap_or(0);
@@ -788,6 +823,7 @@ async fn main() -> Result<()> {
             dedupe_below: 0,
             pending: PendingBatch::default(),
             needs_resnapshot: false,
+            rows_since_compaction: 0,
         });
     }
 
@@ -910,6 +946,7 @@ async fn main() -> Result<()> {
         attach_failed: HashSet::new(),
         tail: tail.clone(),
         tail_retain: cfg.tail_retain,
+        compact_rows: cfg.compact_rows,
         db_oid,
     };
 
@@ -936,6 +973,7 @@ async fn main() -> Result<()> {
                     engine.tail.write().unwrap().applied_lsn = last_recv_lsn;
                     if engine.pending_total() >= cfg.flush_rows {
                         engine.flush_all(&mut persisted_restart).await?;
+                        engine.maybe_compact().await?;
                     }
                 }
                 pgwire::ReplMsg::Keepalive { wal_end, reply_requested } => {
@@ -949,6 +987,7 @@ async fn main() -> Result<()> {
             _ = flush_tick.tick() => {
                 if engine.oldest_batch_age().is_some_and(|age| age >= cfg.flush_interval) {
                     engine.flush_all(&mut persisted_restart).await?;
+                    engine.maybe_compact().await?;
                     conn.send_status(last_recv_lsn, persisted_restart).await?;
                 }
             }

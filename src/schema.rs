@@ -80,6 +80,9 @@ pub struct TableDesc {
     /// rows written before it read as NULL from WAL, so the table needs a
     /// re-snapshot to materialize the defaults.
     pub has_fast_defaults: bool,
+    /// Primary-key column names, in key order. Empty if the table has no
+    /// primary key — change-log compaction needs a key and is skipped then.
+    pub pk: Vec<String>,
 }
 
 /// Discover every table to transcode. `tables` = None means all ordinary
@@ -191,6 +194,18 @@ pub async fn discover(conninfo: &str, table: &str) -> Result<TableDesc> {
     let db_oid: u32 = row.get(1);
     let toast_rel_node: Option<u32> = row.get(2);
 
+    let pk_rows = client
+        .query(
+            "SELECT a.attname
+             FROM pg_index i
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+             WHERE i.indrelid = format('public.%I', $1::text)::regclass AND i.indisprimary
+             ORDER BY array_position(i.indkey, a.attnum)",
+            &[&table],
+        )
+        .await?;
+    let pk: Vec<String> = pk_rows.iter().map(|r| r.get::<_, String>(0)).collect();
+
     let attrs = client
         .query(
             "SELECT a.attname, a.atttypid, a.attisdropped, a.attlen::int4, a.attalign::text,
@@ -234,5 +249,5 @@ pub async fn discover(conninfo: &str, table: &str) -> Result<TableDesc> {
         bail!("table '{table}' has no columns?");
     }
     handle.abort();
-    Ok(TableDesc { name: table.to_string(), db_oid, rel_node, toast_rel_node, cols, phys, has_fast_defaults })
+    Ok(TableDesc { name: table.to_string(), db_oid, rel_node, toast_rel_node, cols, phys, has_fast_defaults, pk })
 }

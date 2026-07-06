@@ -505,4 +505,191 @@ impl DeltaSink {
         }
         Ok(mirror)
     }
+
+    /// Collapse the append-only change log to current state: keep the latest
+    /// (_ltap_lsn, _ltap_seq) row per primary key, drop tombstoned keys and
+    /// all superseded versions, and rewrite the table as fresh files in ONE
+    /// atomic commit (remove-all + add-compacted) that carries the exactly-
+    /// once watermarks forward. Runs inline in the single writer, so there is
+    /// no concurrency to coordinate. Works in Arrow space, so every Delta
+    /// column — including ones dropped in Postgres but retained here — is
+    /// preserved byte-for-byte. Returns (rows_before, rows_after), or None if
+    /// skipped (no primary key, or nothing to gain).
+    pub async fn compact(&mut self, desc: &TableDesc) -> Result<Option<(usize, usize)>> {
+        use deltalake::arrow::array::{
+            new_null_array, Array, BooleanArray as ABool, Int64Array as AI64, UInt32Array,
+        };
+        use deltalake::arrow::compute::{concat_batches, take};
+
+        if desc.pk.is_empty() {
+            return Ok(None); // no key to collapse on
+        }
+        let pk_idx: Vec<usize> = desc
+            .pk
+            .iter()
+            .filter_map(|name| self.delta_cols.iter().position(|dc| &dc.col.name == name))
+            .collect();
+        if pk_idx.len() != desc.pk.len() {
+            return Ok(None); // a PK column isn't in the Delta table (mid-evolution)
+        }
+
+        // Read every active file, conform it to the current schema (older
+        // files lack columns added later), and concat into one batch.
+        let files = self.table.get_files_by_partitions(&[]).await?;
+        if files.len() < 2 {
+            // A single file still benefits if it has superseded rows, but the
+            // common "already compact" case is one file — cheap to check below.
+        }
+        let store = self.table.log_store().object_store(None);
+        let mut batches = Vec::new();
+        for path in &files {
+            let bytes = store.get(path).await?.bytes().await?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
+            for b in reader {
+                batches.push(conform_batch(&b?, &self.arrow_schema));
+            }
+        }
+        if batches.is_empty() {
+            return Ok(None);
+        }
+        let all = concat_batches(&self.arrow_schema, &batches)?;
+        let total = all.num_rows();
+
+        let lsns = all.column(all.schema().index_of(LSN_COL)?).as_any().downcast_ref::<AI64>()
+            .ok_or_else(|| anyhow::anyhow!("bad {LSN_COL} type"))?.clone();
+        let seqs = all.column(all.schema().index_of(SEQ_COL)?).as_any().downcast_ref::<AI64>()
+            .ok_or_else(|| anyhow::anyhow!("bad {SEQ_COL} type"))?.clone();
+        let dels = all.column(all.schema().index_of(DELETED_COL)?).as_any().downcast_ref::<ABool>()
+            .ok_or_else(|| anyhow::anyhow!("bad {DELETED_COL} type"))?.clone();
+        let pk_types: Vec<PgType> = desc.pk.iter().map(|n| {
+            desc.cols.iter().find(|c| &c.name == n).map(|c| c.ty).unwrap()
+        }).collect();
+
+        // Latest (lsn, seq) row index per primary key.
+        let mut best: HashMap<String, (i64, i64, u32, bool)> = HashMap::new();
+        for i in 0..total {
+            let mut key = String::new();
+            for (k, &ci) in pk_idx.iter().enumerate() {
+                key.push_str(&arrow_cell_key(all.column(ci), pk_types[k], i));
+                key.push('\x1f');
+            }
+            let lsn = lsns.value(i);
+            let seq = seqs.value(i);
+            match best.get(&key) {
+                Some((l, s, _, _)) if (lsn, seq) <= (*l, *s) => {}
+                _ => {
+                    best.insert(key, (lsn, seq, i as u32, dels.value(i)));
+                }
+            }
+        }
+        let mut survivors: Vec<u32> = best
+            .values()
+            .filter(|(_, _, _, deleted)| !*deleted)
+            .map(|(_, _, idx, _)| *idx)
+            .collect();
+        survivors.sort_unstable();
+        let after = survivors.len();
+
+        // Nothing to gain: already one file with no superseded/deleted rows.
+        if after == total && files.len() <= 1 {
+            return Ok(None);
+        }
+
+        let idx_array = UInt32Array::from(survivors);
+        let cols: Vec<_> = all
+            .columns()
+            .iter()
+            .map(|c| take(c, &idx_array, None))
+            .collect::<std::result::Result<_, _>>()?;
+        let compacted = RecordBatch::try_new(self.arrow_schema.clone(), cols)?;
+
+        // Build the replace commit: remove every current file, add the
+        // compacted file(s), and re-assert the watermarks so resume is
+        // unaffected even after the old log entries are checkpointed away.
+        let removes: Vec<Action> = self
+            .table
+            .snapshot()?
+            .snapshot()
+            .log_data()
+            .into_iter()
+            .map(|v| Action::Remove(v.remove_action(true)))
+            .collect();
+
+        let mut adds: Vec<Action> = Vec::new();
+        if compacted.num_rows() > 0 {
+            let mut writer = RecordBatchWriter::for_table(&self.table)?;
+            writer.write(compacted).await?;
+            adds = writer.flush().await?.into_iter().map(Action::Add).collect();
+        }
+
+        let resume = self.resume_state().await?;
+        let mut txns = Vec::new();
+        if let Some(v) = resume.commit_lsn {
+            txns.push(Transaction::new(TXN_COMMIT, v as i64));
+        }
+        if let Some(v) = resume.restart_lsn {
+            txns.push(Transaction::new(TXN_RESTART, v as i64));
+        }
+        txns.push(Transaction::new(TXN_FILENODE, resume.filenode.unwrap_or(desc.rel_node) as i64));
+
+        let mut actions = removes;
+        actions.extend(adds);
+        let op = DeltaOperation::Write {
+            mode: SaveMode::Overwrite,
+            partition_by: None,
+            predicate: None,
+        };
+        let finalized = CommitBuilder::from(CommitProperties::default().with_application_transactions(txns))
+            .with_actions(actions)
+            .build(Some(self.table.snapshot()?), self.table.log_store(), op)
+            .await
+            .context("committing compaction")?;
+        self.table.state = Some(finalized.snapshot());
+        Ok(Some((total, after)))
+    }
+}
+
+/// Reshape a batch to `schema`: keep columns by name, fill absent ones (added
+/// after this file was written) with nulls.
+fn conform_batch(batch: &RecordBatch, schema: &Arc<ArrowSchema>) -> RecordBatch {
+    use deltalake::arrow::array::new_null_array;
+    let cols: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            batch
+                .column_by_name(f.name())
+                .cloned()
+                .unwrap_or_else(|| new_null_array(f.data_type(), batch.num_rows()))
+        })
+        .collect();
+    RecordBatch::try_new(schema.clone(), cols).expect("conform batch to schema")
+}
+
+/// A stable string key for the value in `col` at `row`, for grouping by PK.
+fn arrow_cell_key(col: &ArrayRef, ty: PgType, row: usize) -> String {
+    use deltalake::arrow::array::{
+        Array, BinaryArray as ABin, BooleanArray as ABool, Date32Array as ADate,
+        Float32Array as AF32, Float64Array as AF64, Int16Array as AI16, Int32Array as AI32,
+        Int64Array as AI64, StringArray as AStr, TimestampMicrosecondArray as ATs,
+    };
+    if col.is_null(row) {
+        return "\0NULL".to_string();
+    }
+    let a = col.as_any();
+    match ty {
+        PgType::Bool => (a.downcast_ref::<ABool>().unwrap().value(row) as u8).to_string(),
+        PgType::Int2 => a.downcast_ref::<AI16>().unwrap().value(row).to_string(),
+        PgType::Int4 | PgType::Date => a.downcast_ref::<AI32>().unwrap().value(row).to_string(),
+        PgType::Int8 => a.downcast_ref::<AI64>().unwrap().value(row).to_string(),
+        PgType::Float4 => a.downcast_ref::<AF32>().unwrap().value(row).to_bits().to_string(),
+        PgType::Float8 => a.downcast_ref::<AF64>().unwrap().value(row).to_bits().to_string(),
+        PgType::Text | PgType::Uuid => a.downcast_ref::<AStr>().unwrap().value(row).to_string(),
+        PgType::Bytea => hex_of(a.downcast_ref::<ABin>().unwrap().value(row)),
+        PgType::Timestamp | PgType::TimestampTz => a.downcast_ref::<ATs>().unwrap().value(row).to_string(),
+    }
+}
+
+fn hex_of(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
