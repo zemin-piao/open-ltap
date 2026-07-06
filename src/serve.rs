@@ -79,6 +79,23 @@ impl TailStore {
         }
     }
 
+    /// Bound tail memory: evict oldest *flushed* batches (already durable in
+    /// Delta — eviction only narrows the overlap window) until the table is
+    /// under `cap` rows. Unflushed batches are never evicted: they are the
+    /// only copy outside Postgres until the next flush.
+    pub fn enforce_cap(&mut self, table: &str, cap: usize) {
+        if let Some(t) = self.tables.get_mut(table) {
+            let mut total: usize = t.batches.iter().map(|b| b.batch.num_rows()).sum();
+            while total > cap {
+                let Some(pos) = t.batches.iter().position(|b| b.flushed_at.is_some()) else {
+                    break; // everything left is unflushed: must be kept
+                };
+                total -= t.batches[pos].batch.num_rows();
+                t.batches.remove(pos);
+            }
+        }
+    }
+
     /// Schema changed / table re-snapshotted: drop the tail (everything is
     /// durable in Delta at this point — remaps flush first).
     pub fn clear(&mut self, table: &str) {

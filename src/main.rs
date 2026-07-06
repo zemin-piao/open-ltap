@@ -49,6 +49,11 @@ struct Config {
     /// Compact a table's change log once this many rows have accumulated
     /// since its last compaction (0 disables).
     compact_rows: u64,
+    /// Reclaim compaction-orphaned files older than this after compacting;
+    /// None = never vacuum.
+    vacuum_after: Option<Duration>,
+    /// Ceiling on served-tail rows per table (flushed batches evict first).
+    tail_max_rows: usize,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -84,6 +89,11 @@ impl Config {
                 env_or("LTAP_TAIL_RETAIN_MS", "60000").parse().expect("LTAP_TAIL_RETAIN_MS"),
             ),
             compact_rows: env_or("LTAP_COMPACT_ROWS", "1000000").parse().expect("LTAP_COMPACT_ROWS"),
+            vacuum_after: match env_or("LTAP_VACUUM_MINS", "1440").as_str() {
+                "off" => None,
+                v => Some(Duration::from_secs(v.parse::<u64>().expect("LTAP_VACUUM_MINS") * 60)),
+            },
+            tail_max_rows: env_or("LTAP_TAIL_MAX_ROWS", "100000").parse().expect("LTAP_TAIL_MAX_ROWS"),
             tables: if tables.is_empty() { None } else { Some(tables) },
             pg_db,
         }
@@ -176,7 +186,9 @@ struct Engine {
     /// Freshness endpoint's view of the world.
     tail: serve::SharedTail,
     tail_retain: Duration,
+    tail_max_rows: usize,
     compact_rows: u64,
+    vacuum_after: Option<Duration>,
     db_oid: u32,
 }
 
@@ -222,7 +234,11 @@ impl Engine {
             t.rows_since_compaction += n as u64;
             t.pending.rows.clear();
             t.pending.first_at = None;
-            self.tail.write().unwrap().mark_flushed(&t.desc.name, self.tail_retain);
+            {
+                let mut tail = self.tail.write().unwrap();
+                tail.mark_flushed(&t.desc.name, self.tail_retain);
+                tail.enforce_cap(&t.desc.name, self.tail_max_rows);
+            }
         }
         *persisted_restart = restart;
         Ok(())
@@ -245,6 +261,13 @@ impl Engine {
             match self.tables[ti].sink.compact(&desc).await {
                 Ok(Some((before, after))) => {
                     tracing::info!(table = %name, rows_before = before, rows_after = after, "compacted change log");
+                    if let Some(retention) = self.vacuum_after {
+                        match self.tables[ti].sink.vacuum(retention).await {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!(table = %name, files_deleted = n, "vacuumed orphaned files"),
+                            Err(e) => tracing::warn!(table = %name, "vacuum failed: {e:#}"),
+                        }
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => tracing::warn!(table = %name, "compaction failed: {e:#}"),
@@ -618,7 +641,9 @@ impl Engine {
                             let t = &self.tables[ti];
                             if t.pending.rows.len() > start {
                                 if let Ok(batch) = t.sink.make_batch(&t.pending.rows[start..]) {
-                                    self.tail.write().unwrap().push(&t.desc.name, batch);
+                                    let mut tail = self.tail.write().unwrap();
+                                    tail.push(&t.desc.name, batch);
+                                    tail.enforce_cap(&t.desc.name, self.tail_max_rows);
                                 }
                             }
                         }
@@ -946,7 +971,9 @@ async fn main() -> Result<()> {
         attach_failed: HashSet::new(),
         tail: tail.clone(),
         tail_retain: cfg.tail_retain,
+        tail_max_rows: cfg.tail_max_rows,
         compact_rows: cfg.compact_rows,
+        vacuum_after: cfg.vacuum_after,
         db_oid,
     };
 

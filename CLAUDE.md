@@ -113,6 +113,13 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   Verified: 1811→189 rows, current-state md5 identical, post-compaction UPDATE/DELETE/INSERT +
   kill-9 restart all exact; keyless table skipped without error. NOTE: DV-based collapse now
   feasible (buoyant_kernel `deletion_vector_writer` is DataFusion-free) — would cut write amp.
+- **M4 wrapped 2026-07-06**: vacuum after compaction (delta-rs VacuumBuilder, DataFusion-free;
+  LTAP_VACUUM_MINS default 1440, "off" disables, enforce_retention_duration(false)) — verified
+  orphans physically deleted, one parquet file left, md5 intact; tail memory bounded
+  (LTAP_TAIL_MAX_ROWS default 100k, evicts oldest FLUSHED batches only — unflushed are the only
+  copy outside PG; batch-granular) — verified merged reads stay complete through eviction.
+  Arrow Flight deliberately skipped (gRPC stack for marginal gain over HTTP-Parquet). M4 DONE —
+  the M0–M4 product is complete.
 - `examples/walscan.rs` — offline WAL reader harness (feeds a raw segment file, compares against
   `pg_waldump`; supports chunked feeding to simulate streaming). Invaluable for reader bugs.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
@@ -126,8 +133,9 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   A→B followed by CREATE A would confuse name-based tracking); attach_failed retry policy.
   Notes: rewrites are handled by re-snapshot, not by decoding XLOG_FPI page loads; rapid
   consecutive DDL on one table remains the known race window (mitigated by drift self-healing).
-- **M4 leftovers** — Arrow Flight endpoint (pyarrow/ADBC clients); bound tail memory for very
-  large pending sets; Range support if force_download ever hurts.
+- **M4 leftovers (explicitly deferred)** — Arrow Flight endpoint (only if ADBC clients demand
+  it); HTTP Range support if force_download ever hurts; DV-based compaction; streaming
+  compaction for tables larger than memory.
 - **M5 / v2 (future work)** — Neon safekeeper source; pageserver as GetPage@LSN oracle;
   eventually transcoding inside pageserver compaction (canonical columnar).
 

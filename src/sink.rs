@@ -506,6 +506,23 @@ impl DeltaSink {
         Ok(mirror)
     }
 
+    /// Reclaim data files no longer referenced by the log (orphaned by
+    /// compaction), older than `retention`. Runs in the single writer; the
+    /// retention window protects readers that resolved a file list just
+    /// before a compaction commit.
+    pub async fn vacuum(&mut self, retention: std::time::Duration) -> Result<usize> {
+        let (table, metrics) = self
+            .table
+            .clone()
+            .vacuum()
+            .with_retention_period(chrono::Duration::from_std(retention).map_err(|e| anyhow::anyhow!("{e}"))?)
+            .with_enforce_retention_duration(false)
+            .await
+            .context("vacuuming Delta table")?;
+        self.table = table;
+        Ok(metrics.files_deleted.len())
+    }
+
     /// Collapse the append-only change log to current state: keep the latest
     /// (_ltap_lsn, _ltap_seq) row per primary key, drop tombstoned keys and
     /// all superseded versions, and rewrite the table as fresh files in ONE

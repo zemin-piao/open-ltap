@@ -74,10 +74,11 @@ future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
   copied (binary COPY under a brief write lock) as one Delta commit, and the WAL stream takes
   over at exactly the cutover LSN — no gap, no overlap, crash-safe
 - ✅ Readable from DuckDB (`delta_scan`) — see `scripts/verify.sh`
-- ✅ **Change-log compaction**: the append-only log is periodically collapsed to current state
-  (latest version per primary key, tombstones and superseded versions dropped) in one atomic
-  remove-all + add-compacted commit that preserves the exactly-once watermarks. Runs inline in
-  the single writer (no commit coordinator needed) and bounds both read cost and restart time.
+- ✅ **Change-log compaction + vacuum**: the append-only log is periodically collapsed to
+  current state (latest version per primary key, tombstones and superseded versions dropped)
+  in one atomic remove-all + add-compacted commit that preserves the exactly-once watermarks,
+  then orphaned files are reclaimed after a retention window. Runs inline in the single writer
+  (no commit coordinator needed) and bounds read cost, restart time, AND storage.
   `LTAP_COMPACT_ROWS` sets the threshold; tables without a primary key are left as a full log
 - ✅ **Freshness read path**: the transcoder serves its in-memory tail (committed in Postgres,
   not yet flushed to Delta) over HTTP as Parquet; `delta_scan + tail` merged reads see every
@@ -101,8 +102,10 @@ Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLES` (csv;
 public tables), `LTAP_SLOT` (default `ltap_<db>`), `LTAP_LAKE` (default `s3://lake`; each table
 lands at `{lake}/{table}`), `LTAP_FLUSH_ROWS`/`LTAP_FLUSH_MS` (batching), `LTAP_SNAPSHOT=off`
 (skip initial snapshot), `LTAP_HTTP_PORT` (freshness endpoint, default 8088, 0 = off),
-`LTAP_TAIL_RETAIN_MS` (served-tail retention, default 60000), `LTAP_COMPACT_ROWS`
-(change-log rows before a table is compacted, default 1000000, 0 = off),
+`LTAP_TAIL_RETAIN_MS` (served-tail retention, default 60000), `LTAP_TAIL_MAX_ROWS`
+(served-tail ceiling per table, default 100000), `LTAP_COMPACT_ROWS` (change-log rows before
+a table is compacted, default 1000000, 0 = off), `LTAP_VACUUM_MINS` (orphaned-file retention
+before deletion after compaction, default 1440, `off` = never),
 `S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY`.
 
 ## Roadmap — the product is M0 → M4, against vanilla Postgres
@@ -119,10 +122,12 @@ lands at `{lake}/{table}`), `LTAP_FLUSH_ROWS`/`LTAP_FLUSH_MS` (batching), `LTAP_
   every-table-automatically (one slot, one stream); relfilenode changes (TRUNCATE / VACUUM
   FULL / CLUSTER, online and offline); ADD/DROP COLUMN with Delta schema evolution;
   CREATE/DROP/RENAME table lifecycle
-- **M4 (core done)** — the LTAP freshness read path: the transcoder serves "Delta + in-memory
-  tail" merged reads over HTTP/Parquet, so analytics get read-your-writes (`?min_lsn=`
-  long-poll) without touching Postgres. Remaining polish: Arrow Flight endpoint, tail serving
-  for very large pending sets.
+- **M4 (done)** — the LTAP freshness read path: the transcoder serves "Delta + in-memory
+  tail" merged reads over HTTP/Parquet with bounded tail memory, so analytics get
+  read-your-writes (`?min_lsn=` long-poll) without touching Postgres; plus inline compaction
+  and vacuum keeping the log, restart time, and storage bounded. (An Arrow Flight endpoint was
+  considered and deliberately skipped: HTTP-Parquet is readable by every engine already, and
+  Flight would add a gRPC stack for marginal gain.)
 
 At M4 the tool is complete for its primary audience: existing Postgres, existing lake, no new
 database platform to adopt.
