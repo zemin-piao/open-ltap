@@ -132,14 +132,22 @@ before deletion after compaction, default 1440, `off` = never),
 At M4 the tool is complete for its primary audience: existing Postgres, existing lake, no new
 database platform to adopt.
 
-## Future work — storage-level integration (research track)
+## M5 — Neon safekeeper source (in progress) & future work (v2)
 
 - **M5 — Neon safekeeper source.** The WAL format is identical, so the same decoder can attach to
   a [Neon](https://github.com/neondatabase/neon) safekeeper stream instead of a walsender: zero
   load on compute, and the pageserver becomes a random-access oracle (`GetPage@LSN`) for
-  pre-images, TOAST chunks, and consistent backfill. Honest caveats: you must run a Neon stack,
-  and table data still exists twice on S3 (Neon layer files + Parquet). Interesting mainly for
-  platform teams already invested in Neon.
+  pre-images, TOAST chunks, and consistent backfill. **Done so far:** the safekeeper wire protocol
+  (tenant/timeline startup params, JWT auth, slot-less `START_REPLICATION`), decoding Neon's
+  custom heap rmgr (compute nodes log DML with a spliced-in `t_cid`, normalized back onto the
+  vanilla decode path), `LTAP_SOURCE=safekeeper` config wiring, and a local pageserver +
+  3-safekeeper + compute stack (`neon-compose/`) for testing. **Not done yet:** an actual
+  end-to-end run against that stack, the full-page-image path under the Neon dialect, confirming
+  safekeeper WAL framing/CRC matches a vanilla walsender byte-for-byte, and the pageserver
+  `GetPage@LSN` oracle itself — pre-images/TOAST/backfill still go through the compute's SQL port
+  (same as M2d) for now; that integration hasn't started. Honest caveats once complete: you must
+  run a Neon stack, and table data still exists twice on S3 (Neon layer files + Parquet).
+  Interesting mainly for platform teams already invested in Neon.
 - **v2 — transcoding inside pageserver compaction.** The Lakebase endgame: Parquet becomes the
   *only* durable copy, row pages demote to a rebuildable cache. Requires forking the pageserver
   and solving the reverse path (rebuilding byte-addressed 8KB pages from Parquet). Research-grade;

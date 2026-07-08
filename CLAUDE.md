@@ -120,6 +120,30 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   copy outside PG; batch-granular) — verified merged reads stay complete through eviction.
   Arrow Flight deliberately skipped (gRPC stack for marginal gain over HTTP-Parquet). M4 DONE —
   the M0–M4 product is complete.
+- **M5 groundwork underway 2026-07-08 (not yet verified end-to-end) — safekeeper source**:
+  dialect split threaded through the existing decoder rather than a second one —
+  `HeapFmt::{Vanilla,Neon}` (`wal/heap.rs`) carries the `t_cid: u32` offset shift through every
+  tuple-header parser (`wal_heap_header`, `parse_update_main`, `multi_insert_offsets`,
+  `decode_insert_tuple`, `decode_update_new_tuple`, `decode_toast_chunk_from_wal`); `rmgr::NEON`
+  (134) opcodes are normalized onto the vanilla `(rmid, op)` space at the top of
+  `Engine::handle_record` (`main.rs`) so the rest of decode stays dialect-agnostic. `pgwire.rs`
+  gained safekeeper startup params (tenant_id/timeline_id), `AuthenticationCleartextPassword`
+  handling (JWT), and `start_replication_safekeeper` (bare `START_REPLICATION PHYSICAL <lsn>`,
+  no SLOT/TIMELINE clause). `WalSource::{Postgres,Safekeeper}` (`LTAP_SOURCE`) skips slot
+  creation on the safekeeper path — Delta watermarks are the only resume authority, there being
+  no slot concept on a safekeeper. `schema::neon_ids()` reads tenant/timeline off the compute's
+  `neon.tenant_id`/`neon.timeline_id` GUCs when not given via env. `neon-compose/` +
+  `scripts/neon-init.sh` vendor upstream neondatabase/neon's docker-compose (pageserver, 3
+  safekeepers, storage broker, compute wrapper) for a local stack, with safekeeper1's pg port
+  published so the transcoder on the host can stream from it. Commits `76c0912` (wire
+  protocol + decoding + config wiring) and `273ba74` (neon-compose stack), both pushed to
+  `origin/main`. **Left**: an actual end-to-end run against neon-compose (the Neon-dialect
+  offset math above is reasoned from `neon_xlog.h`, not yet checked against real bytes); the
+  FPI/full-page-image path under the Neon dialect (untested — page-image restores don't need
+  `fmt`, but that assumption is unverified against a real Neon-rmgr FPI record); confirming
+  safekeeper `XLogData` framing/CRC matches vanilla walsender byte-for-byte; exercising
+  `snapshot.rs`/pageinspect against a Neon compute (plain SQL, expected to work unmodified, but
+  unexercised).
 - `examples/walscan.rs` — offline WAL reader harness (feeds a raw segment file, compares against
   `pg_waldump`; supports chunked feeding to simulate streaming). Invaluable for reader bugs.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
@@ -136,8 +160,11 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 - **M4 leftovers (explicitly deferred)** — Arrow Flight endpoint (only if ADBC clients demand
   it); HTTP Range support if force_download ever hurts; DV-based compaction; streaming
   compaction for tables larger than memory.
-- **M5 / v2 (future work)** — Neon safekeeper source; pageserver as GetPage@LSN oracle;
-  eventually transcoding inside pageserver compaction (canonical columnar).
+- **M5 (in progress, see State above)** — end-to-end validation against neon-compose; FPI path
+  under the Neon dialect; safekeeper framing/CRC parity check; snapshot/pageinspect against a
+  Neon compute. Pageserver as a `GetPage@LSN` oracle (pre-images, TOAST, backfill) not yet
+  started.
+- **v2 (future work)** — transcoding inside pageserver compaction (canonical columnar).
 
 ## Code map (src/)
 
