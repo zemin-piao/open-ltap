@@ -242,6 +242,9 @@ pub mod rmgr {
     pub const SMGR: u8 = 2;
     pub const HEAP2: u8 = 9;
     pub const HEAP: u8 = 10;
+    /// Neon's custom rmgr (RM_NEON_ID): heap DML with CommandIds, logged by
+    /// Neon compute nodes instead of HEAP/HEAP2 records.
+    pub const NEON: u8 = 134;
 }
 
 // fork_flags bits (xlogrecord.h)

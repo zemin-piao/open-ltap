@@ -126,6 +126,25 @@ pub async fn discover_all(conninfo: &str, tables: Option<&[String]>) -> Result<V
     Ok(descs)
 }
 
+/// The compute's (tenant_id, timeline_id), from the neon extension's GUCs.
+pub async fn neon_ids(conninfo: &str) -> Result<(String, String)> {
+    let (client, conn) = tokio_postgres::connect(conninfo, NoTls)
+        .await
+        .context("connecting for neon tenant/timeline discovery")?;
+    let handle = tokio::spawn(conn);
+    let mut ids = Vec::with_capacity(2);
+    for guc in ["neon.tenant_id", "neon.timeline_id"] {
+        let row = client
+            .query_one(&format!("SHOW {guc}") as &str, &[])
+            .await
+            .with_context(|| format!("SHOW {guc} (is this a Neon compute?)"))?;
+        ids.push(row.get::<_, String>(0));
+    }
+    handle.abort();
+    let timeline = ids.pop().unwrap();
+    Ok((ids.pop().unwrap(), timeline))
+}
+
 /// All ordinary tables in the public schema.
 pub async fn list_tables(conninfo: &str) -> Result<Vec<String>> {
     let (client, conn) = tokio_postgres::connect(conninfo, NoTls).await?;

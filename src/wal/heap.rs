@@ -39,6 +39,40 @@ pub const XLOG_HEAP2_MULTI_INSERT: u8 = 0x50;
 /// Set alongside the opcode when the operation initializes a fresh page.
 pub const XLOG_HEAP_INIT_PAGE: u8 = 0x80;
 
+// neon_xlog.h (Neon's postgres fork): compute nodes log DML through a custom
+// rmgr (id 134) instead of heap/heap2 — the same records with a u32 CommandId
+// spliced in, and heap+heap2 opcodes consolidated under one rmgr (so the
+// HOT_UPDATE/LOCK codes differ from vanilla).
+pub const XLOG_NEON_HEAP_INSERT: u8 = 0x00;
+pub const XLOG_NEON_HEAP_DELETE: u8 = 0x10;
+pub const XLOG_NEON_HEAP_UPDATE: u8 = 0x20;
+pub const XLOG_NEON_HEAP_HOT_UPDATE: u8 = 0x30;
+pub const XLOG_NEON_HEAP_LOCK: u8 = 0x40;
+pub const XLOG_NEON_HEAP_MULTI_INSERT: u8 = 0x50;
+
+/// Which dialect a DML record was logged in. Everything is byte-identical
+/// except where a `t_cid: u32` sits in the Neon structs; each parser below
+/// documents the shift it causes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeapFmt {
+    Vanilla,
+    Neon,
+}
+
+/// xl_heap_header { t_infomask2 u16, t_infomask u16, t_hoff u8 } (5 bytes) or
+/// xl_neon_heap_header, which puts `t_cid u32` before t_hoff (9 bytes).
+/// Returns (t_infomask2, t_infomask, t_hoff, header length).
+fn wal_heap_header(b: &[u8], fmt: HeapFmt) -> Result<(u16, u16, usize, usize)> {
+    let len = match fmt {
+        HeapFmt::Vanilla => 5,
+        HeapFmt::Neon => 9,
+    };
+    let hdr = b.get(..len).ok_or_else(|| anyhow::anyhow!("heap header truncated"))?;
+    let t_infomask2 = u16::from_le_bytes(hdr[0..2].try_into().unwrap());
+    let t_infomask = u16::from_le_bytes(hdr[2..4].try_into().unwrap());
+    Ok((t_infomask2, t_infomask, hdr[len - 1] as usize, len))
+}
+
 // transam/xact.h
 pub const XLOG_XACT_OPMASK: u8 = 0x70;
 pub const XLOG_XACT_COMMIT: u8 = 0x00;
@@ -133,27 +167,35 @@ pub fn format_uuid(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// xl_heap_delete: { xmax u32, offnum u16, infobits u8, flags u8 }.
+/// (xl_neon_heap_delete appends a trailing t_cid — same offsets up front,
+/// so both formats read here.)
 pub fn delete_offnum(main_data: &[u8]) -> Result<u16> {
     let s = main_data.get(4..6).ok_or_else(|| anyhow::anyhow!("delete main data too short"))?;
     Ok(u16::from_le_bytes(s.try_into().unwrap()))
 }
 
 /// xl_heap_update: { old_xmax u32, old_offnum u16, old_infobits u8,
-/// flags u8, new_xmax u32, new_offnum u16 } (14 bytes).
+/// flags u8, new_xmax u32, new_offnum u16 } (14 bytes). The Neon variant
+/// inserts t_cid u32 after flags, pushing new_xmax/new_offnum back 4 bytes
+/// (18 bytes total).
 pub struct UpdateInfo {
     pub old_offnum: u16,
     pub new_offnum: u16,
     pub flags: u8,
 }
 
-pub fn parse_update_main(main_data: &[u8]) -> Result<UpdateInfo> {
-    if main_data.len() < 14 {
+pub fn parse_update_main(main_data: &[u8], fmt: HeapFmt) -> Result<UpdateInfo> {
+    let new_off = match fmt {
+        HeapFmt::Vanilla => 12,
+        HeapFmt::Neon => 16,
+    };
+    if main_data.len() < new_off + 2 {
         bail!("update main data too short");
     }
     Ok(UpdateInfo {
         old_offnum: u16::from_le_bytes(main_data[4..6].try_into().unwrap()),
         flags: main_data[7],
-        new_offnum: u16::from_le_bytes(main_data[12..14].try_into().unwrap()),
+        new_offnum: u16::from_le_bytes(main_data[new_off..new_off + 2].try_into().unwrap()),
     })
 }
 
@@ -164,8 +206,10 @@ pub fn insert_offnum(main_data: &[u8]) -> Result<u16> {
 }
 
 /// Offset numbers targeted by a multi-insert. With INIT_PAGE the offsets
-/// array is elided and the tuples occupy slots 1..=ntuples.
-pub fn multi_insert_offsets(main_data: &[u8], info: u8) -> Result<Vec<u16>> {
+/// array is elided and the tuples occupy slots 1..=ntuples. flags/ntuples
+/// share offsets across formats; Neon's t_cid sits between ntuples and the
+/// offsets array, pushing it from byte 4 to byte 8.
+pub fn multi_insert_offsets(main_data: &[u8], info: u8, fmt: HeapFmt) -> Result<Vec<u16>> {
     if main_data.len() < 4 {
         bail!("multi-insert main data too short");
     }
@@ -173,8 +217,12 @@ pub fn multi_insert_offsets(main_data: &[u8], info: u8) -> Result<Vec<u16>> {
     if info & XLOG_HEAP_INIT_PAGE != 0 {
         return Ok((1..=ntuples).collect());
     }
+    let base = match fmt {
+        HeapFmt::Vanilla => 4,
+        HeapFmt::Neon => 8,
+    };
     let arr = main_data
-        .get(4..4 + 2 * ntuples as usize)
+        .get(base..base + 2 * ntuples as usize)
         .ok_or_else(|| anyhow::anyhow!("multi-insert offsets truncated"))?;
     Ok(arr.chunks_exact(2).map(|c| u16::from_le_bytes(c.try_into().unwrap())).collect())
 }
@@ -222,14 +270,10 @@ pub fn decode_insert_tuple(
     block_data: &[u8],
     desc: &TableDesc,
     toast: &ToastCache,
+    fmt: HeapFmt,
 ) -> Result<(Row, Vec<u8>)> {
-    if block_data.len() < 5 {
-        bail!("heap insert block data too short");
-    }
-    let t_infomask2 = u16::from_le_bytes(block_data[0..2].try_into().unwrap());
-    let t_infomask = u16::from_le_bytes(block_data[2..4].try_into().unwrap());
-    let t_hoff = block_data[4] as usize;
-    decode_tuple_payload(&block_data[5..], t_infomask2, t_infomask, t_hoff, desc, toast, None)
+    let (t_infomask2, t_infomask, t_hoff, hdr_len) = wal_heap_header(block_data, fmt)?;
+    decode_tuple_payload(&block_data[hdr_len..], t_infomask2, t_infomask, t_hoff, desc, toast, None)
 }
 
 /// Decode the new tuple of an UPDATE from block-0 data. Layout
@@ -243,6 +287,7 @@ pub fn decode_update_new_tuple(
     old_row: Option<&Row>,
     desc: &TableDesc,
     toast: &ToastCache,
+    fmt: HeapFmt,
 ) -> Result<(Row, Vec<u8>)> {
     let mut off = 0usize;
     let mut prefix = 0usize;
@@ -259,13 +304,8 @@ pub fn decode_update_new_tuple(
         ) as usize;
         off += 2;
     }
-    let hdr = block_data
-        .get(off..off + 5)
-        .ok_or_else(|| anyhow::anyhow!("update block data too short"))?;
-    let t_infomask2 = u16::from_le_bytes(hdr[0..2].try_into().unwrap());
-    let t_infomask = u16::from_le_bytes(hdr[2..4].try_into().unwrap());
-    let t_hoff = hdr[4] as usize;
-    off += 5;
+    let (t_infomask2, t_infomask, t_hoff, hdr_len) = wal_heap_header(&block_data[off..], fmt)?;
+    off += hdr_len;
 
     let bits_len = t_hoff
         .checked_sub(SIZEOF_HEAP_TUPLE_HEADER)
@@ -350,6 +390,8 @@ fn encode_short_varlena(buf: &mut Vec<u8>, payload: &[u8]) -> Option<()> {
 /// 2-byte-aligned: { datalen: u16, t_infomask2: u16, t_infomask: u16,
 /// t_hoff: u8 } followed by `datalen` bytes of tuple payload. The tuple
 /// count lives in the record's main data (xl_heap_multi_insert).
+/// Format-agnostic: ntuples sits at byte 2 in both xl_heap_multi_insert and
+/// xl_neon_heap_multi_insert, and the per-tuple structs are identical.
 pub fn decode_multi_insert(
     block_data: &[u8],
     main_data: &[u8],
@@ -683,12 +725,9 @@ pub fn decode_toast_chunk(
 }
 
 /// Decode a toast chunk from an INSERT record's block-0 data.
-pub fn decode_toast_chunk_from_wal(block_data: &[u8]) -> Result<(u32, i32, Vec<u8>)> {
-    if block_data.len() < 5 {
-        bail!("toast insert block data too short");
-    }
-    let t_hoff = block_data[4] as usize;
-    decode_toast_chunk(&block_data[5..], t_hoff)
+pub fn decode_toast_chunk_from_wal(block_data: &[u8], fmt: HeapFmt) -> Result<(u32, i32, Vec<u8>)> {
+    let (_, _, t_hoff, hdr_len) = wal_heap_header(block_data, fmt)?;
+    decode_toast_chunk(&block_data[hdr_len..], t_hoff)
 }
 
 /// Decode a toast chunk from a restored page image at an offset number.

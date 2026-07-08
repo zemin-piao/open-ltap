@@ -18,9 +18,19 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use wal::heap;
 use wal::rmgr;
+
+/// Where the physical WAL stream comes from. SQL (catalog, snapshots) always
+/// goes to the Postgres endpoint (`PG_*`) — on Neon that's the compute node.
+enum WalSource {
+    /// A vanilla walsender: slot-backed retention, TIMELINE clause.
+    Postgres,
+    /// A Neon safekeeper: tenant/timeline named in the startup packet, no
+    /// slots (Delta watermarks are the only resume authority).
+    Safekeeper,
+}
 
 struct Config {
     pg_host: String,
@@ -28,6 +38,15 @@ struct Config {
     pg_user: String,
     pg_password: String,
     pg_db: String,
+    source: WalSource,
+    sk_host: String,
+    sk_port: u16,
+    /// Hex tenant/timeline ids for the safekeeper; auto-discovered from the
+    /// compute's neon.tenant_id/neon.timeline_id GUCs when unset.
+    sk_tenant: Option<String>,
+    sk_timeline: Option<String>,
+    /// JWT for safekeepers with auth enabled (sent as a cleartext password).
+    sk_token: Option<String>,
     /// Tables to transcode; None = every ordinary table in `public`.
     tables: Option<Vec<String>>,
     slot: String,
@@ -74,6 +93,16 @@ impl Config {
             pg_port: env_or("PG_PORT", "5432").parse().expect("PG_PORT"),
             pg_user: env_or("PG_USER", "postgres"),
             pg_password: env_or("PG_PASSWORD", "postgres"),
+            source: match env_or("LTAP_SOURCE", "postgres").as_str() {
+                "postgres" => WalSource::Postgres,
+                "safekeeper" => WalSource::Safekeeper,
+                s => panic!("LTAP_SOURCE must be postgres or safekeeper, got {s}"),
+            },
+            sk_host: env_or("LTAP_SK_HOST", "localhost"),
+            sk_port: env_or("LTAP_SK_PORT", "5454").parse().expect("LTAP_SK_PORT"),
+            sk_tenant: std::env::var("LTAP_TENANT_ID").ok(),
+            sk_timeline: std::env::var("LTAP_TIMELINE_ID").ok(),
+            sk_token: std::env::var("LTAP_SK_TOKEN").ok(),
             slot: env_or("LTAP_SLOT", &format!("ltap_{pg_db}")),
             lake: env_or("LTAP_LAKE", "s3://lake"),
             s3_endpoint: env_or("S3_ENDPOINT", "http://localhost:9000"),
@@ -436,7 +465,28 @@ impl Engine {
             }
         };
 
-        match record.rmid {
+        // Neon computes log DML through their own rmgr — the vanilla heap
+        // records with a CommandId spliced in, heap+heap2 opcodes merged
+        // under one rmgr. Normalize to the vanilla (rmid, op) space and keep
+        // the dialect so parsers read the shifted offsets.
+        let raw_op = record.info & heap::XLOG_HEAP_OPMASK;
+        let (rmid, op, fmt) = match record.rmid {
+            rmgr::NEON => match raw_op {
+                heap::XLOG_NEON_HEAP_INSERT => (rmgr::HEAP, heap::XLOG_HEAP_INSERT, heap::HeapFmt::Neon),
+                heap::XLOG_NEON_HEAP_DELETE => (rmgr::HEAP, heap::XLOG_HEAP_DELETE, heap::HeapFmt::Neon),
+                heap::XLOG_NEON_HEAP_UPDATE => (rmgr::HEAP, heap::XLOG_HEAP_UPDATE, heap::HeapFmt::Neon),
+                heap::XLOG_NEON_HEAP_HOT_UPDATE => {
+                    (rmgr::HEAP, heap::XLOG_HEAP_HOT_UPDATE, heap::HeapFmt::Neon)
+                }
+                heap::XLOG_NEON_HEAP_MULTI_INSERT => {
+                    (rmgr::HEAP2, heap::XLOG_HEAP2_MULTI_INSERT, heap::HeapFmt::Neon)
+                }
+                _ => return Ok(()), // LOCK: no row change
+            },
+            r => (r, raw_op, heap::HeapFmt::Vanilla),
+        };
+
+        match rmid {
             rmgr::SMGR => {
                 if record.info & 0xF0 == heap::XLOG_SMGR_CREATE {
                     if let Ok(Some((db, _rel))) = heap::parse_smgr_create(&record.main_data) {
@@ -447,7 +497,6 @@ impl Engine {
                 }
             }
             rmgr::HEAP => {
-                let op = record.info & heap::XLOG_HEAP_OPMASK;
                 let Some(block0) = record.blocks.iter().find(|b| b.id == 0) else {
                     return Ok(());
                 };
@@ -467,7 +516,7 @@ impl Engine {
                         // A chunk of an out-of-line value; buffer it for the
                         // pointer tuple that follows in the same transaction.
                         let chunk = if !block0.data.is_empty() {
-                            heap::decode_toast_chunk_from_wal(&block0.data)
+                            heap::decode_toast_chunk_from_wal(&block0.data, fmt)
                         } else if let Some(img) = &block0.image {
                             img.restore().and_then(|page| {
                                 heap::decode_toast_chunk_from_page(&page, heap::insert_offnum(&record.main_data)?)
@@ -484,7 +533,7 @@ impl Engine {
                         let ti = main.unwrap();
                         let desc = &self.tables[ti].desc;
                         let decoded = if !block0.data.is_empty() {
-                            heap::decode_insert_tuple(&block0.data, desc, &self.toast)
+                            heap::decode_insert_tuple(&block0.data, desc, &self.toast, fmt)
                         } else if let Some(img) = &block0.image {
                             // full_page_writes=on: the tuple lives in the image.
                             img.restore().and_then(|page| {
@@ -527,7 +576,7 @@ impl Engine {
                     }
                     heap::XLOG_HEAP_UPDATE | heap::XLOG_HEAP_HOT_UPDATE if main.is_some() => {
                         let ti = main.unwrap();
-                        if let Err(e) = self.handle_update(lsn, &record, block0, ti) {
+                        if let Err(e) = self.handle_update(lsn, &record, block0, ti, fmt) {
                             self.note_decode_error(ti, lsn, "update", &e);
                         }
                     }
@@ -535,7 +584,6 @@ impl Engine {
                 }
             }
             rmgr::HEAP2 => {
-                let op = record.info & heap::XLOG_HEAP_OPMASK;
                 if op != heap::XLOG_HEAP2_MULTI_INSERT {
                     return Ok(());
                 }
@@ -556,7 +604,7 @@ impl Engine {
                     heap::decode_multi_insert(&block0.data, &record.main_data, desc, &self.toast)
                 } else if let Some(img) = &block0.image {
                     img.restore().and_then(|page| {
-                        heap::multi_insert_offsets(&record.main_data, record.info)?
+                        heap::multi_insert_offsets(&record.main_data, record.info, fmt)?
                             .iter()
                             .map(|&off| heap::decode_tuple_from_page(&page, off, desc, &self.toast))
                             .collect()
@@ -564,7 +612,7 @@ impl Engine {
                 } else {
                     Err(anyhow::anyhow!("multi-insert with neither data nor image"))
                 };
-                match (rows, heap::multi_insert_offsets(&record.main_data, record.info)) {
+                match (rows, heap::multi_insert_offsets(&record.main_data, record.info, fmt)) {
                     (Ok(rows), Ok(offsets)) if rows.len() == offsets.len() => {
                         for ((row, attrs), offnum) in rows.into_iter().zip(offsets) {
                             self.txbuf.add_op(record.xid, lsn, ti, txbuf::Op::Insert {
@@ -679,8 +727,9 @@ impl Engine {
         record: &wal::Record,
         block0: &wal::BlockRef,
         ti: usize,
+        fmt: heap::HeapFmt,
     ) -> Result<()> {
-        let info = heap::parse_update_main(&record.main_data)?;
+        let info = heap::parse_update_main(&record.main_data, fmt)?;
         // Block 0 = the new tuple's page; block 1 (if present) = the old page.
         let old_blkno = record.blocks.iter().find(|b| b.id == 1).map(|b| b.blkno).unwrap_or(block0.blkno);
         let old_ctid = (old_blkno, info.old_offnum);
@@ -700,6 +749,7 @@ impl Engine {
                 old_row.as_ref(),
                 desc,
                 &self.toast,
+                fmt,
             )?
         } else if let Some(img) = &block0.image {
             // FPI carries the complete new tuple; prefix/suffix never apply.
@@ -852,13 +902,44 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 3. Attach to the WAL stream (slot keeps WAL retained while we're down).
-    let mut conn = pgwire::ReplConn::connect(&cfg.pg_host, cfg.pg_port, &cfg.pg_user).await?;
+    // 3. Attach to the WAL stream. Vanilla: a slot keeps WAL retained while
+    //    we're down. Safekeeper: no slots — Delta watermarks are the resume
+    //    authority and the safekeeper keeps WAL per its own horizon.
+    let (mut conn, slot_restart) = match cfg.source {
+        WalSource::Postgres => {
+            let mut conn =
+                pgwire::ReplConn::connect(&cfg.pg_host, cfg.pg_port, &cfg.pg_user, &[], None).await?;
+            if conn.create_slot(&cfg.slot).await? {
+                tracing::info!(slot = %cfg.slot, "created replication slot");
+            }
+            let slot_restart = conn.slot_restart_lsn(&cfg.slot).await?;
+            (conn, slot_restart)
+        }
+        WalSource::Safekeeper => {
+            let (tenant, tl) = match (cfg.sk_tenant.clone(), cfg.sk_timeline.clone()) {
+                (Some(t), Some(tl)) => (t, tl),
+                _ => schema::neon_ids(&cfg.sql_conninfo()).await.context(
+                    "LTAP_TENANT_ID/LTAP_TIMELINE_ID unset and the compute has no neon GUCs",
+                )?,
+            };
+            tracing::info!(tenant = %tenant, timeline = %tl, sk = %format!("{}:{}", cfg.sk_host, cfg.sk_port), "safekeeper source");
+            let params = [
+                ("tenant_id", tenant.as_str()),
+                ("timeline_id", tl.as_str()),
+                ("application_name", "open-ltap"),
+            ];
+            let conn = pgwire::ReplConn::connect(
+                &cfg.sk_host,
+                cfg.sk_port,
+                &cfg.pg_user,
+                &params,
+                cfg.sk_token.as_deref(),
+            )
+            .await?;
+            (conn, None)
+        }
+    };
     let (timeline, flush_lsn) = conn.identify_system().await?;
-    if conn.create_slot(&cfg.slot).await? {
-        tracing::info!(slot = %cfg.slot, "created replication slot");
-    }
-    let slot_restart = conn.slot_restart_lsn(&cfg.slot).await?;
 
     // 4. Per table: resume from its watermark (rebuilding the pre-image
     //    mirror from its own change log) or take an initial snapshot.
@@ -943,7 +1024,10 @@ async fn main() -> Result<()> {
         tables = tables.len(),
         "starting physical replication"
     );
-    conn.start_replication(&cfg.slot, start_lsn, timeline).await?;
+    match cfg.source {
+        WalSource::Postgres => conn.start_replication(&cfg.slot, start_lsn, timeline).await?,
+        WalSource::Safekeeper => conn.start_replication_safekeeper(start_lsn).await?,
+    }
 
     let tail: serve::SharedTail = Arc::new(std::sync::RwLock::new(serve::TailStore::default()));
     if cfg.http_port != 0 {

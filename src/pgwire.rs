@@ -1,7 +1,9 @@
 //! Minimal Postgres frontend-protocol client for *physical* streaming
-//! replication. Deliberately tiny: trust auth only (dev), simple queries,
-//! CopyBoth streaming. This is the piece that later gets a second
-//! implementation speaking the Neon safekeeper protocol.
+//! replication. Deliberately tiny: trust or cleartext-password auth, simple
+//! queries, CopyBoth streaming. Neon safekeepers speak this same protocol —
+//! they differ only in the startup parameters (tenant_id/timeline_id), the
+//! START_REPLICATION syntax (no SLOT/TIMELINE clause), and slot commands
+//! (none: safekeepers manage their own WAL horizon).
 
 use anyhow::{Context, Result, bail};
 use bytes::{Buf, BufMut, BytesMut};
@@ -45,20 +47,30 @@ pub struct ReplConn {
 }
 
 impl ReplConn {
-    pub async fn connect(host: &str, port: u16, user: &str) -> Result<Self> {
+    /// `extra_params` are appended to the startup packet (safekeepers take
+    /// tenant_id/timeline_id here); `password` answers a cleartext password
+    /// request (safekeepers with auth enabled take the JWT there).
+    pub async fn connect(
+        host: &str,
+        port: u16,
+        user: &str,
+        extra_params: &[(&str, &str)],
+        password: Option<&str>,
+    ) -> Result<Self> {
         let stream = TcpStream::connect((host, port))
             .await
             .with_context(|| format!("connecting to {host}:{port}"))?;
         let mut conn = ReplConn { stream, buf: BytesMut::with_capacity(64 * 1024) };
-        conn.send_startup(user).await?;
-        conn.await_ready().await?;
+        conn.send_startup(user, extra_params).await?;
+        conn.await_ready(password).await?;
         Ok(conn)
     }
 
-    async fn send_startup(&mut self, user: &str) -> Result<()> {
+    async fn send_startup(&mut self, user: &str, extra_params: &[(&str, &str)]) -> Result<()> {
         let mut body = BytesMut::new();
         body.put_u32(196608); // protocol 3.0
-        for (k, v) in [("user", user), ("replication", "true")] {
+        let base = [("user", user), ("replication", "true")];
+        for (k, v) in base.iter().chain(extra_params) {
             body.put_slice(k.as_bytes());
             body.put_u8(0);
             body.put_slice(v.as_bytes());
@@ -72,17 +84,28 @@ impl ReplConn {
         Ok(())
     }
 
-    async fn await_ready(&mut self) -> Result<()> {
+    async fn await_ready(&mut self, password: Option<&str>) -> Result<()> {
         loop {
             let (tag, mut payload) = self.read_msg().await?;
             match tag {
                 b'R' => {
                     let code = payload.get_u32();
-                    if code != 0 {
-                        bail!(
+                    match (code, password) {
+                        (0, _) => {} // AuthenticationOk
+                        (3, Some(pw)) => {
+                            // AuthenticationCleartextPassword
+                            let mut msg = BytesMut::new();
+                            msg.put_u8(b'p');
+                            msg.put_u32(4 + pw.len() as u32 + 1);
+                            msg.put_slice(pw.as_bytes());
+                            msg.put_u8(0);
+                            self.stream.write_all(&msg).await?;
+                        }
+                        (3, None) => bail!("server wants a password and none is configured"),
+                        _ => bail!(
                             "server requires auth method {code}; dev setup expects \
                              `host replication ... trust` in pg_hba.conf"
-                        );
+                        ),
                     }
                 }
                 b'S' | b'K' | b'N' => {} // ParameterStatus / BackendKeyData / Notice
@@ -177,6 +200,17 @@ impl ReplConn {
             timeline
         );
         self.send_query(&q).await?;
+        self.await_copy_both().await
+    }
+
+    /// Safekeeper variant: no slot, no TIMELINE clause (the timeline was
+    /// already fixed by the startup parameters).
+    pub async fn start_replication_safekeeper(&mut self, start_lsn: u64) -> Result<()> {
+        self.send_query(&format!("START_REPLICATION PHYSICAL {}", fmt_lsn(start_lsn))).await?;
+        self.await_copy_both().await
+    }
+
+    async fn await_copy_both(&mut self) -> Result<()> {
         loop {
             let (tag, payload) = self.read_msg().await?;
             match tag {
