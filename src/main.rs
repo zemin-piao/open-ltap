@@ -923,11 +923,12 @@ async fn main() -> Result<()> {
                 )?,
             };
             tracing::info!(tenant = %tenant, timeline = %tl, sk = %format!("{}:{}", cfg.sk_host, cfg.sk_port), "safekeeper source");
-            let params = [
-                ("tenant_id", tenant.as_str()),
-                ("timeline_id", tl.as_str()),
-                ("application_name", "open-ltap"),
-            ];
+            // Safekeepers don't read tenant_id/timeline_id as top-level startup
+            // params — they're packed into the standard libpq `options` param as
+            // whitespace-separated `key=value` tokens (safekeeper/src/handler.rs
+            // startup(), via pq_proto's options_raw()).
+            let options = format!("tenant_id={tenant} timeline_id={tl}");
+            let params = [("options", options.as_str()), ("application_name", "open-ltap")];
             let conn = pgwire::ReplConn::connect(
                 &cfg.sk_host,
                 cfg.sk_port,
