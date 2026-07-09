@@ -26,7 +26,7 @@ cutover ceremony, small-file cleanup, per-table config) just to get operational 
 flow through each stage, with pros/cons of the product track (M0–M4) vs. the storage-level
 future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
 
-## Status: M1 done, M2 in progress
+## Status: M0–M4 complete (the product); M5 safekeeper source validated
 
 - ✅ Hand-rolled replication wire client (trust auth, dev) + physical replication slot, so
   Postgres retains WAL while the transcoder is down
@@ -84,6 +84,14 @@ future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
   not yet flushed to Delta) over HTTP as Parquet; `delta_scan + tail` merged reads see every
   committed transaction seconds after commit, with `?min_lsn=` long-polling for hard
   read-your-writes — see `scripts/verify-fresh.sh` and `GET /status`
+- ✅ **Neon safekeeper source (M5, research track)**: `LTAP_SOURCE=safekeeper` streams the same
+  physical WAL from a Neon safekeeper instead of a walsender (slot-less, JWT auth, Neon's
+  custom heap rmgr normalized onto the vanilla decode path) — validated end-to-end against a
+  live neon-compose stack; see the M5 section below for what's still open
+- ✅ **Synthetic-WAL regression suite** (`cargo test` — no Postgres or Docker needed): byte-exact
+  record/page builders drive the reader and decoders, covering WAL framing + CRC edge cases,
+  every Neon `t_cid` offset shift (asserted to misdecode under the wrong dialect), the
+  full-page-image restore path in both dialects, and TOAST chunk decode + pointer resolution
 
 ## Quickstart
 
@@ -96,6 +104,8 @@ cargo run                     # transcode EVERY public table (or: cargo run -- t
 docker exec -i openltap-pg psql -U postgres -d app \
   -c "INSERT INTO t VALUES (1, 'hello lakehouse')"
 ./scripts/verify.sh t         # read the Delta table back via DuckDB
+
+cargo test                    # offline regression suite (WAL framing, Neon dialect, FPI, TOAST)
 ```
 
 Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLES` (csv; default: all
@@ -145,13 +155,14 @@ database platform to adopt.
   PG 17.5): INSERT, UPDATE, DELETE, multi-insert/COPY, and a forced post-checkpoint INSERT all
   decoded byte-exact. The `t_cid` offset math was independently cross-checked against
   `neon_xlog.h` from `neondatabase/postgres@REL_17_STABLE_neon_17_5` field-by-field and matches
-  exactly. **Honest gaps still open:** the full-page-image *restore* path never actually fired in
-  testing (Neon keeps tuple data alongside the image, so the data path was always taken instead —
-  the restore path itself is dialect-independent and already verified since M2b, just not
-  exercised under this dialect); safekeeper WAL framing/CRC wasn't byte-diffed against a vanilla
-  walsender; TOAST and DDL under the safekeeper path are untested; and the pageserver
-  `GetPage@LSN` oracle itself hasn't been started — pre-images/TOAST/backfill still go through
-  the compute's SQL port (same as M2d). Honest caveats once complete: you must run a Neon stack,
+  exactly. The decode-layer gaps the live run couldn't trigger are now pinned by a synthetic-WAL
+  regression suite (`tests/`, 2026-07-09): the full-page-image *restore* path under the Neon
+  dialect (Neon keeps tuple data alongside images, so it never fired live — now exercised with
+  raw, holed, and pglz-compressed images), WAL framing/CRC reassembly edge cases, and TOAST
+  chunk decode + pointer resolution under Neon headers. **Honest gaps still open:** TOAST and
+  DDL over a *live* safekeeper stream (the decode layer is tested; the end-to-end path is not),
+  and the pageserver `GetPage@LSN` oracle itself hasn't been started — pre-images/TOAST/backfill
+  still go through the compute's SQL port (same as M2d). Honest caveats once complete: you must run a Neon stack,
   and table data still exists twice on S3 (Neon layer files + Parquet). Interesting mainly for
   platform teams already invested in Neon.
 - **v2 — transcoding inside pageserver compaction.** The Lakebase endgame: Parquet becomes the
