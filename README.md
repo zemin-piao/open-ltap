@@ -132,28 +132,32 @@ before deletion after compaction, default 1440, `off` = never),
 At M4 the tool is complete for its primary audience: existing Postgres, existing lake, no new
 database platform to adopt.
 
-## M5 — Neon safekeeper source (validated end-to-end) & future work (v2)
+## M5 — Neon safekeeper source (fully validated) & future work (v2)
 
 - **M5 — Neon safekeeper source.** The WAL format is identical, so the same decoder can attach to
   a [Neon](https://github.com/neondatabase/neon) safekeeper stream instead of a walsender: zero
   load on compute, and the pageserver becomes a random-access oracle (`GetPage@LSN`) for
-  pre-images, TOAST chunks, and consistent backfill. **Done and verified:** the safekeeper wire
-  protocol (tenant/timeline packed into the libpq `options` startup param — safekeepers reject
-  them as top-level params — JWT auth, slot-less `START_REPLICATION`) and decoding of Neon's
-  custom heap rmgr (compute nodes log DML with a spliced-in `t_cid`, normalized back onto the
-  vanilla decode path) were run end-to-end against a live neon-compose stack (real Neon compute,
-  PG 17.5): INSERT, UPDATE, DELETE, multi-insert/COPY, and a forced post-checkpoint INSERT all
-  decoded byte-exact. The `t_cid` offset math was independently cross-checked against
-  `neon_xlog.h` from `neondatabase/postgres@REL_17_STABLE_neon_17_5` field-by-field and matches
-  exactly. **Honest gaps still open:** the full-page-image *restore* path never actually fired in
-  testing (Neon keeps tuple data alongside the image, so the data path was always taken instead —
-  the restore path itself is dialect-independent and already verified since M2b, just not
-  exercised under this dialect); safekeeper WAL framing/CRC wasn't byte-diffed against a vanilla
-  walsender; TOAST and DDL under the safekeeper path are untested; and the pageserver
-  `GetPage@LSN` oracle itself hasn't been started — pre-images/TOAST/backfill still go through
-  the compute's SQL port (same as M2d). Honest caveats once complete: you must run a Neon stack,
-  and table data still exists twice on S3 (Neon layer files + Parquet). Interesting mainly for
-  platform teams already invested in Neon.
+  pre-images, TOAST chunks, and consistent backfill. **Done and verified end-to-end:** the
+  safekeeper wire protocol (tenant/timeline packed into the libpq `options` startup param —
+  safekeepers reject them as top-level params — JWT auth, slot-less `START_REPLICATION`) and
+  decoding of Neon's custom heap rmgr (compute nodes log DML with a spliced-in `t_cid`,
+  normalized back onto the vanilla decode path) were run against a live neon-compose stack (real
+  Neon compute, PG 17.5): INSERT, UPDATE, DELETE, multi-insert/COPY, and a forced post-checkpoint
+  INSERT all decoded byte-exact, and the `t_cid` offset math was independently cross-checked
+  against `neon_xlog.h` field-by-field. Every previously-open gap has since closed too: a genuine
+  full-page-image *restore* fired and decoded correctly (confirmed independently via
+  `pg_waldump`); an independent from-scratch client cross-validated WAL framing and CRC32C with
+  zero mismatches against both the safekeeper and a vanilla walsender; and TOAST/DDL under the
+  safekeeper path uncovered **two real bugs that turned out to be pre-existing and
+  dialect-independent** (reproduced identically on vanilla Postgres) — a TOAST decompression bug
+  (the reassembled out-of-line buffer needed its embedded 4-byte compression header skipped) and
+  a DDL-detection bug (`pg_class`/`pg_attribute` are mapped relations, so their `relfilenode`
+  column reads 0 on any Postgres, which silently defeated proactive DDL detection). Both are
+  fixed and verified. The only piece of M5 left is the pageserver `GetPage@LSN` oracle itself —
+  pre-images/TOAST/backfill still go through the compute's SQL port (same as M2d), and that
+  integration hasn't started. Honest caveats once complete: you must run a Neon stack, and table
+  data still exists twice on S3 (Neon layer files + Parquet). Interesting mainly for platform
+  teams already invested in Neon.
 - **v2 — transcoding inside pageserver compaction.** The Lakebase endgame: Parquet becomes the
   *only* durable copy, row pages demote to a rebuildable cache. Requires forking the pageserver
   and solving the reverse path (rebuilding byte-addressed 8KB pages from Parquet). Research-grade;

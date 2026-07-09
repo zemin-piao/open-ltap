@@ -165,6 +165,33 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   but not a rigorous comparison). TOAST and DDL under the safekeeper path are untested. The
   pageserver `GetPage@LSN` oracle (pre-images/TOAST/backfill) still hasn't been started —
   pre-images still route through the compute's SQL port, same as M2d.
+- **M5 fully validated 2026-07-09 — all four remaining gaps closed**: **FPI-restore path**:
+  forced a genuine Neon-rmgr FPI-only record (`VACUUM FREEZE` + `CHECKPOINT` + `UPDATE`, needed
+  to avoid a hint-bit write stealing the FPI slot first — Neon's compute defaults to
+  `wal_level=logical`, which via `RelationIsLogicallyLogged`'s `REGBUF_KEEP_DATA` normally keeps
+  tuple data alongside every FPI, same as vanilla) — `img.restore()` → `decode_tuple_from_page`
+  fired and decoded byte-exact, independently confirmed via `pg_waldump` on the safekeeper's
+  durable WAL (`FPW` flag present). **Framing/CRC**: an independent from-scratch Python client
+  (own CRC32C table, own page-header/continuation-record parser, no reuse of our Rust code)
+  validated 2327 safekeeper records (incl. rmgr 134) and 2582 vanilla-walsender records with zero
+  mismatches. **TOAST and DDL surfaced two real, pre-existing, dialect-independent bugs** —
+  reproduced identically against vanilla Postgres, not Neon-specific:
+  - `ToastCache::resolve()` (`wal/heap.rs`) fed the whole reassembled out-of-line chunk buffer to
+    `pglz_decompress`, but `toast_save_datum` (`toast_internals.c`) chunks a compressed datum
+    starting at `VARDATA(dval)`, which includes the 4-byte compressed-varlena `tcinfo` header
+    (the same one an inline-compressed value carries) before the real pglz stream. Fixed by
+    skipping those 4 bytes (`85dd280`).
+  - `schema::catalog_filenodes()` read `pg_class.relfilenode` directly, but `pg_class`/
+    `pg_attribute` are themselves mapped relations — that column reads 0 for them on *any*
+    Postgres, vanilla included — so `catalog_rels` was always `{0}` and DDL was never proactively
+    detected (masked previously by the reactive `SchemaDrift` fallback, which only fires once a
+    mismatched row is decoded, i.e. only after subsequent DML). Fixed with
+    `pg_relation_filenode(oid)`, which resolves the relmapper indirection (`81796b3`).
+  Both fixes verified end-to-end over the safekeeper source: `ADD COLUMN`, `DROP COLUMN`, and
+  `TRUNCATE` (relfilenode rewrite) all correctly detected/handled; TOAST (incompressible and
+  highly-compressible external values) decoded byte-exact (md5 match). **Still not started**:
+  the pageserver `GetPage@LSN` oracle (pre-images/TOAST/backfill) — pre-images still route
+  through the compute's SQL port, same as M2d. This is the only piece of M5 left.
 - `examples/walscan.rs` — offline WAL reader harness (feeds a raw segment file, compares against
   `pg_waldump`; supports chunked feeding to simulate streaming). Invaluable for reader bugs.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
@@ -181,10 +208,9 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 - **M4 leftovers (explicitly deferred)** — Arrow Flight endpoint (only if ADBC clients demand
   it); HTTP Range support if force_download ever hurts; DV-based compaction; streaming
   compaction for tables larger than memory.
-- **M5 (validated end-to-end against neon-compose, see State above)** — remaining: FPI-restore
-  path under the Neon dialect (never triggered in testing; low risk, see State); safekeeper
-  framing/CRC parity spot-check; TOAST and DDL under the safekeeper path. Pageserver as a
-  `GetPage@LSN` oracle (pre-images, TOAST, backfill) not yet started.
+- **M5 (fully validated end-to-end against neon-compose, see State above)** — the only remaining
+  piece is the pageserver as a `GetPage@LSN` oracle (pre-images, TOAST, backfill); not yet
+  started.
 - **v2 (future work)** — transcoding inside pageserver compaction (canonical columnar).
 
 ## Code map (src/)

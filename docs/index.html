@@ -245,16 +245,18 @@
   + Parquet) until v2.</p>
   <p><strong>Status:</strong> the safekeeper wire protocol (W③ — tenant/timeline packed into the
   libpq <code>options</code> startup param, JWT auth, slot-less <code>START_REPLICATION</code>)
-  and decoding of Neon's custom heap rmgr are done and <strong>validated end-to-end</strong>
-  against a live neon-compose stack (real Neon compute, PG 17.5): INSERT, UPDATE, DELETE,
-  multi-insert/COPY, and a forced post-checkpoint INSERT all decoded byte-exact, and the WAL
-  offset math was independently cross-checked field-by-field against Neon's own
-  <code>neon_xlog.h</code> source. Still open: the full-page-image restore path never actually
-  fired in testing (dialect-independent and already verified since M2b, just not exercised here);
-  safekeeper WAL framing/CRC wasn't byte-diffed against a vanilla walsender; TOAST and DDL under
-  this path are untested. The <strong>pageserver oracle shown below is not wired up yet</strong>:
-  pre-images, TOAST, and backfill still resolve through the compute's SQL port, same as the
-  M0–M4 product.</p>
+  and decoding of Neon's custom heap rmgr are <strong>fully validated end-to-end</strong> against
+  a live neon-compose stack (real Neon compute, PG 17.5): INSERT, UPDATE, DELETE,
+  multi-insert/COPY, a forced post-checkpoint INSERT, and a genuine full-page-image restore all
+  decoded byte-exact; an independent from-scratch client cross-checked WAL framing and CRC32C
+  with zero mismatches against both the safekeeper and a vanilla walsender; and TOAST/DDL under
+  this path uncovered two real bugs that turned out to be <strong>pre-existing and
+  dialect-independent</strong> (reproduced identically on vanilla Postgres) — a TOAST
+  decompression bug and a DDL-detection bug (<code>pg_class</code>/<code>pg_attribute</code> are
+  mapped relations, so their stored <code>relfilenode</code> reads 0 on any Postgres) — both now
+  fixed and re-verified. The <strong>pageserver oracle shown below is the only piece not wired up
+  yet</strong>: pre-images, TOAST, and backfill still resolve through the compute's SQL port,
+  same as the M0–M4 product.</p>
 
   <div class="diagram">
   <svg viewBox="0 0 1000 420" role="img" aria-label="M5: writes quorum-commit on safekeepers; open-ltap consumes the safekeeper WAL stream and queries the pageserver for pre-images; OLTP reads fetch pages from the pageserver on buffer-pool miss; analytics scan Delta with a planned tail merge">
@@ -375,7 +377,7 @@
         <li><strong>You must run Neon</strong> — 3 safekeepers, pageserver, compute images, no managed control plane in OSS; a platform decision, not a tool install</li>
         <li><strong>Narrow audience</strong> — teams on RDS/self-hosted Postgres get nearly all the value from M0–M4 without this</li>
         <li><strong>Transcoder can lag</strong> — an independent consumer; freshness bounded by decode+commit unless the tail merge is deployed</li>
-        <li><strong>Pageserver oracle not wired up yet</strong> — wire protocol and WAL-dialect decode are validated end-to-end against a local Neon stack, but pre-images/TOAST/backfill still go through the compute's SQL port, and the FPI-restore path + safekeeper framing/CRC parity + TOAST/DDL under this path remain unexercised</li>
+        <li><strong>Pageserver oracle not wired up yet</strong> — everything else (wire protocol, WAL-dialect decode, FPI-restore, framing/CRC parity, TOAST, DDL) is validated end-to-end against a local Neon stack, but pre-images/TOAST/backfill still go through the compute's SQL port</li>
         <li><strong>Branches &amp; PITR unmapped</strong> — Neon branches have no Delta-snapshot story yet</li>
       </ul>
     </div>
@@ -523,7 +525,7 @@
       <tr><td>Copies of table data</td><td>2 — heap + Parquet</td><td>2 — layers + Parquet</td><td class="t-good">1 — Parquet only</td></tr>
       <tr><td>Neon fork needed</td><td class="t-good">no — any Postgres</td><td class="t-good">no — external subscriber</td><td class="t-hot">yes — compaction + read path</td></tr>
       <tr><td>Who wants it</td><td class="t-good">anyone with Postgres + S3 + Spark/DuckDB</td><td>platform teams running Neon</td><td>whoever forks the pageserver</td></tr>
-      <tr><td>Status</td><td class="t-good">M0 shipped &amp; verified; M1–M4 roadmap</td><td class="t-good">wire protocol + WAL decode validated end-to-end; pageserver oracle not started</td><td>research-grade</td></tr>
+      <tr><td>Status</td><td class="t-good">M0 shipped &amp; verified; M1–M4 roadmap</td><td class="t-good">fully validated end-to-end; pageserver oracle not started</td><td>research-grade</td></tr>
     </tbody>
   </table>
   </div>
