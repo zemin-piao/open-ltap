@@ -183,8 +183,11 @@ pub async fn table_name_by_filenode(conninfo: &str, node: u32) -> Result<Option<
 pub async fn catalog_filenodes(conninfo: &str) -> Result<Vec<u32>> {
     let (client, conn) = tokio_postgres::connect(conninfo, NoTls).await?;
     let handle = tokio::spawn(conn);
+    // pg_class and pg_attribute are themselves mapped relations (their
+    // pg_class.relfilenode column reads 0; the real filenode lives in the
+    // relmapper). pg_relation_filenode() resolves that indirection.
     let rows = client
-        .query("SELECT relfilenode FROM pg_class WHERE oid IN (1259, 1249)", &[])
+        .query("SELECT pg_relation_filenode(oid) FROM pg_class WHERE oid IN (1259, 1249)", &[])
         .await?;
     handle.abort();
     Ok(rows.iter().map(|r| r.get::<_, u32>(0)).collect())
