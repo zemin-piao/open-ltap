@@ -26,7 +26,7 @@ cutover ceremony, small-file cleanup, per-table config) just to get operational 
 flow through each stage, with pros/cons of the product track (M0–M4) vs. the storage-level
 future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
 
-## Status: M1 done, M2 in progress
+## Status: M0–M4 complete (the product); M5 safekeeper source validated
 
 - ✅ Hand-rolled replication wire client (trust auth, dev) + physical replication slot, so
   Postgres retains WAL while the transcoder is down
@@ -84,6 +84,14 @@ future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
   not yet flushed to Delta) over HTTP as Parquet; `delta_scan + tail` merged reads see every
   committed transaction seconds after commit, with `?min_lsn=` long-polling for hard
   read-your-writes — see `scripts/verify-fresh.sh` and `GET /status`
+- ✅ **Neon safekeeper source (M5, research track)**: `LTAP_SOURCE=safekeeper` streams the same
+  physical WAL from a Neon safekeeper instead of a walsender (slot-less, JWT auth, Neon's
+  custom heap rmgr normalized onto the vanilla decode path) — validated end-to-end against a
+  live neon-compose stack; see the M5 section below for what's still open
+- ✅ **Synthetic-WAL regression suite** (`cargo test` — no Postgres or Docker needed): byte-exact
+  record/page builders drive the reader and decoders, covering WAL framing + CRC edge cases,
+  every Neon `t_cid` offset shift (asserted to misdecode under the wrong dialect), the
+  full-page-image restore path in both dialects, and TOAST chunk decode + pointer resolution
 
 ## Quickstart
 
@@ -96,6 +104,8 @@ cargo run                     # transcode EVERY public table (or: cargo run -- t
 docker exec -i openltap-pg psql -U postgres -d app \
   -c "INSERT INTO t VALUES (1, 'hello lakehouse')"
 ./scripts/verify.sh t         # read the Delta table back via DuckDB
+
+cargo test                    # offline regression suite (WAL framing, Neon dialect, FPI, TOAST)
 ```
 
 Config via env: `PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB`, `LTAP_TABLES` (csv; default: all
@@ -144,16 +154,20 @@ database platform to adopt.
   normalized back onto the vanilla decode path) were run against a live neon-compose stack (real
   Neon compute, PG 17.5): INSERT, UPDATE, DELETE, multi-insert/COPY, and a forced post-checkpoint
   INSERT all decoded byte-exact, and the `t_cid` offset math was independently cross-checked
-  against `neon_xlog.h` field-by-field. Every previously-open gap has since closed too: a genuine
-  full-page-image *restore* fired and decoded correctly (confirmed independently via
-  `pg_waldump`); an independent from-scratch client cross-validated WAL framing and CRC32C with
-  zero mismatches against both the safekeeper and a vanilla walsender; and TOAST/DDL under the
-  safekeeper path uncovered **two real bugs that turned out to be pre-existing and
-  dialect-independent** (reproduced identically on vanilla Postgres) — a TOAST decompression bug
-  (the reassembled out-of-line buffer needed its embedded 4-byte compression header skipped) and
-  a DDL-detection bug (`pg_class`/`pg_attribute` are mapped relations, so their `relfilenode`
-  column reads 0 on any Postgres, which silently defeated proactive DDL detection). Both are
-  fixed and verified. The only piece of M5 left is the pageserver `GetPage@LSN` oracle itself —
+  against `neon_xlog.h` field-by-field. A synthetic-WAL regression suite (`tests/`, `cargo test`
+  — no Postgres or Docker needed) pins the decode layer deterministically: WAL framing/CRC
+  reassembly edge cases, every Neon `t_cid` offset shift (asserted to misdecode under the wrong
+  dialect), the full-page-image restore path in both dialects, and TOAST chunk decode. Every
+  gap that suite flagged as still needing a live run has since closed too: a genuine full-page-
+  image *restore* fired live and decoded correctly (confirmed independently via `pg_waldump`);
+  an independent from-scratch client cross-validated WAL framing and CRC32C with zero mismatches
+  against both the safekeeper and a vanilla walsender; and TOAST/DDL under the safekeeper path
+  uncovered **two real bugs that turned out to be pre-existing and dialect-independent**
+  (reproduced identically on vanilla Postgres) — a TOAST decompression bug (the reassembled
+  out-of-line buffer needed its embedded 4-byte compression header skipped) and a DDL-detection
+  bug (`pg_class`/`pg_attribute` are mapped relations, so their `relfilenode` column reads 0 on
+  any Postgres, which silently defeated proactive DDL detection). Both are fixed and verified.
+  The only piece of M5 left is the pageserver `GetPage@LSN` oracle itself —
   pre-images/TOAST/backfill still go through the compute's SQL port (same as M2d), and that
   integration hasn't started. Honest caveats once complete: you must run a Neon stack, and table
   data still exists twice on S3 (Neon layer files + Parquet). Interesting mainly for platform

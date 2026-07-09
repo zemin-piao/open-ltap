@@ -165,17 +165,36 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   but not a rigorous comparison). TOAST and DDL under the safekeeper path are untested. The
   pageserver `GetPage@LSN` oracle (pre-images/TOAST/backfill) still hasn't been started —
   pre-images still route through the compute's SQL port, same as M2d.
-- **M5 fully validated 2026-07-09 — all four remaining gaps closed**: **FPI-restore path**:
-  forced a genuine Neon-rmgr FPI-only record (`VACUUM FREEZE` + `CHECKPOINT` + `UPDATE`, needed
-  to avoid a hint-bit write stealing the FPI slot first — Neon's compute defaults to
-  `wal_level=logical`, which via `RelationIsLogicallyLogged`'s `REGBUF_KEEP_DATA` normally keeps
-  tuple data alongside every FPI, same as vanilla) — `img.restore()` → `decode_tuple_from_page`
-  fired and decoded byte-exact, independently confirmed via `pg_waldump` on the safekeeper's
-  durable WAL (`FPW` flag present). **Framing/CRC**: an independent from-scratch Python client
-  (own CRC32C table, own page-header/continuation-record parser, no reuse of our Rust code)
-  validated 2327 safekeeper records (incl. rmgr 134) and 2582 vanilla-walsender records with zero
-  mismatches. **TOAST and DDL surfaced two real, pre-existing, dialect-independent bugs** —
-  reproduced identically against vanilla Postgres, not Neon-specific:
+- **M5 synthetic-WAL regression suite 2026-07-09** (`tests/` — the repo's first tests): byte-exact
+  record/page/tuple builders (`tests/common/mod.rs`, layouts per xlogrecord.h + the
+  field-verified neon_xlog.h offsets above) drive the real `WalReader`/`parse_record`/decoders.
+  Closes two M5 gaps deterministically, without a stack: (1) **FPI-restore under the Neon
+  dialect** (`tests/neon_dialect.rs`) — rmgr-134 records carrying an image and NO block data now
+  exercise `img.restore()` → `decode_tuple_from_page` (raw-with-hole, pglz-compressed, hole-less;
+  multi-insert with Neon offsets array and INIT_PAGE; toast chunk from page; plus one framed
+  end-to-end through the reader); (2) **framing/CRC parity** (`tests/wal_framing.rs`) —
+  reassembly proven chunk-size-invariant and byte-identical to the built records,
+  header-split-across-pages, long segment headers, mid-stream join via xlp_rem_len, CRC/magic
+  corruption rejected (our CRC construction matching `parse_record`'s check = both match
+  xloginsert.c). Every Neon `t_cid` shift is asserted against its vanilla twin AND asserted to
+  misdecode under the wrong dialect (the shifts are load-bearing, not cosmetic). TOAST chunk
+  decode + pointer resolution under Neon headers covered at the WAL-decode layer (live
+  safekeeper TOAST/DDL E2E still open). Refactor: the Neon opcode normalization moved from
+  `Engine::handle_record` into `heap::normalize_dml` (pure, tested).
+- **M5 fully validated live 2026-07-09 — closes what the synthetic suite above left open**:
+  re-ran FPI-restore and framing/CRC *live* against neon-compose to confirm the synthetic
+  suite's coverage holds for real (forced a genuine Neon-rmgr FPI-only record via `VACUUM
+  FREEZE` + `CHECKPOINT` + `UPDATE` — needed because Neon's compute defaults to
+  `wal_level=logical`, whose `RelationIsLogicallyLogged`/`REGBUF_KEEP_DATA` normally keeps tuple
+  data alongside every FPI, same as vanilla — `img.restore()` → `decode_tuple_from_page` fired
+  and decoded byte-exact, independently confirmed via `pg_waldump`'s `FPW` flag on the
+  safekeeper's durable WAL; and an independent from-scratch Python client, own CRC32C table and
+  page-header/continuation parser, validated 2327 safekeeper records incl. rmgr 134 and 2582
+  vanilla-walsender records with zero mismatches). Then closed the two items the suite
+  explicitly left open — **TOAST and DDL over a live safekeeper stream** — which surfaced two
+  real, pre-existing, dialect-independent bugs (reproduced identically on vanilla Postgres, not
+  caught by the synthetic suite since it drives neither real pg_toast compression nor a live
+  catalog query):
   - `ToastCache::resolve()` (`wal/heap.rs`) fed the whole reassembled out-of-line chunk buffer to
     `pglz_decompress`, but `toast_save_datum` (`toast_internals.c`) chunks a compressed datum
     starting at `VARDATA(dval)`, which includes the 4-byte compressed-varlena `tcinfo` header
@@ -223,7 +242,12 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   alignment, padding; record *headers* may split across pages — only xl_tot_len is guaranteed
   on-page) + `parse_record` (block headers per xlogrecord.h, CRC32C validated).
 - `wal/heap.rs` — heap INSERT + multi-insert (COPY) tuple decode (null bitmap, alignment,
-  varlena per varatt.h incl. pglz); XACT opcodes + subxact list parsing also here.
+  varlena per varatt.h incl. pglz); XACT opcodes + subxact list parsing also here; `normalize_dml`
+  maps rmgr-NEON opcodes onto the vanilla `(rmid, op)` space + `HeapFmt` dialect tag.
+- `tests/` — synthetic-WAL regression suite (`cargo test`, no Postgres/Docker needed):
+  `common/mod.rs` builds byte-exact records/pages/tuples in both dialects; `wal_framing.rs`
+  covers reader reassembly + CRC; `neon_dialect.rs` covers Neon offset shifts, FPI-restore,
+  TOAST decode. Extend it whenever a decode bug is found — cheapest place to pin a layout.
 - `schema.rs` — "catalog lite": table descriptor via SQL at startup (M3 replaces this).
 - `txbuf.rs` — per-xid op buffering (Insert/Update/Delete with ctids + RowVersion) + per-txn
   overlays for intra-txn pre-images; commit merges subxacts LSN-sorted, abort discards.
