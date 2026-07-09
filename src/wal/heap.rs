@@ -694,8 +694,14 @@ impl ToastCache {
         if buf.len() == raw_data {
             return Ok(buf); // stored uncompressed
         }
+        // toast_save_datum (toast_internals.c) chunks a compressed datum from
+        // VARDATA(dval) onward, which starts with the 4-byte compressed-varlena
+        // tcinfo field (raw size + method, the same header an inline-compressed
+        // value carries) *before* the real pglz/lz4 stream — so `buf` has that
+        // header baked in and must be skipped, not just the stored payload.
+        let payload = buf.get(4..).ok_or_else(|| anyhow::anyhow!("toast value {valueid}: too short for a compression header"))?;
         match extinfo >> 30 {
-            0 => pglz_decompress(&buf, raw_data),
+            0 => pglz_decompress(payload, raw_data),
             1 => bail!("lz4-compressed toast value: set default_toast_compression=pglz"),
             m => bail!("unknown toast compression method {m}"),
         }
