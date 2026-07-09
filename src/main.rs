@@ -465,25 +465,10 @@ impl Engine {
             }
         };
 
-        // Neon computes log DML through their own rmgr — the vanilla heap
-        // records with a CommandId spliced in, heap+heap2 opcodes merged
-        // under one rmgr. Normalize to the vanilla (rmid, op) space and keep
+        // Normalize Neon-rmgr DML onto the vanilla (rmid, op) space, keeping
         // the dialect so parsers read the shifted offsets.
-        let raw_op = record.info & heap::XLOG_HEAP_OPMASK;
-        let (rmid, op, fmt) = match record.rmid {
-            rmgr::NEON => match raw_op {
-                heap::XLOG_NEON_HEAP_INSERT => (rmgr::HEAP, heap::XLOG_HEAP_INSERT, heap::HeapFmt::Neon),
-                heap::XLOG_NEON_HEAP_DELETE => (rmgr::HEAP, heap::XLOG_HEAP_DELETE, heap::HeapFmt::Neon),
-                heap::XLOG_NEON_HEAP_UPDATE => (rmgr::HEAP, heap::XLOG_HEAP_UPDATE, heap::HeapFmt::Neon),
-                heap::XLOG_NEON_HEAP_HOT_UPDATE => {
-                    (rmgr::HEAP, heap::XLOG_HEAP_HOT_UPDATE, heap::HeapFmt::Neon)
-                }
-                heap::XLOG_NEON_HEAP_MULTI_INSERT => {
-                    (rmgr::HEAP2, heap::XLOG_HEAP2_MULTI_INSERT, heap::HeapFmt::Neon)
-                }
-                _ => return Ok(()), // LOCK: no row change
-            },
-            r => (r, raw_op, heap::HeapFmt::Vanilla),
+        let Some((rmid, op, fmt)) = heap::normalize_dml(record.rmid, record.info) else {
+            return Ok(()); // Neon LOCK etc.: no row change
         };
 
         match rmid {

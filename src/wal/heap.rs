@@ -59,6 +59,30 @@ pub enum HeapFmt {
     Neon,
 }
 
+/// Normalize a record's (rmid, info) onto the vanilla `(rmid, op)` space,
+/// tagging the dialect. Neon computes log DML through their own rmgr — the
+/// vanilla heap records with a CommandId spliced in, heap+heap2 opcodes
+/// merged under one rmgr (so HOT_UPDATE/LOCK are renumbered). Everything
+/// else passes through as vanilla. `None` = no row change we track (Neon
+/// LOCK, unknown Neon opcodes).
+pub fn normalize_dml(rmid: u8, info: u8) -> Option<(u8, u8, HeapFmt)> {
+    use crate::wal::rmgr;
+    let raw_op = info & XLOG_HEAP_OPMASK;
+    match rmid {
+        rmgr::NEON => match raw_op {
+            XLOG_NEON_HEAP_INSERT => Some((rmgr::HEAP, XLOG_HEAP_INSERT, HeapFmt::Neon)),
+            XLOG_NEON_HEAP_DELETE => Some((rmgr::HEAP, XLOG_HEAP_DELETE, HeapFmt::Neon)),
+            XLOG_NEON_HEAP_UPDATE => Some((rmgr::HEAP, XLOG_HEAP_UPDATE, HeapFmt::Neon)),
+            XLOG_NEON_HEAP_HOT_UPDATE => Some((rmgr::HEAP, XLOG_HEAP_HOT_UPDATE, HeapFmt::Neon)),
+            XLOG_NEON_HEAP_MULTI_INSERT => {
+                Some((rmgr::HEAP2, XLOG_HEAP2_MULTI_INSERT, HeapFmt::Neon))
+            }
+            _ => None,
+        },
+        r => Some((r, raw_op, HeapFmt::Vanilla)),
+    }
+}
+
 /// xl_heap_header { t_infomask2 u16, t_infomask u16, t_hoff u8 } (5 bytes) or
 /// xl_neon_heap_header, which puts `t_cid u32` before t_hoff (9 bytes).
 /// Returns (t_infomask2, t_infomask, t_hoff, header length).
