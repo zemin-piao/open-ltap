@@ -278,6 +278,21 @@ fn tuple_on_page(page: &[u8], offnum: u16) -> Result<(&[u8], u16, u16, usize)> {
     Ok((&tuple[SIZEOF_HEAP_TUPLE_HEADER..], t_infomask2, t_infomask, t_hoff))
 }
 
+/// Raw attribute bytes (from t_hoff on) of a tuple on a page — the pre-image
+/// bytes prefix/suffix-compressed updates reconstruct against; the same slice
+/// `decode_tuple_payload` returns as its attrs, so the two are interchangeable
+/// as `RowVersion::attrs`.
+pub fn raw_attrs_from_page(page: &[u8], offnum: u16) -> Result<Vec<u8>> {
+    let (payload, _im2, _im, hoff) = tuple_on_page(page, offnum)?;
+    let bits_len = hoff
+        .checked_sub(SIZEOF_HEAP_TUPLE_HEADER)
+        .ok_or_else(|| anyhow::anyhow!("t_hoff {hoff} < header size"))?;
+    payload
+        .get(bits_len..)
+        .map(|b| b.to_vec())
+        .ok_or_else(|| anyhow::anyhow!("tuple shorter than its null bitmap"))
+}
+
 /// Decode one tuple (by offset number) from a restored page image.
 pub fn decode_tuple_from_page(
     page: &[u8],

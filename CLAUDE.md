@@ -219,9 +219,25 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   live: 302/302 tuples decoded byte-exact vs SQL across 3 pages (pruned dead versions
   correctly skipped), and **time travel** — `LTAP_AT_LSN` pinned before an UPDATE+DELETE
   returned the exact pre-mutation state (old tuple values at same offnums) while the
-  current-LSN read matched post-mutation SQL. **Remaining for M5-oracle**: wire the engine's
-  pre-images/TOAST/backfill through this client (replace the mirror's pageinspect dependency
-  and snapshot's SQL COPY on the safekeeper path).
+  current-LSN read matched post-mutation SQL.
+- **Oracle wired into the engine & verified 2026-07-10**: `Oracle` (main.rs) = lazy pagestream
+  connection, auto-on for the safekeeper source (`LTAP_PS=off` disables; `LTAP_PS_HOST`/`_PORT`
+  default localhost:6400, `LTAP_PS_TOKEN` for JWT); connect failure warns once and degrades to
+  mirror-only, per-request failure drops the conn and retries next need. Pre-image fallback
+  when the mirror can't answer: UPDATE fetches the old tuple's page at the record's **start**
+  LSN (page versions are keyed by record-END LSN, so start LSN = state just before the record)
+  via the old block's own BlockRef reltag — raw attr bytes via new `heap::raw_attrs_from_page`
+  (same slice decode_tuple_payload returns, toast-free) for prefix/suffix, decoded row
+  (tolerated failure — old toast chunks are gone) for unchanged-toast carry-over; DELETE
+  fetches the old row for tombstone content. Mirror rebuild at restart **skips the pageinspect
+  sweep** when the oracle is on (long-row attrs come lazily). handle_record/handle_update are
+  now async. Verified live on neon-compose: 500-char-payload table (attrs unfaithful by
+  construction), kill -9, restart (refreshed=0 — no pageinspect), prefix-compressed UPDATE
+  replayed through the oracle + live batch of 10 more + DELETE — md5 identical to PG at every
+  step, zero decode failures. Vanilla path untouched (oracle=None). **Remaining for M5-oracle**:
+  snapshot/backfill still uses SQL COPY (visibility from pages = the v2b P2 problem); TOAST
+  chunk backfill for pre-toast-update rows still unwired (old_row decode tolerates, carries
+  from Delta-rebuilt mirror instead). M5 oracle = functionally complete for pre-images.
 - `examples/walscan.rs` — offline WAL reader harness (feeds a raw segment file, compares against
   `pg_waldump`; supports chunked feeding to simulate streaming). Invaluable for reader bugs.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.

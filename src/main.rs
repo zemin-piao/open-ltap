@@ -47,6 +47,13 @@ struct Config {
     sk_timeline: Option<String>,
     /// JWT for safekeepers with auth enabled (sent as a cleartext password).
     sk_token: Option<String>,
+    /// Pageserver GetPage@LSN oracle (safekeeper source only): pre-image
+    /// fallback when the mirror can't answer, replacing pageinspect.
+    /// LTAP_PS=off disables; connect failures degrade to mirror-only.
+    ps_enabled: bool,
+    ps_host: String,
+    ps_port: u16,
+    ps_token: Option<String>,
     /// Tables to transcode; None = every ordinary table in `public`.
     tables: Option<Vec<String>>,
     slot: String,
@@ -103,6 +110,10 @@ impl Config {
             sk_tenant: std::env::var("LTAP_TENANT_ID").ok(),
             sk_timeline: std::env::var("LTAP_TIMELINE_ID").ok(),
             sk_token: std::env::var("LTAP_SK_TOKEN").ok(),
+            ps_enabled: !matches!(env_or("LTAP_PS", "on").as_str(), "off" | "0" | "false"),
+            ps_host: env_or("LTAP_PS_HOST", "localhost"),
+            ps_port: env_or("LTAP_PS_PORT", "6400").parse().expect("LTAP_PS_PORT"),
+            ps_token: std::env::var("LTAP_PS_TOKEN").ok(),
             slot: env_or("LTAP_SLOT", &format!("ltap_{pg_db}")),
             lake: env_or("LTAP_LAKE", "s3://lake"),
             s3_endpoint: env_or("S3_ENDPOINT", "http://localhost:9000"),
@@ -219,6 +230,67 @@ struct Engine {
     compact_rows: u64,
     vacuum_after: Option<Duration>,
     db_oid: u32,
+    /// GetPage@LSN oracle (safekeeper source): authoritative pre-image
+    /// fallback when the mirror can't answer. None on the vanilla path.
+    oracle: Option<Oracle>,
+}
+
+/// Lazy pagestream connection to the pageserver. Connect failures disable it
+/// with one warning (the engine then degrades to mirror-only, as before);
+/// per-request failures drop the connection and retry on the next need.
+struct Oracle {
+    host: String,
+    port: u16,
+    tenant: String,
+    timeline: String,
+    token: Option<String>,
+    conn: Option<pgwire::ReplConn>,
+    disabled: bool,
+}
+
+impl Oracle {
+    /// The main-fork page of `rel` block `blkno` as of `lsn`. Page versions
+    /// are keyed by record-END LSN, so passing an update record's start LSN
+    /// yields the page state just before that record — the pre-image.
+    async fn page(&mut self, rel: wal::RelTag, blkno: u32, lsn: u64) -> Option<Vec<u8>> {
+        if self.disabled {
+            return None;
+        }
+        if self.conn.is_none() {
+            match pgwire::ReplConn::connect_pageserver(
+                &self.host,
+                self.port,
+                "open-ltap",
+                &self.tenant,
+                &self.timeline,
+                self.token.as_deref(),
+            )
+            .await
+            {
+                Ok(c) => {
+                    tracing::info!(ps = %format!("{}:{}", self.host, self.port), "pageserver oracle connected");
+                    self.conn = Some(c);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "pageserver oracle unavailable (LTAP_PS=off silences this) — \
+                         pre-image fallback disabled: {e:#}"
+                    );
+                    self.disabled = true;
+                    return None;
+                }
+            }
+        }
+        let tag = pgwire::RelTag { spcnode: rel.spc, dbnode: rel.db, relnode: rel.rel, forknum: 0 };
+        match self.conn.as_mut().unwrap().get_page(tag, blkno, lsn).await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(blkno, lsn = %pgwire::fmt_lsn(lsn), "GetPage failed: {e:#}");
+                self.conn = None; // stale sub-protocol state — reconnect next time
+                None
+            }
+        }
+    }
 }
 
 impl Engine {
@@ -456,7 +528,7 @@ impl Engine {
         }
     }
 
-    fn handle_record(&mut self, lsn: u64, rec: &[u8]) -> Result<()> {
+    async fn handle_record(&mut self, lsn: u64, rec: &[u8]) -> Result<()> {
         let record = match wal::parse_record(rec) {
             Ok(r) => r,
             Err(e) => {
@@ -545,7 +617,23 @@ impl Engine {
                         match heap::delete_offnum(&record.main_data) {
                             Ok(offnum) => {
                                 let ctid = (block0.blkno, offnum);
-                                let old_row = self.preimage(ti, ctid).map(|v| v.row.clone());
+                                let mut old_row = self.preimage(ti, ctid).map(|v| v.row.clone());
+                                if old_row.is_none() && self.oracle.is_some() {
+                                    // Oracle fallback: the deleted tuple as it
+                                    // was on-page just before this record.
+                                    if let Some(page) =
+                                        self.oracle.as_mut().unwrap().page(block0.rel, block0.blkno, lsn).await
+                                    {
+                                        old_row = heap::decode_tuple_from_page(
+                                            &page,
+                                            offnum,
+                                            &self.tables[ti].desc,
+                                            &self.toast,
+                                        )
+                                        .ok()
+                                        .map(|(r, _)| r);
+                                    }
+                                }
                                 if old_row.is_none() && lsn > self.tables[ti].dedupe_below {
                                     tracing::warn!(
                                         lsn = %pgwire::fmt_lsn(lsn),
@@ -561,7 +649,7 @@ impl Engine {
                     }
                     heap::XLOG_HEAP_UPDATE | heap::XLOG_HEAP_HOT_UPDATE if main.is_some() => {
                         let ti = main.unwrap();
-                        if let Err(e) = self.handle_update(lsn, &record, block0, ti, fmt) {
+                        if let Err(e) = self.handle_update(lsn, &record, block0, ti, fmt).await {
                             self.note_decode_error(ti, lsn, "update", &e);
                         }
                     }
@@ -706,7 +794,7 @@ impl Engine {
     /// Decode an UPDATE/HOT UPDATE: find the pre-image, reconstruct the new
     /// tuple (prefix/suffix bytes come from the old tuple; unchanged toast
     /// values from the old row), and buffer the op.
-    fn handle_update(
+    async fn handle_update(
         &mut self,
         lsn: u64,
         record: &wal::Record,
@@ -716,14 +804,45 @@ impl Engine {
     ) -> Result<()> {
         let info = heap::parse_update_main(&record.main_data, fmt)?;
         // Block 0 = the new tuple's page; block 1 (if present) = the old page.
-        let old_blkno = record.blocks.iter().find(|b| b.id == 1).map(|b| b.blkno).unwrap_or(block0.blkno);
-        let old_ctid = (old_blkno, info.old_offnum);
+        let old_block = record.blocks.iter().find(|b| b.id == 1).unwrap_or(block0);
+        let old_ctid = (old_block.blkno, info.old_offnum);
         let new_ctid = (block0.blkno, info.new_offnum);
 
-        let (old_attrs, old_row) = match self.preimage(ti, old_ctid) {
+        let (mut old_attrs, mut old_row) = match self.preimage(ti, old_ctid) {
             Some(v) => (v.attrs.clone(), Some(v.row.clone())),
             None => (None, None),
         };
+        // Oracle fallback: fetch the old tuple's page as it was just before
+        // this record. The raw attr bytes (what prefix/suffix reconstruct
+        // against) never need toast resolution; the decoded row (unchanged-
+        // toast carry-over) may fail on out-of-line values whose chunks are
+        // long gone — tolerated, decode below will error only if needed.
+        if (old_attrs.is_none() || old_row.is_none()) && self.oracle.is_some() {
+            if let Some(page) =
+                self.oracle.as_mut().unwrap().page(old_block.rel, old_block.blkno, lsn).await
+            {
+                if old_attrs.is_none() {
+                    match heap::raw_attrs_from_page(&page, info.old_offnum) {
+                        Ok(a) => old_attrs = Some(a),
+                        Err(e) => tracing::warn!(
+                            lsn = %pgwire::fmt_lsn(lsn),
+                            ctid = ?old_ctid,
+                            "oracle page fetched but old tuple unreadable: {e}"
+                        ),
+                    }
+                }
+                if old_row.is_none() {
+                    old_row = heap::decode_tuple_from_page(
+                        &page,
+                        info.old_offnum,
+                        &self.tables[ti].desc,
+                        &self.toast,
+                    )
+                    .ok()
+                    .map(|(r, _)| r);
+                }
+            }
+        }
         let desc = &self.tables[ti].desc;
 
         let (row, attrs) = if !block0.data.is_empty() {
@@ -890,6 +1009,7 @@ async fn main() -> Result<()> {
     // 3. Attach to the WAL stream. Vanilla: a slot keeps WAL retained while
     //    we're down. Safekeeper: no slots — Delta watermarks are the resume
     //    authority and the safekeeper keeps WAL per its own horizon.
+    let mut neon_tt: Option<(String, String)> = None; // tenant/timeline, safekeeper source only
     let (mut conn, slot_restart) = match cfg.source {
         WalSource::Postgres => {
             let mut conn =
@@ -908,6 +1028,7 @@ async fn main() -> Result<()> {
                 )?,
             };
             tracing::info!(tenant = %tenant, timeline = %tl, sk = %format!("{}:{}", cfg.sk_host, cfg.sk_port), "safekeeper source");
+            neon_tt = Some((tenant.clone(), tl.clone()));
             // Safekeepers don't read tenant_id/timeline_id as top-level startup
             // params — they're packed into the standard libpq `options` param as
             // whitespace-separated `key=value` tokens (safekeeper/src/handler.rs
@@ -936,7 +1057,13 @@ async fn main() -> Result<()> {
         match resume.restart_lsn {
             Some(r) => {
                 t.mirror = t.sink.load_mirror(&t.desc).await?;
-                let raw = snapshot::read_raw_attrs_conn(&cfg.sql_conninfo(), &t.desc).await?;
+                // With the GetPage oracle available, long-row pre-image bytes
+                // come lazily at update time — no pageinspect sweep needed.
+                let raw = if neon_tt.is_some() && cfg.ps_enabled {
+                    HashMap::new()
+                } else {
+                    snapshot::read_raw_attrs_conn(&cfg.sql_conninfo(), &t.desc).await?
+                };
                 let mut refreshed = 0usize;
                 for (ctid, ver) in t.mirror.iter_mut() {
                     if ver.attrs.is_none() {
@@ -1028,6 +1155,18 @@ async fn main() -> Result<()> {
     let db_oid = tables[0].desc.db_oid;
     let catalog_rels: HashSet<u32> =
         schema::catalog_filenodes(&cfg.sql_conninfo()).await?.into_iter().collect();
+    let oracle = match (&neon_tt, cfg.ps_enabled) {
+        (Some((tenant, tl)), true) => Some(Oracle {
+            host: cfg.ps_host.clone(),
+            port: cfg.ps_port,
+            tenant: tenant.clone(),
+            timeline: tl.clone(),
+            token: cfg.ps_token.clone(),
+            conn: None,
+            disabled: false,
+        }),
+        _ => None,
+    };
     let mut engine = Engine {
         rel_to_table: tables.iter().enumerate().map(|(i, t)| (t.desc.rel_node, i)).collect(),
         toast_rels: tables.iter().filter_map(|t| t.desc.toast_rel_node).collect(),
@@ -1045,6 +1184,7 @@ async fn main() -> Result<()> {
         compact_rows: cfg.compact_rows,
         vacuum_after: cfg.vacuum_after,
         db_oid,
+        oracle,
     };
 
     let mut reader = wal::WalReader::new(start_lsn);
@@ -1062,7 +1202,7 @@ async fn main() -> Result<()> {
                 pgwire::ReplMsg::XLogData(x) => {
                     last_recv_lsn = x.wal_end.max(last_recv_lsn);
                     for (lsn, rec) in reader.feed(x.start_lsn, &x.data)? {
-                        engine.handle_record(lsn, &rec)?;
+                        engine.handle_record(lsn, &rec).await?;
                     }
                     if let Some(ddl_lsn) = engine.remap_at.take() {
                         engine.remap_check(ddl_lsn, &cfg, &mut persisted_restart).await?;
