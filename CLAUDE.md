@@ -273,6 +273,13 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   zero organic image layers over days of light writing. V2b conclusion: image-creation
   transcode is a throughput path, never a freshness path — freshness must come from the tail
   merge / V2a's commit-ordered stream. **All four P0 probes complete.**
+- **V2a step (a) shipped 2026-07-11** (`410554f`): the engine moved out of `main.rs` into the
+  lib (`src/engine.rs` — Config/Table/Engine/Oracle/PendingBatch/Mirror + attach/remap helpers,
+  public seams); `main.rs` is now a 284-line pgwire embedder; lib.rs exports
+  engine/serve/sink/snapshot. Pure code motion; verified by the test suite + a live safekeeper
+  smoke run (oracle pre-images, md5 match). Next V2a steps per `docs/v2-scope.md` §V2a
+  execution plan: (b) stack upgrade + local neon build, (c) TranscodeSink tee patch + engine
+  embedding, (d) gauntlet on the forked image.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
