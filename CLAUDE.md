@@ -252,8 +252,21 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   entries, rmid-134 records + embedded page images decoded), forced image layer
   (`compact?force_image_layer_creation=true&force_l0_compaction=true` after a pageserver
   restart — the `checkpoint` API needs a testing build; image LSN only covers flushed L0s) —
-  long_t decoded byte-exact from zstd image blobs, 20/20 rows, id-sum matching SQL. Catalog
-  rels (pg_class 1259/pg_attribute 1249) confirmed present in image layers → P0-2 substrate.
+  long_t decoded byte-exact from zstd image blobs, 20/20 rows, id-sum matching SQL.
+- **P0-2 catalog-from-pages shipped & verified 2026-07-11** (`layerscan table=<name> db=<oid>`):
+  derives a TableDesc from a single image layer with zero SQL — relmapper blob at key
+  (0,spc,db,0,0,0) (512B pg_filenode.map, LE, magic 0x592717; pg_class/pg_attribute are mapped
+  so their pg_class.relfilenode is useless) → pg_class/pg_attribute heap pages parsed by the
+  PG17 FormData fixed layouts (fetched from REL_17_STABLE headers, offsets in the example;
+  **attcacheoff still exists in PG17** — relfilenode@88, relkind@115, relnatts@116; attname@4,
+  atttypid@68, attlen@72, attnum@74, attalign@87, atthasmissing@92, attisdropped@95). Spike
+  visibility heuristic = keep xmax==0 catalog tuples (real answer = CLOG@LSN, v2-scope P2).
+  Toast chunks preloaded from the toast rel's pages in the same layer feed the ToastCache.
+  Verified vs live SQL: gnarly table (int8/bool/text/timestamptz/uuid + DROPped float4 column
+  + ADD int4 DEFAULT 42) — derived desc exact (filenode 41019, toast 41022, 7 phys slots,
+  fast_defaults=true), rows decoded byte-exact incl. a 6400-char incompressible out-of-line
+  TOAST value (md5 match); pre-ADD rows read score=NULL as WAL semantics dictate (that's what
+  the fast-defaults re-snapshot is for). **The P0→V2a gate (probes 1–2) is met.**
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan

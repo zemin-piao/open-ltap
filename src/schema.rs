@@ -28,7 +28,7 @@ pub enum PgType {
 }
 
 impl PgType {
-    fn from_oid(oid: u32) -> Result<Self> {
+    pub fn from_oid(oid: u32) -> Result<Self> {
         Ok(match oid {
             16 => PgType::Bool,
             21 => PgType::Int2,
