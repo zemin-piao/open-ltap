@@ -176,7 +176,9 @@ database platform to adopt.
   *only* durable copy, row pages demote to a rebuildable cache. Requires forking the pageserver
   and solving the reverse path (rebuilding byte-addressed 8KB pages from Parquet). Research-grade;
   also watching for Databricks' announced open-source **LTAP Writer Library**, which would cover
-  a large piece of this.
+  a large piece of this. **Scoped in detail in [`docs/v2-scope.md`](docs/v2-scope.md)**: staged
+  as fork-free probes → embedded engine (V2a) → page-driven transcode at image-layer creation
+  (V2b) → page demotion (V2c), each with a go/no-go gate and a hard-problem register.
 
 ## Known limitations (deliberate, tracked by milestone)
 
