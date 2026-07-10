@@ -240,6 +240,20 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   from Delta-rebuilt mirror instead). M5 oracle = functionally complete for pre-images.
 - `examples/walscan.rs` — offline WAL reader harness (feeds a raw segment file, compares against
   `pg_waldump`; supports chunked feeding to simulate streaming). Invaluable for reader bugs.
+- **P0-1 layerscan shipped & verified 2026-07-10** (`examples/layerscan.rs`): offline pageserver
+  layer-file reader — no pageserver, no fork, no S3 SDK. Parses both layer kinds (bincode-BE
+  Summary on block 0, magics 0x5A60/0x5A61 v3; fixed-width disk-btree index, root/child blocks
+  relative to index_start_blk, 5-byte values = 0x80+child-blk inner / 40-bit offsets leaf;
+  blobs 1-byte len <0x80 else 4-byte BE high-bit + compression bits — **zstd is 0b001 (0x90),
+  blob_io.rs's own doc comment saying 0b011 is wrong**; image keys 18B, delta keys 18B+LSN,
+  delta leaf = BlobRef(pos<<1|will_init), delta values = bincode Value: 0=Image, 1=WalRecord,
+  WalRecord tag 0 = Postgres{will_init,rec}=raw WAL record). `rel=<node> cols=<ty,..>` decodes
+  pages with a synthetic TableDesc via decode_tuple_from_page. Verified live: delta layer (842
+  entries, rmid-134 records + embedded page images decoded), forced image layer
+  (`compact?force_image_layer_creation=true&force_l0_compaction=true` after a pageserver
+  restart — the `checkpoint` API needs a testing build; image LSN only covers flushed L0s) —
+  long_t decoded byte-exact from zstd image blobs, 20/20 rows, id-sum matching SQL. Catalog
+  rels (pg_class 1259/pg_attribute 1249) confirmed present in image layers → P0-2 substrate.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan

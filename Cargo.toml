@@ -18,3 +18,5 @@ url = "2.5.8"
 
 [dev-dependencies]
 crc32c = "0.6.8"
+# layerscan example: pageserver image-layer blobs default to zstd(1)
+zstd = "0.13"
