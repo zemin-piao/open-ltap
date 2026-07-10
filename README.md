@@ -26,7 +26,7 @@ cutover ceremony, small-file cleanup, per-table config) just to get operational 
 flow through each stage, with pros/cons of the product track (M0–M4) vs. the storage-level
 future work (M5, v2). Source: [`docs/index.html`](docs/index.html).
 
-## Status: M0–M4 complete (the product); M5 safekeeper source validated
+## Status: M0–M4 complete (the product); M5 complete (safekeeper source + pageserver oracle)
 
 - ✅ Hand-rolled replication wire client (trust auth, dev) + physical replication slot, so
   Postgres retains WAL while the transcoder is down
@@ -167,11 +167,13 @@ database platform to adopt.
   out-of-line buffer needed its embedded 4-byte compression header skipped) and a DDL-detection
   bug (`pg_class`/`pg_attribute` are mapped relations, so their `relfilenode` column reads 0 on
   any Postgres, which silently defeated proactive DDL detection). Both are fixed and verified.
-  The only piece of M5 left is the pageserver `GetPage@LSN` oracle itself —
-  pre-images/TOAST/backfill still go through the compute's SQL port (same as M2d), and that
-  integration hasn't started. Honest caveats once complete: you must run a Neon stack, and table
-  data still exists twice on S3 (Neon layer files + Parquet). Interesting mainly for platform
-  teams already invested in Neon.
+  The pageserver `GetPage@LSN` oracle is now wired in too (2026-07-10): the transcoder speaks
+  the pagestream_v3 sub-protocol, and on the safekeeper path pre-images come straight from the
+  pageserver at the exact pre-record LSN — no `pageinspect`, no compute involvement (verified
+  live: kill -9 + restart + prefix-compressed updates of long rows, md5-identical to Postgres).
+  Initial snapshots still use SQL `COPY` (page-level visibility is a v2 problem). Honest
+  caveats: you must run a Neon stack, and table data still exists twice on S3 (Neon layer
+  files + Parquet). Interesting mainly for platform teams already invested in Neon.
 - **v2 — transcoding inside pageserver compaction.** The Lakebase endgame: Parquet becomes the
   *only* durable copy, row pages demote to a rebuildable cache. Requires forking the pageserver
   and solving the reverse path (rebuilding byte-addressed 8KB pages from Parquet). Research-grade;
@@ -179,6 +181,11 @@ database platform to adopt.
   a large piece of this. **Scoped in detail in [`docs/v2-scope.md`](docs/v2-scope.md)**: staged
   as fork-free probes → embedded engine (V2a) → page-driven transcode at image-layer creation
   (V2b) → page demotion (V2c), each with a go/no-go gate and a hard-problem register.
+  **All four fork-free probes are complete (2026-07-11)** — layer files parse offline
+  (`examples/layerscan.rs`), a table's schema derives from `pg_class`/`pg_attribute` pages with
+  zero SQL (validated byte-exact incl. TOAST), the GetPage oracle is live, and image-layer
+  cadence is measured (freshness must come from the tail merge, never from image creation).
+  The V2a gate is met; results in the scope doc.
 
 ## Known limitations (deliberate, tracked by milestone)
 
@@ -186,10 +193,13 @@ database platform to adopt.
   and is replace-based; a deletion-vector variant (now feasible — the kernel exposes a
   DataFusion-free DV writer) would cut write amplification
 - The pre-image mirror lives in memory: one entry per live row (decoded values + on-page
-  bytes). Very large tables need RAM to match; the M5 pageserver oracle is the real fix
-- Pre-image bytes for rows with long (>126 B) values come from `pageinspect` when available
-  (in-tree extension, superuser); without it, the first prefix-compressed UPDATE of such a
-  row after a snapshot/restart may be skipped with a warning
+  bytes). Very large tables need RAM to match; on the safekeeper source the GetPage oracle
+  already answers mirror misses, and full mirror-less operation is v2a territory
+- On **vanilla Postgres**, pre-image bytes for rows with long (>126 B) values come from
+  `pageinspect` when available (in-tree extension, superuser); without it, the first
+  prefix-compressed UPDATE of such a row after a snapshot/restart may be skipped with a
+  warning. On the safekeeper source this limitation is gone — the pageserver oracle supplies
+  the exact on-page bytes at the pre-record LSN
 - lz4/zstd compression unsupported (`wal_compression` and `default_toast_compression`
   must be `off`/`pglz`)
 - Column type changes (`ALTER TABLE ... TYPE`) detach the table (Delta cannot retype a

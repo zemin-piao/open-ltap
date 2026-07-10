@@ -151,6 +151,33 @@ readers. Each stage's output is the next stage's substrate.
 
 **Gate to V2a**: probes 1–2 succeed; we can name the maintenance budget for a fork.
 
+#### P0 results (2026-07-10/11) — all four probes ran; the V2a gate is met
+
+1. **layerscan** ✅ (`examples/layerscan.rs`, commit `7200003`): both layer formats parse
+   offline; delta layers verified to carry raw WAL records (rmid 134) our decoder already
+   reads, plus embedded page images; a forced image layer decoded a test table byte-exact
+   from zstd blobs. One upstream doc bug found: `blob_io.rs` says the zstd bit pattern is
+   0b011, its own constants say 0b001 (`0x90`) — the code is right.
+2. **Catalog-from-pages** ✅ (`layerscan table=<name> db=<oid>`, commit `1594664`): relmapper
+   → pg_class/pg_attribute by PG17 FormData layout → TableDesc (types, dropped slots, toast
+   filenode, fast defaults), validated by decoding the table byte-exact from the same layer —
+   including an out-of-line TOAST value resolved from the toast rel's pages (md5 match), zero
+   SQL. Open ends for V2a: visibility used the xmax==0 spike heuristic (P2 owns the real
+   answer), and pk discovery (pg_index) wasn't done.
+3. **GetPage oracle** ✅ (commits `235392d`, `ae2f955`): pagestream_v3 client + engine
+   integration; pre-images now come from the pageserver on the safekeeper path and the
+   mirror's pageinspect dependency is gone. Closed the M5 remainder in the same stroke.
+4. **Cadence** ✅ measured on neon-compose (defaults: checkpoint_distance 256 MB,
+   checkpoint_timeout 10 m, compaction_period 20 s, compaction_threshold 10 L0s,
+   image_creation_threshold 3): a 41 MB write burst was still entirely in the ephemeral
+   layer 45 s (2+ compaction periods) later — no L0, no image layer. The organic freshness
+   ladder is ephemeral (≤256 MB / ≤10 min) → L0 (10 L0s ≈ 2.5 GB before L1) → image layers
+   (3 stacked deltas); this timeline produced **zero organic image layers across days of
+   light writing**. Conclusion for V2b: transcode-at-image-creation is a *throughput* path,
+   never a freshness path — LSN-exact reads must come from the tail merge (or V2a's
+   commit-ordered stream), and any threshold tuning that forces images faster buys freshness
+   with write amplification.
+
 ### V2a — embed the M0–M5 engine at WAL ingest (fork, additive)
 
 Run today's engine as a task inside the pageserver, fed from the ingest path (the same decoded

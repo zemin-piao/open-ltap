@@ -267,6 +267,12 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   fast_defaults=true), rows decoded byte-exact incl. a 6400-char incompressible out-of-line
   TOAST value (md5 match); pre-ADD rows read score=NULL as WAL semantics dictate (that's what
   the fast-defaults re-snapshot is for). **The P0→V2a gate (probes 1–2) is met.**
+- **P0-4 cadence measured 2026-07-11** (results recorded in `docs/v2-scope.md` §P0 results):
+  41 MB burst still 100% in the ephemeral layer 45 s later (defaults: checkpoint_distance
+  256 MB, checkpoint_timeout 10 m, compaction_threshold 10 L0s, image_creation_threshold 3);
+  zero organic image layers over days of light writing. V2b conclusion: image-creation
+  transcode is a throughput path, never a freshness path — freshness must come from the tail
+  merge / V2a's commit-ordered stream. **All four P0 probes complete.**
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
