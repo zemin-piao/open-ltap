@@ -202,6 +202,38 @@ with user-visible value (zero-footprint CDC on Neon), not the endgame.
 **Gate to V2b**: V2a survives the existing gauntlet (M1–M3 scenarios: kill -9, DDL, TOAST,
 relfilenode rewrites) inside the pageserver's restart/failure model.
 
+#### V2a execution plan (recon done 2026-07-11)
+
+- **Version pin decision**: the compose stack's `neon:latest` image was built **2025-08-26** —
+  ~9 months older than the source this doc cites (`8f60b04`, 2026-05-25). Either pin the fork
+  to a release tag near the image (and re-verify layer formats against it) or upgrade the
+  stack to a current image first. Prefer the upgrade: everything verified so far (pagestream
+  V3, layer formats incl. the 0b001 zstd bit) was validated against the *running* old image
+  AND read from May-2026 source, so both ends already agree; upgrading narrows rather than
+  widens the gap.
+- **Build logistics (this dev box)**: `postgres_ffi` needs built vendored Postgres trees
+  (`POSTGRES_INSTALL_DIR`, bindgen) — so `make postgres-v14..v17` precedes any cargo build;
+  cmake and pkg-config are missing and Homebrew is read-only (drop official binary releases
+  into `~/.local/bin`); protoc exists. A macOS-built pageserver **cannot run in the compose
+  stack** — runtime validation requires building neon's Linux image (hours, in the Docker
+  VM), so plan two loops: fast local `cargo check` for patch iteration, slow image build for
+  the live gauntlet.
+- **Patch shape** (small series, rebase-friendly): (1) `pageserver/src/transcode.rs` — a
+  `TranscodeSink` trait + a bounded tokio channel tee; (2) one call site in the walreceiver
+  ingest path sending `(lsn, raw record bytes)` when a tenant-conf flag is on, dropping (with
+  a counter) when the channel is full — fail-open, never backpressure ingest (P4); (3) config
+  plumbing + the engine task. The engine side needs an open-ltap refactor first: Engine moves
+  out of `main.rs` into the lib with a pluggable record source (today it's welded to the
+  pgwire stream loop), SQL catalog swapped for the P0-2 catalog-from-pages path (productize
+  from `examples/layerscan.rs`, + pg_index for pk discovery), pre-images via native
+  timeline reads instead of the pagestream client.
+- **Sequencing within V2a**: (a) open-ltap refactor (engine-as-lib, no neon dependency —
+  independently shippable and testable against the existing safekeeper path); (b) stack
+  upgrade + local neon build proving the toolchain; (c) the tee patch + engine embedding;
+  (d) gauntlet in the compose stack with the forked image.
+- **Empirical footnote**: the P0-4 ladder's checkpoint_timeout bound was confirmed live —
+  the 41 MB burst rolled ephemeral→L0 at exactly the 10-minute mark.
+
 ### V2b — page-driven transcode at image-layer creation
 
 Tee `create_image_layer_for_rel_blocks`: for main-fork heap relations, additionally decode
