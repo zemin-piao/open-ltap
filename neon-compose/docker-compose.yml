@@ -3,6 +3,8 @@
 # are vendored verbatim from upstream). Changes from upstream:
 #   - safekeeper1 publishes its pg port (5454) so the transcoder on the host
 #     can stream WAL from it
+#   - the pageserver publishes its pg port (6400) so the transcoder on the
+#     host can issue GetPage@LSN requests (pagestream_v3)
 #   - the minio bucket job also creates a `lake` bucket for our Delta tables
 #     (this stack replaces the vanilla dev stack, including its MinIO)
 #   - PG_VERSION defaults to 17 (the major we verify against)
@@ -46,6 +48,7 @@ services:
       - AWS_SECRET_ACCESS_KEY=password
     ports:
       - 9898:9898 # http endpoints
+      - 6400:6400 # pg protocol handler — GetPage@LSN for the transcoder
     volumes:
       - ./pageserver_config:/data/.neon/
     depends_on:

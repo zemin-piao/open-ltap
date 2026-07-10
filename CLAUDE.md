@@ -208,9 +208,20 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
     `pg_relation_filenode(oid)`, which resolves the relmapper indirection (`81796b3`).
   Both fixes verified end-to-end over the safekeeper source: `ADD COLUMN`, `DROP COLUMN`, and
   `TRUNCATE` (relfilenode rewrite) all correctly detected/handled; TOAST (incompressible and
-  highly-compressible external values) decoded byte-exact (md5 match). **Still not started**:
-  the pageserver `GetPage@LSN` oracle (pre-images/TOAST/backfill) — pre-images still route
-  through the compute's SQL port, same as M2d. This is the only piece of M5 left.
+  highly-compressible external values) decoded byte-exact (md5 match).
+- **GetPage@LSN oracle client shipped & verified 2026-07-10** (P0-3 of `docs/v2-scope.md`):
+  `pgwire.rs` speaks the pageserver's `pagestream_v3` sub-protocol — `connect_pageserver`
+  (plain non-replication startup, `pagestream_v3 <tenant> <timeline>` into CopyBoth), then
+  `get_page`/`rel_nblocks`/`rel_exists` as CopyData request/response frames (layouts per
+  neon's `libs/pageserver_api/src/pagestream_api.rs`; V3 echoes the request header — reqid
+  checked; not_modified_since = request_lsn, so only pass safekeeper-committed LSNs).
+  `examples/getpage.rs` = harness; neon-compose now publishes pageserver port 6400. Verified
+  live: 302/302 tuples decoded byte-exact vs SQL across 3 pages (pruned dead versions
+  correctly skipped), and **time travel** — `LTAP_AT_LSN` pinned before an UPDATE+DELETE
+  returned the exact pre-mutation state (old tuple values at same offnums) while the
+  current-LSN read matched post-mutation SQL. **Remaining for M5-oracle**: wire the engine's
+  pre-images/TOAST/backfill through this client (replace the mirror's pageinspect dependency
+  and snapshot's SQL COPY on the safekeeper path).
 - `examples/walscan.rs` — offline WAL reader harness (feeds a raw segment file, compares against
   `pg_waldump`; supports chunked feeding to simulate streaming). Invaluable for reader bugs.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.

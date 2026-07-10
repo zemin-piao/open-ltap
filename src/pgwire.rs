@@ -4,6 +4,11 @@
 //! they differ only in the startup parameters (tenant_id/timeline_id), the
 //! START_REPLICATION syntax (no SLOT/TIMELINE clause), and slot commands
 //! (none: safekeepers manage their own WAL horizon).
+//!
+//! Also speaks the Neon pageserver's `pagestream_v3` sub-protocol (GetPage@LSN
+//! et al.): the same libpq framing, but a plain (non-replication) startup and
+//! request/response messages inside CopyBoth. Message layouts per
+//! `libs/pageserver_api/src/pagestream_api.rs` in neondatabase/neon.
 
 use anyhow::{Context, Result, bail};
 use bytes::{Buf, BufMut, BytesMut};
@@ -41,9 +46,20 @@ pub enum ReplMsg {
     Keepalive { wal_end: u64, reply_requested: bool },
 }
 
+/// Physical identity of a relation fork, as the pageserver addresses pages.
+/// `spcnode` is the tablespace oid (1663 = pg_default), `forknum` 0 = main.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelTag {
+    pub spcnode: u32,
+    pub dbnode: u32,
+    pub relnode: u32,
+    pub forknum: u8,
+}
+
 pub struct ReplConn {
     stream: TcpStream,
     buf: BytesMut,
+    reqid: u64,
 }
 
 impl ReplConn {
@@ -60,16 +76,47 @@ impl ReplConn {
         let stream = TcpStream::connect((host, port))
             .await
             .with_context(|| format!("connecting to {host}:{port}"))?;
-        let mut conn = ReplConn { stream, buf: BytesMut::with_capacity(64 * 1024) };
-        conn.send_startup(user, extra_params).await?;
+        let mut conn = ReplConn { stream, buf: BytesMut::with_capacity(64 * 1024), reqid: 0 };
+        conn.send_startup(user, true, extra_params).await?;
         conn.await_ready(password).await?;
         Ok(conn)
     }
 
-    async fn send_startup(&mut self, user: &str, extra_params: &[(&str, &str)]) -> Result<()> {
+    /// Connect to a pageserver's page service and enter the `pagestream_v3`
+    /// sub-protocol for `tenant`/`timeline`: a plain (non-replication) startup,
+    /// then request/response inside CopyBoth. `password` answers a cleartext
+    /// password request (JWT when auth is enabled).
+    pub async fn connect_pageserver(
+        host: &str,
+        port: u16,
+        user: &str,
+        tenant: &str,
+        timeline: &str,
+        password: Option<&str>,
+    ) -> Result<Self> {
+        let stream = TcpStream::connect((host, port))
+            .await
+            .with_context(|| format!("connecting to pageserver {host}:{port}"))?;
+        let mut conn = ReplConn { stream, buf: BytesMut::with_capacity(64 * 1024), reqid: 0 };
+        conn.send_startup(user, false, &[]).await?;
+        conn.await_ready(password).await?;
+        conn.send_query(&format!("pagestream_v3 {tenant} {timeline}")).await?;
+        conn.await_copy_both().await.context("entering pagestream")?;
+        Ok(conn)
+    }
+
+    async fn send_startup(
+        &mut self,
+        user: &str,
+        replication: bool,
+        extra_params: &[(&str, &str)],
+    ) -> Result<()> {
         let mut body = BytesMut::new();
         body.put_u32(196608); // protocol 3.0
-        let base = [("user", user), ("replication", "true")];
+        let mut base = vec![("user", user)];
+        if replication {
+            base.push(("replication", "true"));
+        }
         for (k, v) in base.iter().chain(extra_params) {
             body.put_slice(k.as_bytes());
             body.put_u8(0);
@@ -269,6 +316,100 @@ impl ReplConn {
         Ok(())
     }
 
+    // ---- pagestream_v3 requests (connection must be from connect_pageserver) ----
+    //
+    // Every request is one CopyData frame: tag u8, then reqid/request_lsn/
+    // not_modified_since (u64 BE each), then per-type fields. The response
+    // echoes the whole request header + fields before its payload. We always
+    // send not_modified_since = request_lsn (documented as always correct);
+    // the pageserver waits for WAL up to that LSN to arrive, so callers must
+    // pass an LSN the safekeepers have actually committed.
+
+    /// Fetch the 8KB page of `rel` block `blkno` materialized at `lsn`.
+    pub async fn get_page(&mut self, rel: RelTag, blkno: u32, lsn: u64) -> Result<Vec<u8>> {
+        let mut req = self.pagestream_hdr(2, lsn);
+        put_reltag(&mut req, rel);
+        req.put_u32(blkno);
+        let mut resp = self.pagestream_roundtrip(req, 102, "GetPage").await?;
+        resp.advance(33); // echoed request_lsn + not_modified_since + reltag + blkno
+        if resp.len() != 8192 {
+            bail!("GetPage returned {} bytes, want 8192", resp.len());
+        }
+        Ok(resp.to_vec())
+    }
+
+    /// Size of `rel` in blocks at `lsn`.
+    pub async fn rel_nblocks(&mut self, rel: RelTag, lsn: u64) -> Result<u32> {
+        let mut req = self.pagestream_hdr(1, lsn);
+        put_reltag(&mut req, rel);
+        let mut resp = self.pagestream_roundtrip(req, 101, "Nblocks").await?;
+        resp.advance(29); // echoed lsns + reltag
+        Ok(resp.get_u32())
+    }
+
+    /// Whether `rel` exists at `lsn`.
+    pub async fn rel_exists(&mut self, rel: RelTag, lsn: u64) -> Result<bool> {
+        let mut req = self.pagestream_hdr(0, lsn);
+        put_reltag(&mut req, rel);
+        let mut resp = self.pagestream_roundtrip(req, 100, "Exists").await?;
+        resp.advance(29); // echoed lsns + reltag
+        Ok(resp.get_u8() != 0)
+    }
+
+    fn pagestream_hdr(&mut self, tag: u8, lsn: u64) -> BytesMut {
+        self.reqid += 1;
+        let mut req = BytesMut::with_capacity(64);
+        req.put_u8(tag);
+        req.put_u64(self.reqid);
+        req.put_u64(lsn); // request_lsn
+        req.put_u64(lsn); // not_modified_since
+        req
+    }
+
+    /// Send one request frame, read one response frame, check the tag and the
+    /// echoed reqid, and return the payload positioned after the reqid.
+    async fn pagestream_roundtrip(
+        &mut self,
+        req: BytesMut,
+        want_tag: u8,
+        what: &str,
+    ) -> Result<BytesMut> {
+        let mut msg = BytesMut::with_capacity(req.len() + 5);
+        msg.put_u8(b'd');
+        msg.put_u32(4 + req.len() as u32);
+        msg.extend_from_slice(&req);
+        self.stream.write_all(&msg).await?;
+
+        let mut resp = loop {
+            let (tag, payload) = self.read_msg().await?;
+            match tag {
+                b'd' => break payload,
+                b'N' => {}
+                b'E' => bail!("{what} failed: {}", parse_error(&payload)),
+                b'c' | b'Z' => bail!("server ended the pagestream"),
+                t => bail!("unexpected message '{}' in pagestream", t as char),
+            }
+        };
+        if resp.len() < 25 {
+            bail!("{what}: truncated pagestream response ({} bytes)", resp.len());
+        }
+        let tag = resp.get_u8();
+        let got_reqid = resp.get_u64();
+        if tag == 103 {
+            // Error: echoed lsns, then a NUL-terminated message.
+            resp.advance(16);
+            let end = resp.iter().position(|&b| b == 0).unwrap_or(resp.len());
+            bail!("{what}: pageserver error: {}", String::from_utf8_lossy(&resp[..end]));
+        }
+        if tag != want_tag {
+            bail!("{what}: unexpected pagestream response tag {tag}");
+        }
+        if got_reqid != self.reqid {
+            bail!("{what}: response for reqid {got_reqid}, want {}", self.reqid);
+        }
+        Ok(resp)
+    }
+
     async fn send_query(&mut self, q: &str) -> Result<()> {
         let mut msg = BytesMut::new();
         msg.put_u8(b'Q');
@@ -300,6 +441,13 @@ impl ReplConn {
             }
         }
     }
+}
+
+fn put_reltag(buf: &mut BytesMut, rel: RelTag) {
+    buf.put_u32(rel.spcnode);
+    buf.put_u32(rel.dbnode);
+    buf.put_u32(rel.relnode);
+    buf.put_u8(rel.forknum);
 }
 
 fn parse_data_row(mut payload: BytesMut) -> Result<Vec<Option<String>>> {
