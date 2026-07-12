@@ -305,6 +305,13 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   = public fork repo, user decision). Phase 2 = engine adapter (raw DML bytes from batch
   values, `Value::Image` FPIs via page decode, decoded `XlXactParsedRecord` commits) +
   catalog-from-pages productization + native-read pre-images; then step (d) gauntlet.
+  **Unit C shipped (`b8a2547`)**: `src/catalog.rs` — PageSource trait (layer-file +
+  PagestreamSource impls), parse_relmap/MappedRels (pagestream can't serve the relmapper
+  blob — mapped filenodes out of band there), Catalog::load + desc() **now with pk from
+  pg_index** (layout verified vs REL_17_STABLE; not a mapped rel — filenode via its
+  pg_class row), table_names() for auto-discovery, preload_toast. Verified live: composite
+  reversed PK ["b","a"] + byte-exact rows from a fresh forced image layer; old-layer t with
+  dropped-col slot + pk=["id"] matches SQL. layerscan rewired onto the module.
   **Embedding-viability probe passed**: open-ltap as a path dep of the fork's pageserver
   resolves with zero version conflicts and compiles; only obstacle was MSRV (deltalake 0.32
   needs ≥1.91.1 vs neon's pinned 1.88.0) → fork commit #2 (`5c2b75d2f`) bumps the toolchain

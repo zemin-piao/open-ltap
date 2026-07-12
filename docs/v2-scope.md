@@ -354,6 +354,25 @@ relfilenode rewrites) inside the pageserver's restart/failure model.
   replacement); unit E = engine construction/config inside the consumer task (open-ltap as
   fork dep — probe already validated the dep tree) + Delta sink credentials story in the
   pageserver process; then step (d) gauntlet.
+- **Unit C shipped (open-ltap `b8a2547`) — catalog-from-pages is a lib module**
+  (`src/catalog.rs`): `PageSource` trait (async: db/rel_nblocks/get_page + overridable
+  rel_pages) with two impls today (layerscan's image-layer reader; `PagestreamSource` over
+  the pagestream client) and the fork's native Timeline reads as the intended third.
+  Relmapper split honestly: `parse_relmap` + `MappedRels` for blob-capable sources —
+  pagestream serves only rel blocks, so it takes mapped filenodes out of band; in-process
+  keyspace reads and layer files parse the real blob. `Catalog::load` scans
+  pg_class/pg_attribute/pg_index once (xmax==0 heuristic unchanged, P2 pending);
+  `desc()` now also derives the **primary key from pg_index** (indisprimary + indkey
+  int2vector — layout verified against REL_17_STABLE pg_index.h: fixed bools end at 23,
+  int2vector typalign 'i'/typstorage plain → 4-byte varlena header at 24, values at 48;
+  pg_index is NOT mapped — filenode from its own pg_class row, relmapper override
+  honored); `table_names()` = public ordinary tables for auto-discovery; `preload_toast`
+  fills a ToastCache from toast-rel pages. The new unit test caught a real offset bug
+  (indrelid read at 0, lives at 4) before live verification did. **Verified live**:
+  `pkt` (composite reversed PK) derives `pk=["b","a"]` + byte-exact rows from a freshly
+  forced image layer; `t` derives from a months-old layer with its dropped-column slot,
+  `pk=["id"]`, filenode matching live SQL; dropped `gnarly` correctly absent from
+  post-drop layers. layerscan now drives the module (duplicated parsers deleted).
 
 ### V2b — page-driven transcode at image-layer creation
 
