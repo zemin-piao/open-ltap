@@ -36,6 +36,7 @@
 //! WalRecord tag 0 = Postgres { will_init, rec } — a raw WAL record).
 
 use anyhow::{Context, Result, bail};
+use open_ltap::catalog::{Catalog, MappedRels, PageSource, parse_relmap, preload_toast};
 use open_ltap::schema::{Col, PgType, PhysCol, TableDesc};
 use open_ltap::wal::heap::{ToastCache, decode_tuple_from_page};
 use std::collections::BTreeMap;
@@ -213,195 +214,65 @@ fn desc_from_cols(spec: &str, relnode: u32) -> Result<TableDesc> {
     })
 }
 
-// ---- P0-2: catalog-from-pages ---------------------------------------------
+// ---- P0-2: catalog-from-pages (the derivation lives in open_ltap::catalog;
+// this is the image-layer PageSource feeding it) --------------------------
 
-const PG_CLASS_OID: u32 = 1259;
-const PG_ATTRIBUTE_OID: u32 = 1249;
-const RELMAPPER_FILEMAGIC: u32 = 0x59_27_17;
-
-/// oid -> filenode for mapped relations, from the 512-byte pg_filenode.map
-/// blob (relmapper.c RelMapFile: magic, num_mappings, then (oid, filenode)
-/// pairs — little-endian like everything on-page).
-fn parse_relmap(b: &[u8]) -> Result<std::collections::HashMap<u32, u32>> {
-    let magic = u32::from_le_bytes(b[..4].try_into().unwrap());
-    if magic != RELMAPPER_FILEMAGIC {
-        bail!("relmapper magic {magic:#x}, want {RELMAPPER_FILEMAGIC:#x}");
-    }
-    let n = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
-    let mut map = std::collections::HashMap::with_capacity(n);
-    for i in 0..n {
-        let off = 8 + i * 8;
-        map.insert(
-            u32::from_le_bytes(b[off..off + 4].try_into().unwrap()),
-            u32::from_le_bytes(b[off + 4..off + 8].try_into().unwrap()),
-        );
-    }
-    Ok(map)
-}
-
-/// Every LP_NORMAL tuple on a page as (xmax, attribute bytes from t_hoff on).
-/// The attribute bytes of a catalog tuple are its FormData C struct.
-fn page_tuples(page: &[u8]) -> Vec<(u32, Vec<u8>)> {
-    let pd_lower = u16::from_le_bytes([page[12], page[13]]) as usize;
-    let mut out = Vec::new();
-    for i in 0..pd_lower.saturating_sub(24) / 4 {
-        let lp = u32::from_le_bytes(page[24 + i * 4..28 + i * 4].try_into().unwrap());
-        let (lp_off, lp_flags, lp_len) = ((lp & 0x7FFF) as usize, (lp >> 15) & 0x3, (lp >> 17) as usize);
-        if lp_flags != 1 {
-            continue; // not LP_NORMAL
-        }
-        let Some(tuple) = page.get(lp_off..lp_off + lp_len) else { continue };
-        let xmax = u32::from_le_bytes(tuple[4..8].try_into().unwrap());
-        let hoff = tuple[22] as usize;
-        if tuple.len() >= hoff {
-            out.push((xmax, tuple[hoff..].to_vec()));
-        }
-    }
-    out
-}
-
-/// All (xmax, attrs) tuples of one relation across the image layer.
-fn scan_rel(file: &[u8], entries: &[([u8; KEY_SIZE], u64)], db: u32, relnode: u32) -> Result<Vec<(u32, Vec<u8>)>> {
-    let mut out = Vec::new();
-    for (kb, off) in entries {
-        let k = parse_key(kb);
-        if k.f1 == 0 && k.db == db && k.rel == relnode && k.fork == 0 && k.blk != u32::MAX {
-            out.extend(page_tuples(&read_blob(file, *off)?));
-        }
-    }
-    Ok(out)
-}
-
-fn name64(b: &[u8]) -> String {
-    let end = b[..64].iter().position(|&c| c == 0).unwrap_or(64);
-    String::from_utf8_lossy(&b[..end]).into_owned()
-}
-
-/// FormData_pg_class fixed part (PG17): oid 0, relname 4, then 7 oids
-/// (relnamespace..reltablespace) at 68..96, relpages/reltuples/relallvisible
-/// 96..108, reltoastrelid 108, relkind 115, relnatts 116.
-struct ClassRow {
-    oid: u32,
-    name: String,
-    filenode: u32,
-    toastrelid: u32,
-    relkind: u8,
-    natts: i16,
-}
-
-fn parse_pg_class(a: &[u8]) -> Option<ClassRow> {
-    Some(ClassRow {
-        oid: u32::from_le_bytes(a.get(0..4)?.try_into().unwrap()),
-        name: name64(a.get(4..68)?),
-        filenode: u32::from_le_bytes(a.get(88..92)?.try_into().unwrap()),
-        toastrelid: u32::from_le_bytes(a.get(108..112)?.try_into().unwrap()),
-        relkind: *a.get(115)?,
-        natts: i16::from_le_bytes(a.get(116..118)?.try_into().unwrap()),
-    })
-}
-
-/// FormData_pg_attribute fixed part (PG17, attcacheoff still present):
-/// attrelid 0, attname 4, atttypid 68, attlen 72, attnum 74, attcacheoff 76,
-/// atttypmod 80, attndims 84, attbyval 86, attalign 87, ... atthasmissing 92,
-/// ... attisdropped 95.
-struct AttRow {
-    attrelid: u32,
-    name: String,
-    typid: u32,
-    attlen: i16,
-    attnum: i16,
-    attalign: u8,
-    hasmissing: bool,
-    isdropped: bool,
-}
-
-fn parse_pg_attribute(a: &[u8]) -> Option<AttRow> {
-    Some(AttRow {
-        attrelid: u32::from_le_bytes(a.get(0..4)?.try_into().unwrap()),
-        name: name64(a.get(4..68)?),
-        typid: u32::from_le_bytes(a.get(68..72)?.try_into().unwrap()),
-        attlen: i16::from_le_bytes(a.get(72..74)?.try_into().unwrap()),
-        attnum: i16::from_le_bytes(a.get(74..76)?.try_into().unwrap()),
-        attalign: *a.get(87)?,
-        hasmissing: *a.get(92)? != 0,
-        isdropped: *a.get(95)? != 0,
-    })
-}
-
-/// Derive a TableDesc for `table` from pg_class/pg_attribute pages in the
-/// image layer. Spike visibility heuristic: keep tuples with xmax == 0.
-fn desc_from_catalog(
-    file: &[u8],
-    entries: &[([u8; KEY_SIZE], u64)],
+/// A relation-page source over an image layer's (key -> blob) entries.
+struct LayerSource<'a> {
+    file: &'a [u8],
+    entries: &'a [([u8; KEY_SIZE], u64)],
     db: u32,
-    table: &str,
-) -> Result<TableDesc> {
-    let relmap_blob = entries
+}
+
+impl PageSource for LayerSource<'_> {
+    fn db(&self) -> u32 {
+        self.db
+    }
+    async fn rel_nblocks(&mut self, filenode: u32) -> Result<u32> {
+        Ok(self
+            .entries
+            .iter()
+            .map(|(kb, _)| parse_key(kb))
+            .filter(|k| k.f1 == 0 && k.db == self.db && k.rel == filenode && k.fork == 0 && k.blk != u32::MAX)
+            .map(|k| k.blk + 1)
+            .max()
+            .unwrap_or(0))
+    }
+    async fn get_page(&mut self, filenode: u32, blk: u32) -> Result<Vec<u8>> {
+        let (_, off) = self
+            .entries
+            .iter()
+            .find(|(kb, _)| {
+                let k = parse_key(kb);
+                k.f1 == 0 && k.db == self.db && k.rel == filenode && k.fork == 0 && k.blk == blk
+            })
+            .with_context(|| format!("no page for rel {filenode} blk {blk} in the layer"))?;
+        read_blob(self.file, *off)
+    }
+    /// Cheaper than nblocks+get_page: one pass over the sorted entries.
+    async fn rel_pages(&mut self, filenode: u32) -> Result<Vec<Vec<u8>>> {
+        let mut pages = Vec::new();
+        for (kb, off) in self.entries {
+            let k = parse_key(kb);
+            if k.f1 == 0 && k.db == self.db && k.rel == filenode && k.fork == 0 && k.blk != u32::MAX {
+                pages.push(read_blob(self.file, *off)?);
+            }
+        }
+        Ok(pages)
+    }
+}
+
+/// The relmapper blob at key (0, spc, db, 0, 0, 0) — pg_class/pg_attribute
+/// are mapped relations, unreachable through pg_class.relfilenode.
+fn layer_relmap(file: &[u8], entries: &[([u8; KEY_SIZE], u64)], db: u32) -> Result<Vec<u8>> {
+    entries
         .iter()
         .find(|(kb, _)| {
             let k = parse_key(kb);
             (k.f1, k.spc, k.db, k.rel, k.fork, k.blk) == (0, 1663, db, 0, 0, 0)
         })
         .map(|(_, off)| read_blob(file, *off))
-        .context("no relmapper key for this db in the layer")??;
-    let relmap = parse_relmap(&relmap_blob)?;
-    let class_node = *relmap.get(&PG_CLASS_OID).context("pg_class not in relmapper")?;
-    let attr_node = *relmap.get(&PG_ATTRIBUTE_OID).context("pg_attribute not in relmapper")?;
-    println!("relmapper: {} mappings, pg_class -> {class_node}, pg_attribute -> {attr_node}", relmap.len());
-
-    let class_rows: Vec<ClassRow> = scan_rel(file, entries, db, class_node)?
-        .iter()
-        .filter(|(xmax, _)| *xmax == 0)
-        .filter_map(|(_, a)| parse_pg_class(a))
-        .collect();
-    let cls = class_rows
-        .iter()
-        .find(|c| c.name == table && c.relkind == b'r')
-        .with_context(|| format!("table '{table}' not found in pg_class pages"))?;
-    let toast_rel_node = (cls.toastrelid != 0)
-        .then(|| class_rows.iter().find(|c| c.oid == cls.toastrelid).map(|c| c.filenode))
-        .flatten();
-
-    let mut atts: Vec<AttRow> = scan_rel(file, entries, db, attr_node)?
-        .iter()
-        .filter(|(xmax, _)| *xmax == 0)
-        .filter_map(|(_, a)| parse_pg_attribute(a))
-        .filter(|a| a.attrelid == cls.oid && a.attnum >= 1)
-        .collect();
-    atts.sort_by_key(|a| a.attnum);
-    atts.dedup_by_key(|a| a.attnum); // paranoia; xmax==0 should be unique
-    if atts.len() != cls.natts as usize {
-        bail!("pg_attribute yielded {} atts, pg_class.relnatts says {}", atts.len(), cls.natts);
-    }
-
-    let (mut cols, mut phys, mut has_fast_defaults) = (Vec::new(), Vec::new(), false);
-    for a in &atts {
-        if a.isdropped {
-            let align = match a.attalign {
-                b'c' => 1,
-                b's' => 2,
-                b'i' => 4,
-                b'd' => 8,
-                x => bail!("attalign '{}'?", x as char),
-            };
-            phys.push(PhysCol::Dropped { attlen: a.attlen, align });
-        } else {
-            let col = Col { name: a.name.clone(), ty: PgType::from_oid(a.typid)? };
-            phys.push(PhysCol::Live(col.clone()));
-            cols.push(col);
-            has_fast_defaults |= a.hasmissing;
-        }
-    }
-    Ok(TableDesc {
-        name: table.to_string(),
-        db_oid: db,
-        rel_node: cls.filenode,
-        toast_rel_node,
-        cols,
-        phys,
-        has_fast_defaults,
-        pk: Vec::new(), // pg_index lives outside this spike
-    })
+        .context("no relmapper key for this db in the layer")?
 }
 
 fn decode_page(page: &[u8], key: Key, desc: &TableDesc, toast: &ToastCache) {
@@ -419,7 +290,8 @@ fn fmt_lsn(l: u64) -> String {
     format!("{:X}/{:X}", l >> 32, l & 0xFFFF_FFFF)
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     let mut path = None;
     let (mut rel_filter, mut cols_spec) = (None::<u32>, None::<String>);
     let (mut table, mut db) = (None::<String>, None::<u32>);
@@ -465,35 +337,31 @@ fn main() -> Result<()> {
         // P0-2 mode: derive the schema from catalog pages, then use it.
         if let Some(table) = &table {
             let db = db.context("table= needs db=<dboid>")?;
-            let desc = desc_from_catalog(&file, &entries, db, table)?;
+            let relmap = parse_relmap(&layer_relmap(&file, &entries, db)?)?;
+            let mapped = MappedRels::from_relmap(&relmap)?;
+            println!(
+                "relmapper: {} mappings, pg_class -> {}, pg_attribute -> {}",
+                relmap.len(),
+                mapped.pg_class,
+                mapped.pg_attribute
+            );
+            let mut src = LayerSource { file: &file, entries: &entries, db };
+            let cat = Catalog::load(&mut src, &mapped).await?;
+            let desc = cat.desc(table)?;
             // The toast relation's chunk tuples are pages in this same layer:
             // preload the cache so out-of-line values decode too.
             let mut toast = ToastCache::default();
             if let Some(tnode) = desc.toast_rel_node {
-                let mut chunks = 0usize;
-                for (kb, off) in &entries {
-                    let key = parse_key(kb);
-                    if key.f1 == 0 && key.db == db && key.rel == tnode && key.fork == 0 && key.blk != u32::MAX {
-                        let page = read_blob(&file, *off)?;
-                        let pd_lower = u16::from_le_bytes([page[12], page[13]]) as usize;
-                        for offnum in 1..=(pd_lower.saturating_sub(24) / 4) as u16 {
-                            if let Ok((valueid, seq, data)) =
-                                open_ltap::wal::heap::decode_toast_chunk_from_page(&page, offnum)
-                            {
-                                toast.add_chunk(0, valueid, seq, data);
-                                chunks += 1;
-                            }
-                        }
-                    }
-                }
+                let chunks = preload_toast(&mut src, tnode, &mut toast).await?;
                 println!("preloaded {chunks} toast chunks from rel {tnode}");
             }
             println!(
-                "derived from catalog pages: {} rel_node={} toast={:?} fast_defaults={} cols={:?} phys_slots={}",
+                "derived from catalog pages: {} rel_node={} toast={:?} fast_defaults={} pk={:?} cols={:?} phys_slots={}",
                 desc.name,
                 desc.rel_node,
                 desc.toast_rel_node,
                 desc.has_fast_defaults,
+                desc.pk,
                 desc.cols.iter().map(|c| format!("{}:{:?}", c.name, c.ty)).collect::<Vec<_>>(),
                 desc.phys.len(),
             );

@@ -3,6 +3,7 @@
 //! and the v2a pageserver fork will be another. Examples/tests drive the
 //! WAL machinery and layer-file readers directly.
 
+pub mod catalog;
 pub mod engine;
 pub mod pgwire;
 pub mod schema;
