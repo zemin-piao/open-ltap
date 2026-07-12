@@ -280,6 +280,20 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   smoke run (oracle pre-images, md5 match). Next V2a steps per `docs/v2-scope.md` §V2a
   execution plan: (b) stack upgrade + local neon build, (c) TranscodeSink tee patch + engine
   embedding, (d) gauntlet on the forked image.
+- **V2a step (b) done 2026-07-12 — version pin + toolchain** (details in `docs/v2-scope.md`
+  §V2a step (b) results): no newer public neon image exists (local `latest` == remote; ghcr's
+  20k tags end Aug 2025; newest release tag is older than `latest`) — the running image's
+  commit `77e22e4bf` is an ancestor of main just 10 inconsequential commits behind `8f60b04`,
+  so **fork base = main @ `8f60b04`** and the running stack is representative; no stack change
+  needed. Local build proven at that commit in `~/neon`: pkgconf 2.3.0 (built) + cmake 3.31.9
+  (binary) in `~/.local/bin`, read-only brew openssl@3/icu4c, `make postgres-headers-install`
+  (headers only — no full PG builds needed for bindgen), `cargo check -p pageserver` clean
+  (rust 1.88 via neon's rust-toolchain.toml). **Patch-shape correction for step (c)**: the
+  safekeeper→pageserver protocol is hardcoded `Interpreted` (protobuf+zstd,
+  `timeline.rs:3490`) — the pageserver never sees raw XLogData; raw DML bytes arrive inside
+  `SerializedValueBatch` values (`NeonWalRecord::Postgres{rec}`), commits as decoded
+  `MetadataRecord`s. Tee options (both pageserver-side): consume interpreted batches (truer
+  to prod) or a config knob restoring the still-present Vanilla arm (smallest patch).
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan

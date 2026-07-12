@@ -1,3 +1,4 @@
 # Runtime state written by the running pageserver container — not source.
 pageserver_config/pageserver.pid
 pageserver_config/tenants/
+pageserver_config/deletion/

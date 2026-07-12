@@ -234,6 +234,44 @@ relfilenode rewrites) inside the pageserver's restart/failure model.
 - **Empirical footnote**: the P0-4 ladder's checkpoint_timeout bound was confirmed live —
   the 41 MB burst rolled ephemeral→L0 at exactly the 10-minute mark.
 
+#### V2a step (b) results (2026-07-12) — version pin + toolchain proven
+
+- **There is no newer public image than the one already running.** The "prefer the upgrade"
+  branch of the version-pin decision is moot: the local `neon:latest` digest (`7a4f1249…`)
+  equals the remote `latest`; the full ghcr tag list (20,186 tags, paginated to exhaustion)
+  ends at CI runs from late Aug 2025; the newest release tag (`release-9129`, 2025-07-25) is
+  *older* than `latest`. The public repo effectively froze after Aug 2025: the running
+  binaries report commit `77e22e4bf` (2025-08-25), which is an **ancestor of `main` only 10
+  commits behind `8f60b04`** — and those 10 commits are a GCS remote-storage provider,
+  direct-IO alignment config, README/typo/proxy fixes: nothing touching WAL ingest, layer
+  formats, or pagestream. **Decision: fork base = `main` @ `8f60b04`** (the exact commit this
+  doc cites); the running stack is fully representative of it. Local clone: `~/neon`.
+- **Toolchain proven on this box** (fast loop works): pkgconf 2.3.0 built from source +
+  cmake 3.31.9 official binary into `~/.local/bin` (`pkg-config` symlinked to pkgconf);
+  read-only Homebrew supplies openssl@3, icu4c (pkg-config finds icu 78.2), protobuf. Rust
+  1.88.0 auto-pinned via neon's `rust-toolchain.toml`. `make postgres-headers-install`
+  (configure ×4 + header install, no bison needed — full postgres builds NOT required for
+  bindgen) then `cargo check -p pageserver` passes clean. Fast patch loop =
+  `PATH=~/.local/bin:$PATH cargo check -p pageserver` in `~/neon`.
+- **Patch-shape correction (load-bearing for step c)**: at this version the
+  safekeeper→pageserver protocol is **hardcoded `Interpreted` (protobuf + zstd)** at
+  `pageserver/src/tenant/timeline.rs:3490` — the pageserver walreceiver never sees raw
+  XLogData. The *safekeeper* decodes raw records (`safekeeper/src/send_interpreted_wal.rs:444`
+  → `InterpretedWalRecord::from_bytes_filtered`) and ships `InterpretedWalRecords`; raw DML
+  record bytes still reach the pageserver, but *inside* `SerializedValueBatch` values as
+  `NeonWalRecord::Postgres { rec }` per modified block (exactly the raw records P0-1 found
+  stored in delta layers), while commit/abort arrive as decoded `MetadataRecord`s (not raw).
+  Two viable tee placements, both pageserver-side (the engine must stay in the pageserver for
+  page@LSN reads): **(i)** tee at interpreted-batch ingest in
+  `walreceiver_connection.rs` — engine consumes `(next_record_lsn, rec)` from batch values
+  (dedupe per record via first block) + decoded commit metadata instead of raw XACT records
+  (engine adaptation needed: commit/abort handling already lives in `wal/heap.rs` and could
+  accept a pre-decoded form); **(ii)** a config knob restoring
+  `PostgresClientProtocol::Vanilla` (the enum + Vanilla arm still exist in
+  `walreceiver_connection.rs:290`), which hands the engine a true raw stream with the
+  originally planned one-call-site tee — smallest patch, but diverges from the prod-default
+  protocol path. Decide at step (c); (i) is truer to "transcode where the data already is".
+
 ### V2b — page-driven transcode at image-layer creation
 
 Tee `create_image_layer_for_rel_blocks`: for main-fork heap relations, additionally decode
