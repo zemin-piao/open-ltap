@@ -309,6 +309,17 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   resolves with zero version conflicts and compiles; only obstacle was MSRV (deltalake 0.32
   needs ≥1.91.1 vs neon's pinned 1.88.0) → fork commit #2 (`5c2b75d2f`) bumps the toolchain
   to 1.96.1 + one-line E0446 fix. Probe dep reverted; it lands with the engine in phase 2.
+- **V2a step (c) phase 2 units A+B shipped 2026-07-12** (details in `docs/v2-scope.md`):
+  A (open-ltap `e07c713`) = public `Engine::handle_commit/handle_abort/handle_smgr_create`
+  seams extracted from the XACT/SMGR arms (raw path delegates; pure motion, suite green) —
+  with the pre-existing `handle_record(lsn, &[u8])` the engine ingest API is complete for
+  interpreted mode. B (fork `3aaca63ce`) = `RecordEvent` + `events_from()` adapter in
+  `transcode.rs` (7 tests): one Raw per record (every `Postgres` batch value carries the
+  complete record — FPI Image values redundant when any is present); all-image records →
+  `PageImages` (counted/warned, gauntlet will measure); commits/aborts from
+  `XlXactParsedRecord`; SmgrCreate main-fork-only. Remaining: unit C catalog-from-pages →
+  lib, D native-read pre-images, E engine construction in the consumer + sink credentials;
+  then step (d).
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan

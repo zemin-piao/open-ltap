@@ -325,6 +325,36 @@ relfilenode rewrites) inside the pageserver's restart/failure model.
   tee unit tests pass. The probe's Cargo.toml/lock changes were reverted — the dep lands
   with the engine in phase 2.
 
+#### V2a step (c) phase 2, units A+B (2026-07-12) — engine seams + the interpreted adapter
+
+- **Unit A (open-ltap `e07c713`) — engine seams for pre-decoded events**: public
+  `Engine::handle_commit(lsn, xid, &subxids)` / `handle_abort` / `handle_smgr_create(xid, db)`
+  extracted from `handle_record`'s XACT/SMGR arms; the raw-record path delegates to them, so
+  both record sources share one implementation. Pure code motion; the 21-test suite stays
+  green. `handle_record(lsn, &[u8])` was already source-agnostic — with these three seams the
+  engine's ingest API is complete for interpreted mode.
+- **Unit B (fork `3aaca63ce`) — `RecordEvent` + `events_from()` in `transcode.rs`**: the
+  translation from `InterpretedWalRecord` to engine calls, pure and unit-tested (7 tests).
+  Key facts encoded: (1) the decoder clones the *complete* original record into every
+  `NeonWalRecord::Postgres` value it emits for a record (`serialized_batch.rs`), so one
+  `Raw{lsn, rec}` per record is canonical and `Value::Image` FPI blocks are redundant
+  whenever any Postgres value exists — the engine re-decodes all blocks itself, images
+  included; (2) only an **all-image record** (FPI applied on every touched block) loses the
+  raw bytes → surfaces as `PageImages{(RelTag, blkno, page)..}`, counted + warned by the stub
+  consumer, not yet decodable — *measure in the gauntlet* before building a mitigation
+  (expected rare: Neon computes run wal_level=logical which keeps tuple data alongside FPIs,
+  and the value is only Image when `blk.apply_image`); (3) commits/aborts map from
+  `XlXactParsedRecord` (xid + subxacts — prepared-txn records ignored, parity with the raw
+  path); (4) `SmgrCreate` only for `forknum == 0`, matching `parse_smgr_create`. The stub
+  consumer now counts events by kind, so a compose-stack run shows the full translation
+  working before the engine is wired in.
+- **Remaining for phase 2**: unit C = catalog-from-pages productized (P0-2
+  `examples/layerscan.rs` → lib module + `pg_index` PK discovery for compaction); unit D =
+  pre-images via native `Timeline::get` at record-start LSN (fork-side `Oracle`
+  replacement); unit E = engine construction/config inside the consumer task (open-ltap as
+  fork dep — probe already validated the dep tree) + Delta sink credentials story in the
+  pageserver process; then step (d) gauntlet.
+
 ### V2b — page-driven transcode at image-layer creation
 
 Tee `create_image_layer_for_rel_blocks`: for main-fork heap relations, additionally decode
