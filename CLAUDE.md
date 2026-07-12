@@ -294,6 +294,17 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   `SerializedValueBatch` values (`NeonWalRecord::Postgres{rec}`), commits as decoded
   `MetadataRecord`s. Tee options (both pageserver-side): consume interpreted batches (truer
   to prod) or a config knob restoring the still-present Vanilla arm (smallest patch).
+- **V2a step (c) phase 1 shipped 2026-07-12 — TranscodeSink tee scaffold** (details + phase-2
+  adapter contract in `docs/v2-scope.md` §V2a step (c) phase 1): fork branch `openltap/v2a`
+  in `~/neon`, one commit (`104be78da`) atop `8f60b04` — `pageserver/src/transcode.rs`
+  (`TranscodeSink` trait + bounded fail-open `ChannelTee` + stub consumer task where the
+  engine embeds next), `[transcode]` pageserver.toml section (default off), tee offered one
+  line before `ingest_record`; 263 insertions, 44 outside the new file; cargo check + 3 unit
+  tests clean. The Vanilla receiver arm *errors* at this commit ("no longer supported for
+  ingest") so consuming interpreted records was the only option. Branch local-only (pushing
+  = public fork repo, user decision). Phase 2 = engine adapter (raw DML bytes from batch
+  values, `Value::Image` FPIs via page decode, decoded `XlXactParsedRecord` commits) +
+  catalog-from-pages productization + native-read pre-images; then step (d) gauntlet.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan

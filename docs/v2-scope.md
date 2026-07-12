@@ -272,6 +272,46 @@ relfilenode rewrites) inside the pageserver's restart/failure model.
   originally planned one-call-site tee — smallest patch, but diverges from the prod-default
   protocol path. Decide at step (c); (i) is truer to "transcode where the data already is".
 
+#### V2a step (c) phase 1 (2026-07-12) — TranscodeSink tee scaffold, committed on the fork
+
+- **The tee-placement decision made itself**: at `8f60b04` the walreceiver's Vanilla arm
+  *returns an error* ("Vanilla WAL receiver protocol is no longer supported for ingest",
+  `walreceiver_connection.rs`) — option (ii) is dead; option (i), consuming interpreted
+  records, is the only path.
+- **Fork branch `openltap/v2a` in `~/neon`, one commit (`104be78da`) atop `8f60b04`**:
+  8 files, 263 insertions, only 44 lines outside the new `pageserver/src/transcode.rs`
+  (the P9 "small patch series" shape). Contents: `TranscodeSink` trait (`offer(&record)`,
+  non-blocking, infallible) + `ChannelTee` (bounded mpsc, `try_send`, offered/dropped
+  counters, throttled drop logging) + a stub consumer task (per-timeline, spawned at
+  `launch_wal_receiver` when enabled, gate-guarded + cancel-tied to the timeline; logs
+  progress every 10k records — this is where the engine embeds in phase 2). Config:
+  `[transcode] enabled = false` / `channel_capacity = 8192` in pageserver.toml
+  (`TranscodeConfig` in `pageserver_api`). Plumbing: tee created in `launch_wal_receiver`,
+  rides `WalReceiverConf`, offered one line before `walingest.ingest_record` consumes each
+  record. Verified: `cargo check -p pageserver` (+ `pageserver_api`, `control_plane`) clean;
+  3 unit tests (ordering, drop-on-full, drop-on-closed) pass. Branch is local-only — pushing
+  requires creating a public neon fork repo (user decision).
+- **Fail-open semantics settled** (P4): drops surface downstream as `next_record_lsn` gaps
+  and poison the transcoded stream until the engine re-seeds (re-snapshot path) — correctness
+  never depends on the tee keeping up; ingest never waits. Walreceiver reconnects replay
+  records at-or-below already-seen LSNs; the engine's existing Delta-watermark dedupe handles
+  that.
+- **Phase 2 (engine embedding) — the adapter contract, from reading the shapes**: per
+  `InterpretedWalRecord`, DML raw record bytes arrive in `batch` values as
+  `Value::WalRecord(NeonWalRecord::Postgres { rec })` (dedupe per record: take the first
+  block's copy — `rec` is the *whole* raw record, parseable by `parse_record` as-is);
+  records whose blocks carry FPIs may instead arrive as `Value::Image(page)` → route through
+  the engine's existing `decode_tuple_from_page` path (needs an adapter — the engine keys
+  that off `parse_record` block structures today); commit/abort arrive *decoded* as
+  `MetadataRecord::Xact(XactRecord::Commit/Abort(XactCommon { parsed, .. }))` where `parsed:
+  XlXactParsedRecord` has xid + subxacts (what `txbuf` commit/abort needs — engine grows a
+  pre-decoded commit entry point); `MetadataRecord::Smgr(Create)` + `record.xid` covers the
+  M3b suspect-xid flow; `MetadataRecord::Relmap` is a bonus signal for mapped-rel catalog
+  invalidation. Remaining phase-2 work beyond the adapter: catalog-from-pages productization
+  (P0-2 → lib) and pre-images via native timeline reads (`Timeline::get` at
+  `record-start LSN`), replacing the pagestream client; then step (d) = Linux image build +
+  compose gauntlet with `[transcode] enabled = true`.
+
 ### V2b — page-driven transcode at image-layer creation
 
 Tee `create_image_layer_for_rel_blocks`: for main-fork heap relations, additionally decode
