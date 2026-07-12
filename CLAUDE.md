@@ -305,6 +305,10 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   = public fork repo, user decision). Phase 2 = engine adapter (raw DML bytes from batch
   values, `Value::Image` FPIs via page decode, decoded `XlXactParsedRecord` commits) +
   catalog-from-pages productization + native-read pre-images; then step (d) gauntlet.
+  **Embedding-viability probe passed**: open-ltap as a path dep of the fork's pageserver
+  resolves with zero version conflicts and compiles; only obstacle was MSRV (deltalake 0.32
+  needs ≥1.91.1 vs neon's pinned 1.88.0) → fork commit #2 (`5c2b75d2f`) bumps the toolchain
+  to 1.96.1 + one-line E0446 fix. Probe dep reverted; it lands with the engine in phase 2.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan

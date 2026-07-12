@@ -311,6 +311,19 @@ relfilenode rewrites) inside the pageserver's restart/failure model.
   (P0-2 → lib) and pre-images via native timeline reads (`Timeline::get` at
   `record-start LSN`), replacing the pagestream client; then step (d) = Linux image build +
   compose gauntlet with `[transcode] enabled = true`.
+- **Embedding-viability probe (same day) — in-process embedding is viable as a plain cargo
+  dependency.** With open-ltap as a path dep of the fork's pageserver crate: cargo
+  resolution succeeds with *zero* version conflicts (233 packages added; neon's `parquet 53`
+  coexists with deltalake's arrow/parquet — separate majors, no `links` collisions), and the
+  full tree compiles. The one obstacle was MSRV: neon pins rustc 1.88.0 but deltalake 0.32
+  needs ≥1.91.1 and aws-types ≥1.94.1 → **fork commit #2 (`5c2b75d2f`) bumps
+  `rust-toolchain.toml` to 1.96.1** (covers step (d) too: build-tools' rustup respects
+  `rust-toolchain.toml`, though `build-tools/Dockerfile`'s `RUSTC_VERSION=1.88.0` env is
+  worth aligning when we get there) **and fixes the single thing newer rustc rejects in
+  existing neon code** (`SchedulingResult` pub(super) returned by a pub(crate) trait, E0446 —
+  fix is 1.88-compatible). Verified under pinned 1.96.1: `cargo check -p pageserver` clean +
+  tee unit tests pass. The probe's Cargo.toml/lock changes were reverted — the dep lands
+  with the engine in phase 2.
 
 ### V2b — page-driven transcode at image-layer creation
 
