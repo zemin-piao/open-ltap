@@ -536,9 +536,7 @@ impl Engine {
             rmgr::SMGR => {
                 if record.info & 0xF0 == heap::XLOG_SMGR_CREATE {
                     if let Ok(Some((db, _rel))) = heap::parse_smgr_create(&record.main_data) {
-                        if db == self.db_oid && record.xid != 0 {
-                            self.smgr_suspects.insert(record.xid);
-                        }
+                        self.handle_smgr_create(record.xid, db);
                     }
                 }
             }
@@ -703,81 +701,97 @@ impl Engine {
                     _ => Vec::new(),
                 };
                 match op {
-                    heap::XLOG_XACT_COMMIT => {
-                        self.last_commit_lsn = lsn;
-                        if self.smgr_suspects.remove(&record.xid)
-                            || subxids.iter().any(|x| self.smgr_suspects.remove(x))
-                        {
-                            self.remap_at = Some(lsn);
-                        }
-                        let ops = self.txbuf.commit(record.xid, &subxids);
-                        self.toast.gc_xid(record.xid);
-                        for sub in &subxids {
-                            self.toast.gc_xid(*sub);
-                        }
-                        let mut emitted: HashMap<usize, usize> = HashMap::new();
-                        for pending_op in ops {
-                            let t = &mut self.tables[pending_op.table];
-                            if lsn <= t.dedupe_below {
-                                // Replayed commit: already in this table's
-                                // Delta log AND in the mirror rebuilt from it.
-                                continue;
-                            }
-                            let start = *emitted
-                                .entry(pending_op.table)
-                                .or_insert_with(|| t.pending.rows.len());
-                            let _ = start;
-                            match pending_op.op {
-                                txbuf::Op::Insert { ctid, ver } => {
-                                    t.pending.emit(lsn, false, ctid, ver.row.clone());
-                                    t.mirror.insert(ctid, ver);
-                                }
-                                txbuf::Op::Update { old_ctid, ctid, ver } => {
-                                    t.mirror.remove(&old_ctid);
-                                    t.pending.emit(lsn, false, ctid, ver.row.clone());
-                                    t.mirror.insert(ctid, ver);
-                                }
-                                txbuf::Op::Delete { ctid, old_row } => {
-                                    let row = old_row
-                                        .or_else(|| t.mirror.get(&ctid).map(|v| v.row.clone()))
-                                        .unwrap_or_else(|| vec![None; t.desc.cols.len()]);
-                                    t.mirror.remove(&ctid);
-                                    t.pending.emit(lsn, true, ctid, row);
-                                }
-                            }
-                        }
-                        // Publish this commit's rows to the freshness tail.
-                        for (ti, start) in emitted {
-                            let t = &self.tables[ti];
-                            if t.pending.rows.len() > start {
-                                if let Ok(batch) = t.sink.make_batch(&t.pending.rows[start..]) {
-                                    let mut tail = self.tail.write().unwrap();
-                                    tail.push(&t.desc.name, batch);
-                                    tail.enforce_cap(&t.desc.name, self.tail_max_rows);
-                                }
-                            }
-                        }
-                    }
-                    heap::XLOG_XACT_ABORT => {
-                        self.smgr_suspects.remove(&record.xid);
-                        for sub in &subxids {
-                            self.smgr_suspects.remove(sub);
-                        }
-                        self.toast.gc_xid(record.xid);
-                        for sub in &subxids {
-                            self.toast.gc_xid(*sub);
-                        }
-                        let dropped = self.txbuf.abort(record.xid, &subxids);
-                        if dropped > 0 {
-                            tracing::info!(xid = record.xid, ops = dropped, "aborted transaction discarded");
-                        }
-                    }
+                    heap::XLOG_XACT_COMMIT => self.handle_commit(lsn, record.xid, &subxids),
+                    heap::XLOG_XACT_ABORT => self.handle_abort(lsn, record.xid, &subxids),
                     _ => {}
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// A transaction committed at `lsn`. Public seam for record sources that
+    /// deliver commits pre-decoded (the interpreted safekeeper->pageserver
+    /// protocol) rather than as raw XACT records; the raw path above delegates
+    /// here. `subxids` = the commit record's subxact list.
+    pub fn handle_commit(&mut self, lsn: u64, xid: u32, subxids: &[u32]) {
+        self.last_commit_lsn = lsn;
+        if self.smgr_suspects.remove(&xid) || subxids.iter().any(|x| self.smgr_suspects.remove(x)) {
+            self.remap_at = Some(lsn);
+        }
+        let ops = self.txbuf.commit(xid, subxids);
+        self.toast.gc_xid(xid);
+        for sub in subxids {
+            self.toast.gc_xid(*sub);
+        }
+        let mut emitted: HashMap<usize, usize> = HashMap::new();
+        for pending_op in ops {
+            let t = &mut self.tables[pending_op.table];
+            if lsn <= t.dedupe_below {
+                // Replayed commit: already in this table's
+                // Delta log AND in the mirror rebuilt from it.
+                continue;
+            }
+            let start = *emitted
+                .entry(pending_op.table)
+                .or_insert_with(|| t.pending.rows.len());
+            let _ = start;
+            match pending_op.op {
+                txbuf::Op::Insert { ctid, ver } => {
+                    t.pending.emit(lsn, false, ctid, ver.row.clone());
+                    t.mirror.insert(ctid, ver);
+                }
+                txbuf::Op::Update { old_ctid, ctid, ver } => {
+                    t.mirror.remove(&old_ctid);
+                    t.pending.emit(lsn, false, ctid, ver.row.clone());
+                    t.mirror.insert(ctid, ver);
+                }
+                txbuf::Op::Delete { ctid, old_row } => {
+                    let row = old_row
+                        .or_else(|| t.mirror.get(&ctid).map(|v| v.row.clone()))
+                        .unwrap_or_else(|| vec![None; t.desc.cols.len()]);
+                    t.mirror.remove(&ctid);
+                    t.pending.emit(lsn, true, ctid, row);
+                }
+            }
+        }
+        // Publish this commit's rows to the freshness tail.
+        for (ti, start) in emitted {
+            let t = &self.tables[ti];
+            if t.pending.rows.len() > start {
+                if let Ok(batch) = t.sink.make_batch(&t.pending.rows[start..]) {
+                    let mut tail = self.tail.write().unwrap();
+                    tail.push(&t.desc.name, batch);
+                    tail.enforce_cap(&t.desc.name, self.tail_max_rows);
+                }
+            }
+        }
+    }
+
+    /// A transaction aborted. Public seam, same reasoning as [`Self::handle_commit`].
+    pub fn handle_abort(&mut self, _lsn: u64, xid: u32, subxids: &[u32]) {
+        self.smgr_suspects.remove(&xid);
+        for sub in subxids {
+            self.smgr_suspects.remove(sub);
+        }
+        self.toast.gc_xid(xid);
+        for sub in subxids {
+            self.toast.gc_xid(*sub);
+        }
+        let dropped = self.txbuf.abort(xid, subxids);
+        if dropped > 0 {
+            tracing::info!(xid, ops = dropped, "aborted transaction discarded");
+        }
+    }
+
+    /// `xid` created a relation main fork in database `db` (XLOG_SMGR_CREATE):
+    /// mark it suspect so its commit triggers a catalog re-check (M3b remap
+    /// flow). Public seam for sources that deliver smgr records pre-decoded.
+    pub fn handle_smgr_create(&mut self, xid: u32, db: u32) {
+        if db == self.db_oid && xid != 0 {
+            self.smgr_suspects.insert(xid);
+        }
     }
 
     /// Decode an UPDATE/HOT UPDATE: find the pre-image, reconstruct the new
