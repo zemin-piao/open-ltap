@@ -312,6 +312,15 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   pg_class row), table_names() for auto-discovery, preload_toast. Verified live: composite
   reversed PK ["b","a"] + byte-exact rows from a fresh forced image layer; old-layer t with
   dropped-col slot + pk=["id"] matches SQL. layerscan rewired onto the module.
+  **Unit E1 shipped & verified live (`779d0ca`)**: `src/embed.rs` — `embed::run(cfg, events)`
+  drives the engine off a `SourceEvent` channel (Raw / pre-decoded Commit/Abort/SmgrCreate /
+  Progress / Lost); startup shared with the binary via engine.rs helpers (main.rs = thin
+  wire loop); gap-at-stream-start policy (watermark < first LSN → re-snapshot) and Lost
+  policy (drop txbuf/toast + re-snapshot all) implemented. Live-verified via
+  `examples/embedded.rs` (real safekeeper stream, pre-decoded XACT/SMGR like the fork feed):
+  snapshots/multi-row txn/abort/savepoint/TOAST → md5==PG; kill + restart → mirrors rebuilt,
+  gap policy fired, post-restart DML → md5==PG. Remaining: E2 fork wiring (mind tee startup
+  buffering), D native reads, then step (d).
   **Embedding-viability probe passed**: open-ltap as a path dep of the fork's pageserver
   resolves with zero version conflicts and compiles; only obstacle was MSRV (deltalake 0.32
   needs ≥1.91.1 vs neon's pinned 1.88.0) → fork commit #2 (`5c2b75d2f`) bumps the toolchain

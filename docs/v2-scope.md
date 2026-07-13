@@ -373,6 +373,33 @@ relfilenode rewrites) inside the pageserver's restart/failure model.
   forced image layer; `t` derives from a months-old layer with its dropped-column slot,
   `pk=["id"]`, filenode matching live SQL; dropped `gnarly` correctly absent from
   post-drop layers. layerscan now drives the module (duplicated parsers deleted).
+- **Unit E1 shipped & verified live (open-ltap `779d0ca`) — the engine as an embedded
+  driver.** `src/embed.rs`: `run(cfg, events)` drives the engine off an in-process
+  `SourceEvent` stream (`Raw` / pre-decoded `Commit`/`Abort`/`SmgrCreate` / `Progress` /
+  `Lost`) — the in-pageserver deployment shape. Startup shared with the binary via new
+  `engine.rs` helpers (`open_tables`/`resume_tables`/`build_engine`, pure motion; `main.rs`
+  is now a thin wire loop). Two policies the embedded shape forces, both implemented:
+  **gap at stream start** (the source replays from the walreceiver's position, not our
+  watermark — tables with watermark < first event LSN re-snapshot via the idempotent remap
+  path; conservative: an idle gap re-snapshots needlessly, refine if the gauntlet says so)
+  and **`Lost`** (tee overflow: discard txbuf/toast, re-snapshot all tables — the price P4's
+  never-backpressure rule sets). `examples/embedded.rs` = live harness: streams from a real
+  safekeeper but feeds the driver through a channel, pre-decoding XACT/SMGR records exactly
+  like the fork's interpreted feed (diet is a superset only for records the engine ignores).
+  **Verified on neon-compose**: snapshots (composite-PK `pkt` + `t`), multi-row txn, abort,
+  savepoint rollback, TOAST insert + toast-kept update → current-state md5 == PG; kill,
+  restart (mirrors rebuilt refreshed=0 — oracle mode), gap policy re-snapshotted both
+  tables, post-restart update/delete/insert → md5 == PG again. Also fixed: `build_engine`
+  errors instead of panicking when zero tables attach. **Note for readers of the change
+  log**: current-state reads partition by PK (verify.sh), NOT by `_ltap_ctid` — a non-HOT
+  UPDATE moves the row to a new ctid and the old ctid's last version would incorrectly
+  survive a per-ctid QUALIFY.
+- **Remaining**: unit E2 = fork consumer wiring (open-ltap dep + `RecordEvent`→`SourceEvent`
+  + Config from pageserver env; note startup buffering — the tee starts at walreceiver
+  launch, the driver's discovery/snapshot takes seconds, channel capacity must absorb it or
+  the first Lost fires immediately); unit D = native `Timeline::get` PageSource + oracle
+  (removes the self-connect loopback and the SQL catalog); step (d) = Linux image build +
+  compose gauntlet.
 
 ### V2b — page-driven transcode at image-layer creation
 
