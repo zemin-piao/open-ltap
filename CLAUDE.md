@@ -369,6 +369,14 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   (block,offset) per row, does NOT transcode indexes; Neon delta layers store raw WAL
   records; CLOG/multixact + relmapper are in the pageserver keyspace (visibility + mapped-rel
   catalog decode need no SQL). LTAP Writer Library still unreleased as of 2026-07-10.
+  **North Star added 2026-07-13** (`docs/v2-scope.md` §"North Star" + §5 P10): columnar as the
+  *only* canonical materialization, physical-WAL-fsync replication as the storage-layer
+  ingest (not CDC) — articulates why V2a→V2c is worth the research risk, doesn't add a stage.
+  P10 grounds the gap honestly: today's mirror/txbuf/oracle/tail are all transcoder-internal
+  pre-image plumbing, not a general OLTP serving tier (no keyed memtable, no secondary
+  indexes, no in-place update, no point-grained tombstone check, replace-based compaction
+  that doesn't scale to per-row cadence) — genuinely serving OLTP point reads/writes directly
+  off columnar is **not started and not implied by finishing V2a/V2b/V2c as scoped**.
 
 ## Code map (src/)
 

@@ -1,8 +1,31 @@
 # v2 scoping — transcoding inside the pageserver
 
-*Status: scoping document, no code. Written 2026-07-10.*
+*Status: scoping document, no code. Written 2026-07-10. North Star (top of doc) + hot-tier
+gap register (§5 P10) added 2026-07-13.*
 *Grounded against `neondatabase/neon` @ `8f60b04` (main, 2026-05-25) and Databricks' public
 LTAP material (June 2026). File/line references below are to that Neon commit.*
+
+---
+
+## North Star
+
+The end state this whole track points at: **columnar (Parquet under Delta/Iceberg) becomes
+the only canonical on-disk materialization** for a Postgres-compatible database — not a
+downstream copy fed by CDC, but the store of record, with row-oriented pages surviving only as
+a rebuildable cache in front of it (V2c's framing, §4 below). Ingest is **physical replication
+off Postgres's own post-WAL-fsync boundary** — the same bytes any standby receives — decoded by
+open-ltap's own rmgr-level parser, not logical decoding / `pgoutput` / an output plugin. That
+distinction is deliberate and already load-bearing for the M0–M4 product (see CLAUDE.md
+"Settled decisions": "Physical WAL, not logical replication"); v2 doesn't change it, it moves
+the same physical-replication ingest *inside* the storage engine (V2a) and then downstream of
+image-layer materialization (V2b/V2c) instead of running it as an external process.
+
+**This is a vision statement, not a new stage.** Every gate and risk class below (P0 → V2a →
+V2b → V2c) still applies unchanged; the North Star is why the destination is worth the
+research risk in P5–P9. §5 P10 grounds the one part of this vision the staged plan doesn't yet
+scope at all: serving OLTP-latency point reads/writes directly and canonically off columnar,
+as opposed to V2c's narrower (and already-scoped) job of making cache-miss page
+*reconstruction* correct.
 
 ---
 
@@ -493,6 +516,62 @@ boundary (`TranscodeSink`) so patches stay mechanical; and pursue an upstream RF
 (`docs/rfcs/` is an active, numbered process — a "materialization tee" hook is arguably
 upstreamable since Databricks has legitimized the pattern). If the LTAP Writer Library ships
 with a usable license, re-evaluate everything above it.
+
+**P10 — The OLTP hot tier: point reads/writes directly over columnar.** *(Added 2026-07-13,
+grounded by reading the current codebase, not new design.)* The North Star (top of this
+document) is "columnar is the only canonical materialization," which implies something must
+serve OLTP point-read/write latency in front of it. Auditing what exists today against that
+bar:
+
+- *What's actually built* — none of it is a general-purpose serving tier; all of it is
+  pre-image plumbing for the transcoder's own correctness. `txbuf::TxBuffer`'s per-xid overlay
+  (`src/txbuf.rs:52-85`) answers only "what did *this open transaction* just write." `Mirror`
+  (`src/engine.rs:188`, a plain `HashMap<Ctid, RowVersion>` per table) is a real hot,
+  synchronously-updated last-committed-row cache (updated in `handle_commit`,
+  `engine.rs:751-767`, before any Delta flush) — but it's keyed by physical ctid, not primary
+  key, it's never queried from outside `Engine::preimage()` (`engine.rs:381-385`), and a
+  non-HOT update leaves the old ctid's entry stale (flagged already in this doc's own step
+  (c) phase 2 notes, "current-state reads partition by PK... NOT `_ltap_ctid`"). The `Oracle`
+  GetPage@LSN client (`engine.rs:238-293`) is only ever called as a pre-image fallback
+  (`engine.rs:619-624`, `:834-844`), never as a general point-read path. `serve::TailStore`
+  (`src/serve.rs`) — the M4 freshness endpoint — serves the *entire* tail as one Parquet blob
+  per request (`serve.rs:198-232`); there is no per-key filtering anywhere in it. The only
+  *real* random-access serving infrastructure in the whole stack is Neon's own pageserver,
+  which open-ltap calls into but doesn't own or extend.
+- *Visibility/MVCC is not really implemented, only approximated.* The initial snapshot takes a
+  hard `LOCK TABLE ... IN EXCLUSIVE MODE` cutover (`snapshot.rs:39-44`) instead of an
+  xmin/xmax-based consistent read; ongoing "visibility" is just commit order
+  (`txbuf::commit`, `engine.rs:734`); current-state reads are a client-side
+  `QUALIFY latest-(lsn,seq) AND NOT _ltap_deleted` window function, not something open-ltap
+  serves. There is no "read as of a snapshot," only "read as of an LSN, via a full scan."
+- *What a real OLTP-over-columnar hot tier needs and doesn't have*: **(a)** a write-optimized
+  memtable/LSM ingest tier that's actually queryable by key at OLTP latency —
+  `PendingBatch` (`engine.rs:162-181`) is an unkeyed flush buffer, not that; today the write
+  path is still entirely owned by Postgres's heap / Neon's ephemeral WAL layer, not by
+  anything columnar. **(b)** secondary indexes — none exist anywhere in this codebase;
+  `pg_index` (`src/catalog.rs:186-269`) is read only to name PK columns for compaction's
+  dedupe key. This matches Databricks' own stated design (indexes aren't transcoded, served
+  from a separate hot cache, per §1 fact 4 above) — but open-ltap has no such cache tier
+  either. **(c)** an in-place update story — every write here is copy-on-write/append-only by
+  construction (`sink.rs` never mutates a stored row); a hot tier needs its own
+  in-place-mutable structure in front of the immutable columnar log. **(d)** a point-grained
+  delete/tombstone check — `_ltap_deleted` tombstones are correctly excluded by `QUALIFY` and
+  by compaction (`sink.rs:602-613`), but only via a scan; there's no "is key K deleted"
+  index. **(e)** compaction that doesn't assume batch cadence — `DeltaSink::compact`
+  (`sink.rs:535-712`) reads every active file fully into memory and rewrites the whole
+  survivor set in one commit; workable at `LTAP_COMPACT_ROWS`-scale batching (M4's design
+  point), but the write amplification would be untenable at OLTP per-row/per-txn cadence (the
+  DV-based alternative flagged elsewhere in CLAUDE.md as unbuilt future work exists for
+  exactly this reason).
+- *Where this sits relative to the staged plan*: **not scoped by V2a/V2b, and only partially
+  by V2c.** V2c's "row pages demote to cache" + the P5 reverse path already assume *Neon's
+  own* pageserver page cache continues doing OLTP serving — V2c's job is making page
+  *reconstruction* from Parquet+tail correct on a cache miss, not building a standalone
+  memtable/index/in-place-update engine. A genuine "OLTP directly and canonically over
+  columnar, no row-cache tier at all" engine is a materially larger, separate research
+  problem than anything currently staged — it is **not started, high research risk, and not
+  implied by completing V2a/V2b/V2c as currently scoped.** *Risk: research, larger than P5;
+  no prototype exists; flagging honestly rather than inventing a stage for it.*
 
 ---
 

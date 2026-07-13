@@ -519,6 +519,7 @@
       <ul>
         <li><strong>Pageserver fork</strong> — a rebase treadmill against fast-moving Neon internals, forever</li>
         <li><strong>The reverse path</strong> — rebuilding byte-addressed pages (indexes point at exact block/offset) is the research-grade problem; nobody outside Databricks has shipped it</li>
+        <li><strong>No general OLTP hot tier</strong> — this diagram's page cache reconstructs pages on a miss, which is not the same as a keyed memtable, secondary indexes, in-place updates, or low-write-amp compaction; nothing here builds that, it's still Neon's own page cache doing the job</li>
         <li><strong>Cold OLTP reads pay for it</strong> — a cache miss costs Parquet→page reconstruction (R④); needs an aggressive cache hierarchy to hide</li>
         <li><strong>Shared failure domain</strong> — a transcoder bug now sits in the OLTP read path, not beside it</li>
         <li><strong>Branching, PITR, GC all rework</strong> — Neon's copy-on-write branches must map onto Delta snapshots</li>
