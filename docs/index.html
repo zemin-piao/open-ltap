@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>open-ltap — data flow: M0 → M5 → v2</title>
+<title>open-ltap — data flow: M0–M4 → M5 → v2</title>
 <style>
   :root {
     --bg: #14181D;
@@ -111,16 +111,18 @@
 <section>
   <p class="stage-eyebrow" style="color:var(--teal)">The product · M0–M4 shipped</p>
   <h2>Any Postgres → Delta on your S3, one binary</h2>
-  <p>This architecture is the whole product — M1–M4 deepened it (resume, updates/deletes, DDL
-  tracking, the freshness read path) without changing its shape, and it works against RDS,
-  self-hosted, Supabase, or Neon compute. Writes commit exactly as before —
-  <strong>Postgres acks after its local WAL fsync</strong> (W①), and the walsender streams the same
-  WAL bytes to open-ltap in parallel (W②). OLTP reads (R①) never change: shared buffers, then
-  local heap. Analytical reads (R②) never touch Postgres — they scan Delta, seeing data as of the
-  last transcoded commit; the M4 tail merge (R③) upgrades that to read-your-writes.</p>
+  <p>The diagram below is the complete shipped pipeline — full DML (INSERT/UPDATE/DELETE via an
+  append-only tombstone log), TOAST, <code>COPY</code>, initial snapshot, schema evolution, and
+  inline compaction all live, on top of the M4 freshness read path — against RDS, self-hosted,
+  Supabase, or Neon compute. It started as an INSERT-only slice at M0 (2026-07-02); M1–M4
+  (through 2026-07-06) deepened it into this without changing its shape. Writes commit exactly
+  as before — <strong>Postgres acks after its local WAL fsync</strong> (W①), and the walsender
+  streams the same WAL bytes to open-ltap in parallel (W②). OLTP reads (R①) never change: shared
+  buffers, then local heap. Analytical reads (R②) scan Delta as of the last transcoded commit;
+  the M4 tail merge (R③) upgrades that to read-your-writes.</p>
 
   <div class="diagram">
-  <svg viewBox="0 0 1000 440" role="img" aria-label="M0: application writes and OLTP reads go to Postgres; WAL streams to open-ltap which appends committed transactions to Delta on MinIO; analytics scan Delta only">
+  <svg viewBox="0 0 1000 440" role="img" aria-label="The complete M0-M4 pipeline: application writes and OLTP reads go to Postgres; WAL streams to open-ltap which decodes full DML, TOAST, and DDL, then commits to Delta on MinIO with inline compaction; analytics scan Delta and merge the fresh tail">
     <defs>
       <marker id="ah-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
         <path d="M0,0 L10,5 L0,10 z" fill="#E2A65B"/>
@@ -169,14 +171,16 @@
     <line x1="444" y1="118" x2="516" y2="118" stroke="#E2A65B" stroke-width="1.5" marker-end="url(#ah-a)"/>
 
     <!-- open-ltap -->
-    <rect x="520" y="52" width="210" height="140" rx="8" fill="#1F2731" stroke="#E2A65B"/>
+    <rect x="520" y="52" width="210" height="166" rx="8" fill="#1F2731" stroke="#E2A65B"/>
     <text x="625" y="78" text-anchor="middle" font-size="14" font-weight="600" fill="#E2A65B">open-ltap</text>
     <text x="625" y="95" text-anchor="middle" font-size="10" fill="#8A939F">the transcoder · Rust</text>
     <rect x="540" y="106" width="170" height="22" rx="4" fill="#232B34"/>
     <text x="625" y="121" text-anchor="middle" font-size="9.5" fill="#E6E1D7">pgwire → walreader → decode</text>
     <rect x="540" y="134" width="170" height="22" rx="4" fill="#232B34"/>
     <text x="625" y="149" text-anchor="middle" font-size="9.5" fill="#E6E1D7">txbuf — commit/abort gate</text>
-    <text x="625" y="178" text-anchor="middle" font-size="9.5" fill="#8A939F">aborted txns never leave here</text>
+    <rect x="540" y="162" width="170" height="22" rx="4" fill="#232B34"/>
+    <text x="625" y="177" text-anchor="middle" font-size="9.5" fill="#E6E1D7">UPDATE/DELETE · TOAST · DDL</text>
+    <text x="625" y="204" text-anchor="middle" font-size="9.5" fill="#8A939F">aborted txns never leave here</text>
 
     <!-- W3 -->
     <text x="765" y="92" text-anchor="middle" font-size="9.5" fill="#E2A65B">W③</text>
@@ -184,15 +188,16 @@
     <line x1="734" y1="118" x2="796" y2="118" stroke="#E2A65B" stroke-width="1.5" marker-end="url(#ah-a)"/>
 
     <!-- Delta -->
-    <rect x="800" y="52" width="176" height="110" rx="8" fill="#1F2731" stroke="#3A5F56"/>
+    <rect x="800" y="52" width="176" height="130" rx="8" fill="#1F2731" stroke="#3A5F56"/>
     <text x="888" y="80" text-anchor="middle" font-size="13.5" font-weight="600" fill="#52B9A5">Delta table</text>
     <text x="888" y="97" text-anchor="middle" font-size="10" fill="#8A939F">s3://lake/t · MinIO</text>
     <rect x="820" y="110" width="136" height="20" rx="10" fill="#14181D" stroke="#2A333D"/>
     <text x="888" y="124" text-anchor="middle" font-size="9.5" fill="#8A939F">parquet + _ltap_lsn</text>
     <text x="888" y="150" text-anchor="middle" font-size="9.5" fill="#52B9A5">columnar = copy ②</text>
+    <text x="888" y="168" text-anchor="middle" font-size="9.5" fill="#8A939F">snapshotted · compacted</text>
 
     <!-- R2 analytics -->
-    <line x1="888" y1="296" x2="888" y2="166" stroke="#52B9A5" stroke-width="1.5" marker-end="url(#ah-t)"/>
+    <line x1="888" y1="296" x2="888" y2="186" stroke="#52B9A5" stroke-width="1.5" marker-end="url(#ah-t)"/>
     <text x="878" y="224" text-anchor="end" font-size="9.5" fill="#52B9A5">R② delta_scan</text>
     <text x="878" y="238" text-anchor="end" font-size="9.5" fill="#8A939F">fresh to last transcode (~s)</text>
     <rect x="800" y="300" width="176" height="84" rx="8" fill="#1F2731" stroke="#2A333D"/>
@@ -200,7 +205,7 @@
     <text x="888" y="352" text-anchor="middle" font-size="10" fill="#8A939F">DuckDB · Spark</text>
 
     <!-- R3 tail merge -->
-    <path d="M 796 340 L 640 340 L 640 196" fill="none" stroke="#52B9A5" stroke-width="1.5"
+    <path d="M 796 340 L 640 340 L 640 222" fill="none" stroke="#52B9A5" stroke-width="1.5"
           marker-end="url(#ah-t)"/>
     <text x="718" y="358" text-anchor="middle" font-size="9.5" fill="#52B9A5">R③ fresh-tail merge (M4)</text>
   </svg>
@@ -211,20 +216,21 @@
       <h3>You get</h3>
       <ul>
         <li><strong>Any Postgres</strong> — RDS, Supabase, Neon, a laptop; no fork, no extension to install</li>
-        <li><strong>Transactional correctness</strong> — commit/abort gate; rolled-back rows never reach the lake</li>
-        <li><strong>Analytics fully offloaded</strong> — R② never touches Postgres; scans hit object storage</li>
-        <li><strong>LSN lineage</strong> — every row stamped with its commit LSN, the hook everything later builds on</li>
+        <li><strong>Full DML, byte-exact</strong> — INSERT/UPDATE/DELETE (append-only tombstone log), <code>COPY</code>, TOAST, the whole type matrix</li>
+        <li><strong>Schema tracks itself</strong> — ADD/DROP COLUMN, TRUNCATE/CLUSTER/rewrites, table create/drop/rename, all detected from the WAL</li>
+        <li><strong>Read-your-writes</strong> — the M4 tail merge (R③) folds in-flight commits into every analytical read; <code>?min_lsn</code> long-polling for hard RYW</li>
+        <li><strong>Bounded forever</strong> — inline compaction + vacuum keep the change log, restart time, and storage from growing without limit</li>
+        <li><strong>Transactional correctness &amp; LSN lineage</strong> — commit/abort gate; every row stamped with its commit LSN</li>
       </ul>
     </div>
     <div class="pc con">
-      <h3>Missing / costs — each gap is a milestone</h3>
+      <h3>Costs — inherent to this shape</h3>
       <ul>
-        <li><strong>INSERT-only today</strong> — UPDATE/DELETE via an append-only tombstone log, TOAST, <code>COPY</code> → M1/M2</li>
-        <li><strong>No resume yet</strong> — restart loses stream position; no CRC checks → M1 (LSN in Delta commit metadata = exactly-once)</li>
-        <li><strong>Small files</strong> — one Delta commit per Postgres commit; batching + compaction → M1</li>
-        <li><strong>Schema frozen at startup</strong> — DDL mid-stream breaks decoding; multi-table → M3</li>
-        <li><strong>Freshness = transcode lag</strong> — read-your-writes tail merge → M4, the headline feature</li>
-        <li><strong>Inherent to this shape</strong> — costs Postgres one walsender (+ WAL retention if the transcoder stalls); two copies of table data</li>
+        <li><strong>Two copies of table data</strong> — heap + Parquet; a single writer per Delta table</li>
+        <li><strong>Costs Postgres one walsender</strong> — plus WAL retention if the transcoder stalls</li>
+        <li><strong>Pre-image mirror lives in memory</strong> — one entry per live row; very large tables need RAM to match (the M5 oracle already answers misses there; full mirror-less operation is v2a territory)</li>
+        <li><strong>Column type changes detach the table</strong> — Delta can't retype a column in place</li>
+        <li><strong>lz4/zstd unsupported</strong> — <code>wal_compression</code>/<code>default_toast_compression</code> must stay off/pglz</li>
       </ul>
     </div>
   </div>
@@ -546,6 +552,6 @@
 </section>
 
 <footer>
-  open-ltap · <a href="https://github.com/zemin-piao/open-ltap">github.com/zemin-piao/open-ltap</a> · M0 verified 2026-07-02
+  open-ltap · <a href="https://github.com/zemin-piao/open-ltap">github.com/zemin-piao/open-ltap</a> · M0–M4 complete, M4 shipped 2026-07-06
 </footer>
 </div>
