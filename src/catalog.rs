@@ -11,9 +11,12 @@
 //! pagestream API serves only rel blocks) obtain the two mapped filenodes out
 //! of band.
 //!
-//! Visibility: catalog tuples with `xmax == 0` are kept. That is the P0-2
-//! spike heuristic — sufficient for a settled catalog; the exact answer
-//! (CLOG at the read LSN) is v2-scope P2 and pairs with V2b.
+//! Visibility: real CLOG-resolved xmin/xmax visibility, via [`crate::clog`]
+//! (v2-scope P2) — [`Catalog::load`] takes a [`crate::clog::ClogSource`] and
+//! resolves every catalog tuple version through it. This replaced the P0-2
+//! spike heuristic (`xmax == 0`); see `crate::clog`'s module doc for what
+//! "visibility" means here and its one honest gap (current-state CLOG reads,
+//! not yet pinned to an arbitrary past LSN).
 //!
 //! All FormData offsets are PG17 (fetched from `REL_17_STABLE` headers, and
 //! byte-identical in PG18 for the fields used here — see the layout notes on
@@ -23,6 +26,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 
+use crate::clog::{ClogSource, tuple_visible};
 use crate::schema::{Col, PgType, PhysCol, TableDesc};
 use crate::wal::heap::{ToastCache, decode_toast_chunk_from_page};
 
@@ -98,9 +102,12 @@ impl MappedRels {
     }
 }
 
-/// Every LP_NORMAL tuple on a heap page as (xmax, attribute bytes from t_hoff
-/// on). The attribute bytes of a catalog tuple are its FormData C struct.
-pub fn page_tuples(page: &[u8]) -> Vec<(u32, Vec<u8>)> {
+/// Every LP_NORMAL tuple on a heap page as (xmin, xmax, t_infomask,
+/// attribute bytes from t_hoff on). The attribute bytes of a catalog tuple
+/// are its FormData C struct. `xmin`/`xmax`/`infomask` are exactly what
+/// [`crate::clog::tuple_visible`] needs to decide whether this row version
+/// is live.
+pub fn page_tuples(page: &[u8]) -> Vec<(u32, u32, u16, Vec<u8>)> {
     let mut out = Vec::new();
     if page.len() != PAGE_SZ {
         return out;
@@ -113,10 +120,12 @@ pub fn page_tuples(page: &[u8]) -> Vec<(u32, Vec<u8>)> {
             continue; // not LP_NORMAL
         }
         let tup = &page[off..off + len];
+        let xmin = u32::from_le_bytes(tup[0..4].try_into().unwrap());
         let xmax = u32::from_le_bytes(tup[4..8].try_into().unwrap());
+        let infomask = u16::from_le_bytes(tup[20..22].try_into().unwrap());
         let t_hoff = tup[22] as usize;
         if t_hoff <= len {
-            out.push((xmax, tup[t_hoff..].to_vec()));
+            out.push((xmin, xmax, infomask, tup[t_hoff..].to_vec()));
         }
     }
     out
@@ -219,18 +228,24 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// Scan pg_class, pg_attribute and pg_index pages from `src`.
-    pub async fn load<S: PageSource>(src: &mut S, mapped: &MappedRels) -> Result<Catalog> {
+    /// Scan pg_class, pg_attribute and pg_index pages from `src`, keeping
+    /// only tuple versions `clog` resolves as visible (real CLOG visibility,
+    /// v2-scope P2 — see the module doc).
+    pub async fn load<S: PageSource, C: ClogSource>(
+        src: &mut S,
+        clog: &mut C,
+        mapped: &MappedRels,
+    ) -> Result<Catalog> {
         let db = src.db();
-        let class_rows: Vec<ClassRow> = scan(src, mapped.pg_class).await?
+        let class_rows: Vec<ClassRow> = scan(src, clog, mapped.pg_class)
+            .await?
             .iter()
-            .filter(|(xmax, _)| *xmax == 0)
-            .filter_map(|(_, a)| parse_pg_class(a))
+            .filter_map(|a| parse_pg_class(a))
             .collect();
-        let att_rows: Vec<AttRow> = scan(src, mapped.pg_attribute).await?
+        let att_rows: Vec<AttRow> = scan(src, clog, mapped.pg_attribute)
+            .await?
             .iter()
-            .filter(|(xmax, _)| *xmax == 0)
-            .filter_map(|(_, a)| parse_pg_attribute(a))
+            .filter_map(|a| parse_pg_attribute(a))
             .collect();
 
         // pg_index is not mapped: its filenode comes from its own pg_class row
@@ -243,10 +258,10 @@ impl Catalog {
                 .filter(|&n| n != 0)
         });
         let index_rows = match index_node {
-            Some(node) => scan(src, node).await?
+            Some(node) => scan(src, clog, node)
+                .await?
                 .iter()
-                .filter(|(xmax, _)| *xmax == 0)
-                .filter_map(|(_, a)| parse_pg_index(a))
+                .filter_map(|a| parse_pg_index(a))
                 .collect(),
             None => {
                 tracing::warn!("pg_index filenode unresolved; primary keys unavailable");
@@ -289,7 +304,7 @@ impl Catalog {
             .filter(|a| a.attrelid == cls.oid && a.attnum >= 1)
             .collect();
         atts.sort_by_key(|a| a.attnum);
-        atts.dedup_by_key(|a| a.attnum); // paranoia; xmax==0 should be unique
+        atts.dedup_by_key(|a| a.attnum); // paranoia; the visible version per attnum should be unique
         if atts.len() != cls.natts as usize {
             bail!(
                 "pg_attribute yielded {} atts for '{table}', pg_class.relnatts says {}",
@@ -347,10 +362,19 @@ impl Catalog {
     }
 }
 
-async fn scan<S: PageSource>(src: &mut S, filenode: u32) -> Result<Vec<(u32, Vec<u8>)>> {
+async fn scan<S: PageSource, C: ClogSource>(src: &mut S, clog: &mut C, filenode: u32) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     for page in src.rel_pages(filenode).await? {
-        out.extend(page_tuples(&page));
+        for (xmin, xmax, infomask, attrs) in page_tuples(&page) {
+            match tuple_visible(clog, xmin, xmax, infomask).await {
+                Ok(true) => out.push(attrs),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    "visibility check failed for xmin={xmin} xmax={xmax} infomask={infomask:#x}: \
+                     {e:#}; treating as not visible"
+                ),
+            }
+        }
     }
     Ok(out)
 }

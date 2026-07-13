@@ -4,6 +4,7 @@
 //! WAL machinery and layer-file readers directly.
 
 pub mod catalog;
+pub mod clog;
 pub mod embed;
 pub mod engine;
 pub mod pgwire;

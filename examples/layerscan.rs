@@ -3,7 +3,7 @@
 //! and decode heap pages from them with the existing decoder.
 //!
 //!   cargo run --example layerscan -- <layer-file> [rel=<relnode>] [cols=<ty,ty,..>]
-//!   cargo run --example layerscan -- <image-layer> table=<relname> db=<dboid>
+//!   cargo run --example layerscan -- <image-layer> table=<relname> db=<dboid> pgxact=<pg_xact dir>
 //!
 //! The `table=` mode is the P0-2 catalog-from-pages spike: it resolves the
 //! relmapper blob (key spc/db/0/0/0 — pg_class and pg_attribute are mapped
@@ -11,9 +11,14 @@
 //! the PG17 FormData layouts, derives the table's TableDesc (columns, types,
 //! dropped slots, toast filenode, fast defaults), and then decodes the
 //! table's own pages with it — schema and data from the same layer file,
-//! zero SQL. Version-picking is a spike heuristic: it keeps catalog tuples
-//! with xmax == 0 (a live row's xmax is only nonzero mid-DDL); the real
-//! answer is CLOG-at-LSN visibility (v2-scope P2).
+//! zero SQL. Version-picking is real CLOG visibility (v2-scope P2, see
+//! `open_ltap::clog`): `pgxact=` points at a live `pg_xact/` directory
+//! (openltap-pg's or a Neon compute's) that `FileClogSource` reads current
+//! commit/abort/in-progress status from — a *current-state* read, not one
+//! pinned to the layer's own LSN (the true CLOG-at-LSN source needs
+//! fork-side plumbing that doesn't exist yet; see `open_ltap::clog`'s module
+//! doc). `table=` without `pgxact=` is refused rather than silently falling
+//! back to the old xmax==0 heuristic.
 //!
 //! Layer files live in the pageserver's data dir (host-mounted by
 //! neon-compose: neon-compose/pageserver_config/tenants/<t>/timelines/<tl>/)
@@ -37,6 +42,7 @@
 
 use anyhow::{Context, Result, bail};
 use open_ltap::catalog::{Catalog, MappedRels, PageSource, parse_relmap, preload_toast};
+use open_ltap::clog::FileClogSource;
 use open_ltap::schema::{Col, PgType, PhysCol, TableDesc};
 use open_ltap::wal::heap::{ToastCache, decode_tuple_from_page};
 use std::collections::BTreeMap;
@@ -294,7 +300,7 @@ fn fmt_lsn(l: u64) -> String {
 async fn main() -> Result<()> {
     let mut path = None;
     let (mut rel_filter, mut cols_spec) = (None::<u32>, None::<String>);
-    let (mut table, mut db) = (None::<String>, None::<u32>);
+    let (mut table, mut db, mut pgxact) = (None::<String>, None::<u32>, None::<String>);
     for arg in std::env::args().skip(1) {
         if let Some(v) = arg.strip_prefix("rel=") {
             rel_filter = Some(v.parse()?);
@@ -304,12 +310,16 @@ async fn main() -> Result<()> {
             table = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("db=") {
             db = Some(v.parse()?);
+        } else if let Some(v) = arg.strip_prefix("pgxact=") {
+            pgxact = Some(v.to_string());
         } else {
             path = Some(arg);
         }
     }
-    let path = path
-        .context("usage: layerscan <layer-file> [rel=<relnode>] [cols=<ty,..>] [table=<name> db=<dboid>]")?;
+    let path = path.context(
+        "usage: layerscan <layer-file> [rel=<relnode>] [cols=<ty,..>] \
+         [table=<name> db=<dboid> pgxact=<pg_xact dir>]",
+    )?;
     let file = std::fs::read(&path)?;
     let s = parse_summary(&file)?;
     let kind = if s.magic == IMAGE_FILE_MAGIC { "image" } else { "delta" };
@@ -337,6 +347,10 @@ async fn main() -> Result<()> {
         // P0-2 mode: derive the schema from catalog pages, then use it.
         if let Some(table) = &table {
             let db = db.context("table= needs db=<dboid>")?;
+            let pgxact = pgxact.context(
+                "table= needs pgxact=<pg_xact dir> for real CLOG visibility \
+                 (v2-scope P2) — no silent fallback to the old xmax==0 heuristic",
+            )?;
             let relmap = parse_relmap(&layer_relmap(&file, &entries, db)?)?;
             let mapped = MappedRels::from_relmap(&relmap)?;
             println!(
@@ -346,7 +360,8 @@ async fn main() -> Result<()> {
                 mapped.pg_attribute
             );
             let mut src = LayerSource { file: &file, entries: &entries, db };
-            let cat = Catalog::load(&mut src, &mapped).await?;
+            let mut clog = FileClogSource::new(pgxact);
+            let cat = Catalog::load(&mut src, &mut clog, &mapped).await?;
             let desc = cat.desc(table)?;
             // The toast relation's chunk tuples are pages in this same layer:
             // preload the cache so out-of-line values decode too.
