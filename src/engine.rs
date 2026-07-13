@@ -76,8 +76,19 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 impl Config {
+    /// Env + process args (args name the tables) — the binary's constructor.
     pub fn from_env() -> Self {
-        let mut tables: Vec<String> = std::env::args().skip(1).collect();
+        let tables: Vec<String> = std::env::args().skip(1).collect();
+        Self::from_env_with_tables(tables)
+    }
+
+    /// Env only — for embedders whose process args are not ours (the
+    /// pageserver fork). Tables come from LTAP_TABLES or auto-discovery.
+    pub fn from_env_no_args() -> Self {
+        Self::from_env_with_tables(Vec::new())
+    }
+
+    fn from_env_with_tables(mut tables: Vec<String>) -> Self {
         if tables.is_empty() {
             if let Ok(list) = std::env::var("LTAP_TABLES") {
                 tables = list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
