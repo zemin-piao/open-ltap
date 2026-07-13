@@ -6,14 +6,13 @@
 //! pre-image mirror, snapshot, and LSN watermarks. Records are routed by
 //! relfilenode. See README for the milestone map.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use open_ltap::engine::{Config, Engine, Mirror, Oracle, PendingBatch, Table, WalSource, remap_table};
-use open_ltap::wal::{self, heap};
-use open_ltap::{pgwire, schema, serve, sink, snapshot, txbuf};
+use open_ltap::engine::{self, Config, WalSource};
+use open_ltap::wal;
+use open_ltap::{pgwire, schema, serve};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,27 +32,7 @@ async fn main() -> Result<()> {
     );
 
     // 2. Open (or create) the Delta tables and read back where we left off.
-    let mut tables = Vec::with_capacity(descs.len());
-    for desc in descs {
-        let uri = format!("{}/{}", cfg.lake.trim_end_matches('/'), desc.name);
-        let sink = match sink::DeltaSink::open_or_create(&uri, cfg.storage_options(), &desc).await {
-            Ok(s) => s,
-            Err(e) if cfg.tables.is_none() => {
-                tracing::warn!(table = %desc.name, "skipping table (Delta open failed): {e:#}");
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        tables.push(Table {
-            desc,
-            sink,
-            mirror: Mirror::new(),
-            dedupe_below: 0,
-            pending: PendingBatch::default(),
-            needs_resnapshot: false,
-            rows_since_compaction: 0,
-        });
-    }
+    let mut tables = engine::open_tables(&cfg, descs).await?;
 
     // 3. Attach to the WAL stream. Vanilla: a slot keeps WAL retained while
     //    we're down. Safekeeper: no slots — Delta watermarks are the resume
@@ -99,82 +78,8 @@ async fn main() -> Result<()> {
 
     // 4. Per table: resume from its watermark (rebuilding the pre-image
     //    mirror from its own change log) or take an initial snapshot.
-    let mut restart_candidates: Vec<u64> = Vec::new();
-    for t in &mut tables {
-        let resume = t.sink.resume_state().await?;
-        t.dedupe_below = resume.commit_lsn.unwrap_or(0);
-        match resume.restart_lsn {
-            Some(r) => {
-                t.mirror = t.sink.load_mirror(&t.desc).await?;
-                // With the GetPage oracle available, long-row pre-image bytes
-                // come lazily at update time — no pageinspect sweep needed.
-                let raw = if neon_tt.is_some() && cfg.ps_enabled {
-                    HashMap::new()
-                } else {
-                    snapshot::read_raw_attrs_conn(&cfg.sql_conninfo(), &t.desc).await?
-                };
-                let mut refreshed = 0usize;
-                for (ctid, ver) in t.mirror.iter_mut() {
-                    if ver.attrs.is_none() {
-                        if let Some(bytes) = raw.get(ctid) {
-                            ver.attrs = Some(bytes.clone());
-                            refreshed += 1;
-                        }
-                    }
-                }
-                tracing::info!(table = %t.desc.name, rows = t.mirror.len(), refreshed, "pre-image mirror rebuilt from Delta");
-                if t.sink.schema_added_columns() && t.desc.has_fast_defaults {
-                    // A column with a fast default was added while we were
-                    // down: WAL can't materialize it for old rows —
-                    // re-snapshot instead.
-                    tracing::warn!(table = %t.desc.name, "column with DEFAULT added while offline — re-snapshotting");
-                    let tomb_lsn = t.dedupe_below + 1;
-                    remap_table(t, tomb_lsn, 0, r, &cfg.sql_conninfo()).await?;
-                } else if let Some(stored) = resume.filenode {
-                    if stored != t.desc.rel_node {
-                        // TRUNCATE / rewrite happened while we were down (or
-                        // a remap was interrupted): tombstone the old state
-                        // and re-snapshot. Idempotent — the filenode
-                        // watermark only advances with the snapshot commit.
-                        tracing::warn!(
-                            table = %t.desc.name,
-                            stored_filenode = stored,
-                            live_filenode = t.desc.rel_node,
-                            "relfilenode changed while offline — re-snapshotting"
-                        );
-                        let tomb_lsn = t.dedupe_below + 1;
-                        remap_table(t, tomb_lsn, stored, r, &cfg.sql_conninfo()).await?;
-                    }
-                }
-                restart_candidates.push(r);
-            }
-            None if cfg.snapshot => {
-                let (cutover, rows, mut raw_attrs) = snapshot::take(&cfg.sql_conninfo(), &t.desc).await?;
-                tracing::info!(
-                    table = %t.desc.name,
-                    rows = rows.len(),
-                    cutover = %pgwire::fmt_lsn(cutover),
-                    "initial snapshot taken (table was write-locked until here)"
-                );
-                for (ctid, row) in &rows {
-                    let attrs = raw_attrs.remove(ctid).or_else(|| heap::encode_attrs(row, &t.desc));
-                    t.mirror.insert(*ctid, txbuf::RowVersion { row: row.clone(), attrs });
-                }
-                if !rows.is_empty() {
-                    let emits: Vec<sink::EmitRow> = rows
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, (ctid, row))| sink::EmitRow { lsn: cutover, seq: i as u64, deleted: false, ctid, row })
-                        .collect();
-                    let version = t.sink.append(&emits, cutover, cutover, t.desc.rel_node).await?;
-                    tracing::info!(table = %t.desc.name, delta_version = version, "initial snapshot committed to Delta");
-                }
-                t.dedupe_below = cutover;
-                restart_candidates.push(cutover);
-            }
-            None => {} // no watermark, snapshot disabled: attach at the tip
-        }
-    }
+    let restart_candidates =
+        engine::resume_tables(&cfg, &mut tables, neon_tt.is_some() && cfg.ps_enabled).await?;
     // Resume priority: earliest per-table need > pre-existing slot's
     // retained WAL (snapshot disabled) > "now".
     let resume_from = restart_candidates.iter().copied().min().or(slot_restart).unwrap_or(flush_lsn);
@@ -201,40 +106,8 @@ async fn main() -> Result<()> {
             }
         });
     }
-    let db_oid = tables[0].desc.db_oid;
-    let catalog_rels: HashSet<u32> =
-        schema::catalog_filenodes(&cfg.sql_conninfo()).await?.into_iter().collect();
-    let oracle = match (&neon_tt, cfg.ps_enabled) {
-        (Some((tenant, tl)), true) => Some(Oracle {
-            host: cfg.ps_host.clone(),
-            port: cfg.ps_port,
-            tenant: tenant.clone(),
-            timeline: tl.clone(),
-            token: cfg.ps_token.clone(),
-            conn: None,
-            disabled: false,
-        }),
-        _ => None,
-    };
-    let mut engine = Engine {
-        rel_to_table: tables.iter().enumerate().map(|(i, t)| (t.desc.rel_node, i)).collect(),
-        toast_rels: tables.iter().filter_map(|t| t.desc.toast_rel_node).collect(),
-        tables,
-        txbuf: txbuf::TxBuffer::default(),
-        toast: heap::ToastCache::default(),
-        last_commit_lsn: resume_from,
-        catalog_rels,
-        smgr_suspects: HashSet::new(),
-        remap_at: None,
-        attach_failed: HashSet::new(),
-        tail: tail.clone(),
-        tail_retain: cfg.tail_retain,
-        tail_max_rows: cfg.tail_max_rows,
-        compact_rows: cfg.compact_rows,
-        vacuum_after: cfg.vacuum_after,
-        db_oid,
-        oracle,
-    };
+    let mut engine =
+        engine::build_engine(&cfg, tables, tail.clone(), resume_from, neon_tt.clone()).await?;
 
     let mut reader = wal::WalReader::new(start_lsn);
     let mut last_recv_lsn = start_lsn;
