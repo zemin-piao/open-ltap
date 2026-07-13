@@ -109,9 +109,9 @@
 
 <!-- ============================================= M0 -->
 <section>
-  <p class="stage-eyebrow" style="color:var(--teal)">The product · M0 shipped, M1–M4 the roadmap</p>
+  <p class="stage-eyebrow" style="color:var(--teal)">The product · M0–M4 shipped</p>
   <h2>Any Postgres → Delta on your S3, one binary</h2>
-  <p>This architecture is the whole product — M1–M4 deepen it (resume, updates/deletes, DDL
+  <p>This architecture is the whole product — M1–M4 deepened it (resume, updates/deletes, DDL
   tracking, the freshness read path) without changing its shape, and it works against RDS,
   self-hosted, Supabase, or Neon compute. Writes commit exactly as before —
   <strong>Postgres acks after its local WAL fsync</strong> (W①), and the walsender streams the same
@@ -199,10 +199,10 @@
     <text x="888" y="334" text-anchor="middle" font-size="12.5" font-weight="600" fill="#E6E1D7">Analytics</text>
     <text x="888" y="352" text-anchor="middle" font-size="10" fill="#8A939F">DuckDB · Spark</text>
 
-    <!-- R3 planned tail merge -->
-    <path d="M 796 340 L 640 340 L 640 196" fill="none" stroke="#5A6570" stroke-width="1.5"
-          stroke-dasharray="5 5" marker-end="url(#ah-g)"/>
-    <text x="718" y="358" text-anchor="middle" font-size="9.5" fill="#5A6570">R③ fresh-tail merge — planned (M4)</text>
+    <!-- R3 tail merge -->
+    <path d="M 796 340 L 640 340 L 640 196" fill="none" stroke="#52B9A5" stroke-width="1.5"
+          marker-end="url(#ah-t)"/>
+    <text x="718" y="358" text-anchor="middle" font-size="9.5" fill="#52B9A5">R③ fresh-tail merge (M4)</text>
   </svg>
   </div>
 
@@ -219,7 +219,7 @@
     <div class="pc con">
       <h3>Missing / costs — each gap is a milestone</h3>
       <ul>
-        <li><strong>INSERT-only today</strong> — UPDATE/DELETE via deletion vectors, TOAST, <code>COPY</code> → M1/M2</li>
+        <li><strong>INSERT-only today</strong> — UPDATE/DELETE via an append-only tombstone log, TOAST, <code>COPY</code> → M1/M2</li>
         <li><strong>No resume yet</strong> — restart loses stream position; no CRC checks → M1 (LSN in Delta commit metadata = exactly-once)</li>
         <li><strong>Small files</strong> — one Delta commit per Postgres commit; batching + compaction → M1</li>
         <li><strong>Schema frozen at startup</strong> — DDL mid-stream breaks decoding; multi-table → M3</li>
@@ -240,9 +240,9 @@
   open-ltap consumes the safekeeper stream (W③) — downstream of compute, so transcoding costs
   Postgres nothing — and uses the pageserver as a <strong>random-access oracle</strong>: it can
   answer "what did page N of relation R look like at LSN X", which the sequential WAL tape can't —
-  that's how UPDATE/DELETE pre-images, out-of-line TOAST chunks, and consistent backfill scans get
-  resolved. Note the honest trade-off: table data exists <strong>twice on S3</strong> (layer files
-  + Parquet) until v2.</p>
+  that's what UPDATE/DELETE pre-images, out-of-line TOAST chunks, and consistent backfill scans
+  need (see Status below for what's actually wired up today). Note the honest trade-off: table
+  data exists <strong>twice on S3</strong> (layer files + Parquet) until v2.</p>
   <p><strong>Status:</strong> the safekeeper wire protocol (W③ — tenant/timeline packed into the
   libpq <code>options</code> startup param, JWT auth, slot-less <code>START_REPLICATION</code>)
   and decoding of Neon's custom heap rmgr are <strong>fully validated end-to-end</strong> against
@@ -254,12 +254,16 @@
   dialect-independent</strong> (reproduced identically on vanilla Postgres) — a TOAST
   decompression bug and a DDL-detection bug (<code>pg_class</code>/<code>pg_attribute</code> are
   mapped relations, so their stored <code>relfilenode</code> reads 0 on any Postgres) — both now
-  fixed and re-verified. The <strong>pageserver oracle shown below is the only piece not wired up
-  yet</strong>: pre-images, TOAST, and backfill still resolve through the compute's SQL port,
-  same as the M0–M4 product.</p>
+  fixed and re-verified. The <strong>pageserver oracle shown below is now wired into the engine
+  too</strong> (2026-07-10): on the safekeeper path, UPDATE/DELETE pre-images are fetched live
+  from the pageserver's <code>pagestream_v3</code> protocol at the exact pre-record LSN — no
+  <code>pageinspect</code>, no compute SQL involvement — verified live including a kill -9 +
+  restart. What's still SQL: the initial snapshot/backfill (page-level visibility is a v2-scope
+  research problem) and TOAST-chunk backfill for pre-toast-update rows (falls back to the
+  Delta-rebuilt mirror). M5 is functionally complete for pre-images.</p>
 
   <div class="diagram">
-  <svg viewBox="0 0 1000 420" role="img" aria-label="M5: writes quorum-commit on safekeepers; open-ltap consumes the safekeeper WAL stream and queries the pageserver for pre-images; OLTP reads fetch pages from the pageserver on buffer-pool miss; analytics scan Delta with a planned tail merge">
+  <svg viewBox="0 0 1000 420" role="img" aria-label="M5: writes quorum-commit on safekeepers; open-ltap consumes the safekeeper WAL stream and queries the pageserver for pre-images; OLTP reads fetch pages from the pageserver on buffer-pool miss; analytics scan Delta with a tail merge">
     <!-- Application -->
     <rect x="24" y="52" width="120" height="96" rx="8" fill="#1F2731" stroke="#2A333D"/>
     <text x="84" y="92" text-anchor="middle" font-size="12.5" font-weight="600" fill="#E6E1D7">Application</text>
@@ -341,8 +345,8 @@
 
     <!-- pageserver -> ltap oracle -->
     <path d="M 594 300 L 700 300 L 700 172" fill="none" stroke="#E2A65B" stroke-width="1.5"
-          stroke-dasharray="5 5" marker-end="url(#ah-a)"/>
-    <text x="600" y="292" font-size="9" fill="#E2A65B">GetPage@LSN — pre-images · TOAST · backfill</text>
+          marker-end="url(#ah-a)"/>
+    <text x="600" y="292" font-size="9" fill="#E2A65B">GetPage@LSN — pre-images (live); backfill still SQL</text>
 
     <!-- analytics -->
     <rect x="850" y="280" width="136" height="96" rx="8" fill="#1F2731" stroke="#2A333D"/>
@@ -365,7 +369,7 @@
       <ul>
         <li><strong>Zero load on compute</strong> — the transcoder taps WAL downstream, at the safekeepers</li>
         <li><strong>Every table automatically</strong> — no replication slots, no publications, no per-table setup</li>
-        <li><strong>The GetPage@LSN oracle</strong> — pre-images for updates, TOAST chunks, consistent backfill scans; vanilla CDC never has this</li>
+        <li><strong>The GetPage@LSN oracle</strong> — pre-images for UPDATE/DELETE, live and wired in; vanilla CDC has no equivalent random-access read</li>
         <li><strong>No Neon fork</strong> — an external subscriber; upstream upgrades stay painless</li>
         <li><strong>Read-your-writes analytics</strong> — pin LSN, scan Delta ≤ LSN, merge the tail (R④, with M4)</li>
       </ul>
@@ -377,7 +381,7 @@
         <li><strong>You must run Neon</strong> — 3 safekeepers, pageserver, compute images, no managed control plane in OSS; a platform decision, not a tool install</li>
         <li><strong>Narrow audience</strong> — teams on RDS/self-hosted Postgres get nearly all the value from M0–M4 without this</li>
         <li><strong>Transcoder can lag</strong> — an independent consumer; freshness bounded by decode+commit unless the tail merge is deployed</li>
-        <li><strong>Pageserver oracle not wired up yet</strong> — everything else (wire protocol, WAL-dialect decode, FPI-restore, framing/CRC parity, TOAST, DDL) is validated end-to-end against a local Neon stack, but pre-images/TOAST/backfill still go through the compute's SQL port</li>
+        <li><strong>Oracle covers pre-images only</strong> — initial snapshot/backfill still goes through the compute's SQL <code>COPY</code> (page-level visibility is a v2-scope research problem), and TOAST-chunk backfill for pre-toast-update rows is still unwired</li>
         <li><strong>Branches &amp; PITR unmapped</strong> — Neon branches have no Delta-snapshot story yet</li>
       </ul>
     </div>
@@ -395,6 +399,16 @@
   pageserver (R③, R⑤), while <strong>cold OLTP reads now pay the reverse path</strong> — a buffer-pool
   and page-cache miss means rebuilding the exact 8KB page from Parquet + WAL tail (R④), which is why
   the caching hierarchy has to be aggressive.</p>
+  <p><strong>Status:</strong> the diagram below is the end state, not where things are today. The
+  four fork-free probes (P0) are complete — an offline pageserver layer-file reader, deriving a
+  table's schema straight from <code>pg_class</code>/<code>pg_attribute</code> pages with zero SQL,
+  the GetPage@LSN oracle client (now also powering the M5 oracle above), and image-layer cadence
+  measurement all validated live. The first stage, <strong>V2a — embedding the transcoder inside
+  the pageserver — is underway</strong>: the engine has been extracted into a library, a fork of
+  Neon is pinned to a specific commit, and a <code>TranscodeSink</code> tee scaffold plus several
+  engine-adapter units are landing on a local fork branch. None of that has run the end-to-end
+  gauntlet yet, and V2b/V2c — canonical Parquet, the reverse path described below — haven't
+  started.</p>
 
   <div class="diagram">
   <svg viewBox="0 0 1000 470" role="img" aria-label="v2: writes flow through safekeepers into a forked pageserver whose compaction writes canonical Parquet; OLTP reads are served from an ephemeral page cache rebuilt from Parquet on miss; analytics scan Parquet directly with a tail merge">
@@ -525,7 +539,7 @@
       <tr><td>Copies of table data</td><td>2 — heap + Parquet</td><td>2 — layers + Parquet</td><td class="t-good">1 — Parquet only</td></tr>
       <tr><td>Neon fork needed</td><td class="t-good">no — any Postgres</td><td class="t-good">no — external subscriber</td><td class="t-hot">yes — compaction + read path</td></tr>
       <tr><td>Who wants it</td><td class="t-good">anyone with Postgres + S3 + Spark/DuckDB</td><td>platform teams running Neon</td><td>whoever forks the pageserver</td></tr>
-      <tr><td>Status</td><td class="t-good">M0 shipped &amp; verified; M1–M4 roadmap</td><td class="t-good">fully validated end-to-end; pageserver oracle not started</td><td>research-grade</td></tr>
+      <tr><td>Status</td><td class="t-good">M0–M4 shipped &amp; verified</td><td class="t-good">fully validated end-to-end; oracle wired for pre-images (snapshot/backfill still SQL)</td><td>research-grade; V2a (embedding) underway, P0 probes done</td></tr>
     </tbody>
   </table>
   </div>

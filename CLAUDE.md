@@ -350,17 +350,23 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 - **M4 leftovers (explicitly deferred)** — Arrow Flight endpoint (only if ADBC clients demand
   it); HTTP Range support if force_download ever hurts; DV-based compaction; streaming
   compaction for tables larger than memory.
-- **M5 (fully validated end-to-end against neon-compose, see State above)** — the only remaining
-  piece is the pageserver as a `GetPage@LSN` oracle (pre-images, TOAST, backfill); not yet
-  started.
+- **M5 (fully validated end-to-end against neon-compose, see State above)** — the
+  `GetPage@LSN` oracle shipped and is wired into the engine (2026-07-10): pre-images for
+  UPDATE/DELETE come from the pageserver, not SQL. What's left: initial snapshot/backfill
+  still uses SQL `COPY` (page-level visibility is the v2-scope P2 problem), and TOAST chunk
+  backfill for pre-toast-update rows is still unwired (tolerated fallback via the
+  Delta-rebuilt mirror). M5 is functionally complete for pre-images.
 - **v2 (future work)** — transcoding inside pageserver compaction (canonical columnar).
   **Scoped 2026-07-10 in `docs/v2-scope.md`** (grounded in neon @ 8f60b04 + Databricks' June-2026
-  LTAP blog): stages P0 (fork-free probes: layerscan.rs, catalog-from-pages, GetPage oracle =
-  the open M5 item, cadence measurement) → V2a (embed the engine at WAL ingest; mirror dies,
-  replaced by native page@LSN reads) → V2b (transcode at image-layer creation; fragments +
-  tail merge) → V2c (heap-page demotion; research gate: reverse path + GC/PITR/branching).
-  Key confirmed facts: Databricks transcodes at page materialization, keeps bit-exact datums,
-  stores (block,offset) per row, does NOT transcode indexes; Neon delta layers store raw WAL
+  LTAP blog): stages P0 (fork-free probes: layerscan.rs, catalog-from-pages, GetPage oracle,
+  cadence measurement — **all four complete 2026-07-11**) → V2a (embed the engine at WAL
+  ingest; mirror dies, replaced by native page@LSN reads — **underway**: engine extracted to
+  `src/engine.rs` (step a, done), fork version pinned at neon @ `8f60b04` (step b, done), fork
+  tee scaffold + engine-adapter units A/B/C/E1 shipped on the `openltap/v2a` fork branch
+  (step c phases 1–2, in progress) → V2b (transcode at image-layer creation; fragments +
+  tail merge) → V2c (heap-page demotion; research gate: reverse path + GC/PITR/branching). Key confirmed
+  facts: Databricks transcodes at page materialization, keeps bit-exact datums, stores
+  (block,offset) per row, does NOT transcode indexes; Neon delta layers store raw WAL
   records; CLOG/multixact + relmapper are in the pageserver keyspace (visibility + mapped-rel
   catalog decode need no SQL). LTAP Writer Library still unreleased as of 2026-07-10.
 
