@@ -573,6 +573,20 @@ bar:
   implied by completing V2a/V2b/V2c as currently scoped.** *Risk: research, larger than P5;
   no prototype exists; flagging honestly rather than inventing a stage for it.*
 
+**Full design (2026-07-13): `docs/hot-tier-design.md`.** Expands this entry into all eight
+sub-problems — write-optimized memtable + flush cadence, point-read merge order, snapshot-at-
+LSN reads (a genuine free win off the existing exactly-once watermarks), why "in-place update"
+is a category error over immutable columnar, the tombstone-retention correctness trap a naive
+point-read design would hit, the deliberate punt on secondary indexes and why, DV-based
+compaction as the recommended per-flush-cadence fast path (with `compact()` kept unchanged as
+the slow path), and how this composes with — never replaces — the page-shaped GetPage@LSN
+Oracle. Each sub-problem gets a design-space-with-tradeoffs then a grounded recommendation,
+plus a P10a→d phased plan and an open-questions list (Delta stats coverage, the unprototyped
+DV write/read round-trip, memtable memory bounds, Delta-vs-Iceberg for this specific need, and
+read-side concurrency). Orthogonal to P0→V2a→V2b→V2c, not a stage within it — see that doc's
+§5 for exactly how it intersects V2a's Unit D and V2c's reverse path without depending on
+either.
+
 ---
 
 ## 6. What carries over from M0–M5 (4.3 kLOC audit)
