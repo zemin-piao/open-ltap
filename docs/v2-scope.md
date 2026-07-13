@@ -1,7 +1,9 @@
 # v2 scoping — transcoding inside the pageserver
 
 *Status: scoping document, no code. Written 2026-07-10. North Star (top of doc) + hot-tier
-gap register (§5 P10) added 2026-07-13.*
+gap register (§5 P10) added 2026-07-13; P10 marked PARKED the same day once Databricks' own
+shipped design confirmed the V2/V2c axis alone is sufficient — see the prior-art note in §1
+and §5 P10.*
 *Grounded against `neondatabase/neon` @ `8f60b04` (main, 2026-05-25) and Databricks' public
 LTAP material (June 2026). File/line references below are to that Neon commit.*
 
@@ -20,12 +22,17 @@ distinction is deliberate and already load-bearing for the M0–M4 product (see 
 the same physical-replication ingest *inside* the storage engine (V2a) and then downstream of
 image-layer materialization (V2b/V2c) instead of running it as an external process.
 
-**This is a vision statement, not a new stage.** Every gate and risk class below (P0 → V2a →
-V2b → V2c) still applies unchanged; the North Star is why the destination is worth the
-research risk in P5–P9. §5 P10 grounds the one part of this vision the staged plan doesn't yet
-scope at all: serving OLTP-latency point reads/writes directly and canonically off columnar,
-as opposed to V2c's narrower (and already-scoped) job of making cache-miss page
-*reconstruction* correct.
+**This is a vision statement, not a new stage — and P0 → V2a → V2b → V2c is the whole path to
+it.** Databricks' own shipped LTAP architecture (§1 below) reaches "one copy, OLTP and OLAP
+both served" entirely via this axis — transcode at the storage layer, heap pages demoted to a
+rebuildable cache, no separate serving interface of any kind — which is the strongest evidence
+available that this staged plan, on its own, is sufficient to reach the North Star. Every gate
+and risk class below still applies unchanged; the North Star is why the destination is worth
+the research risk in P5–P9.
+
+§5 P10 explored a different axis — a lake-native, primary-key-addressed point-read/write
+interface, distinct from serving Postgres's own page requests — and is now **parked** (see the
+prior-art note in §1): informative as a design register, not part of the critical path.
 
 ---
 
@@ -72,10 +79,53 @@ Direct claims from [the Databricks blog](https://www.databricks.com/blog/lakebas
    the same point).
 5. **Row pages demote to cache**: "the PageServer still materializes traditional row-based
    pages in a local cache, but this is strictly a performance cache."
+6. **Non-round-trippable values get a text overflow field, not silent loss or coercion**
+   *(added 2026-07-13)*: "The handful of values with no lossless columnar counterpart, e.g. NaN
+   and ±Infinity, NUMERICs beyond the decimal range, exotic or extension types, are not dropped
+   or coerced. They are carried alongside the original columns in a structured overflow field
+   within the same table, holding the canonical Postgres text for those values." — directly
+   relevant to this doc's own P6: a semantic Arrow mapping (ours) doesn't have to be perfectly
+   round-trippable for every type if a side-channel text field catches the exceptions. Worth
+   revisiting as a fourth P6 option alongside raw-datum columns, proof-of-round-trip, and
+   restricting demotion.
+7. **MVCC via retained-but-hidden intermediate versions, GC'd like any superseded row**
+   *(added 2026-07-13)*: "Intermediate row versions are retained to preserve Postgres's MVCC
+   semantics and PITR, but they are not visible to Iceberg/Delta readers and are eventually
+   garbage-collected." Same shape as our own append-only change log +
+   `_ltap_deleted` tombstones + compaction (M2d/M4b) — just running inside the pageserver
+   instead of an external sink. Confirms P2's "visibility from pages, CLOG@LSN" direction
+   rather than motivating a different visibility model.
+8. **LSN-merge freshness — the same mechanism as our M4 tail, one layer down**
+   *(added 2026-07-13)*: "When an analytical query starts... it first asks Postgres for the
+   current LSN... [and] reads the overwhelming majority of the data... directly from object
+   storage. The only thing left is the small set of very recent changes that have not yet been
+   materialized to the lake, and those it fetches from the PageServer and merges on top." —
+   architecturally identical to `serve.rs`'s Delta-plus-tail merge (M4, shipped 2026-07-04);
+   the difference is that their "tail" is served live from PageServer pages rather than a
+   separate HTTP endpoint, which is exactly the shape V2b's tail-merge plan (§4) already
+   assumed.
 
 The announced open-source **LTAP Writer Library is still unreleased** as of 2026-07-10 (searched;
 launch press from June 16, no repo, no license, no timeline). Plan as if it never ships; treat
 it as a possible V2c accelerant if it does.
+
+**Prior-art note — why P10 is parked, not pursued** *(added 2026-07-13)*: facts 1–8 above
+describe, in detail, a shipped, production-validated implementation of exactly this project's
+V2/V2c axis — transcode at the storage layer, byte-exact preservation (with an overflow field
+for the exceptions), heap pages demoted to a rebuildable cache, MVCC via hidden intermediate
+versions, LSN-merge freshness. Nowhere in the blog is there any mention of a *separate*
+lake-native point-read/write interface distinct from serving Postgres's own page requests —
+every read described flows through Postgres's ordinary buffer pool and the PageServer. That's
+an absence, not a stated rejection, so it's signal rather than proof — but it's the strongest
+evidence available that reaching "one copy, OLTP and OLAP" doesn't require what `docs/hot-tier-
+design.md` (P10) designed, which is why P10 is parked rather than pursued (§5 P10 below).
+**Where we differ, honestly:** Lakebase is a managed, Databricks-proprietary product, and the
+one open-source component they announced — the LTAP Writer Library — remains unreleased (see
+above). This project's V2 track is an Apache-2.0 patch series against open Neon, targeting
+open Delta/Iceberg tables any engine can read, with no managed control plane at any stage. That
+is real differentiation worth stating plainly — but it also means P5–P9's hard problems have to
+be solved independently; Databricks hasn't open-sourced enough for us to check our answers
+against theirs beyond what the blog states.
 
 Sources: [Databricks blog](https://www.databricks.com/blog/lakebase-ltap-rethinking-database-storage) ·
 [press release](https://www.databricks.com/company/newsroom/press-releases/databricks-launches-ltap-first-lake-transactionalanalytical) ·
@@ -517,11 +567,16 @@ boundary (`TranscodeSink`) so patches stay mechanical; and pursue an upstream RF
 upstreamable since Databricks has legitimized the pattern). If the LTAP Writer Library ships
 with a usable license, re-evaluate everything above it.
 
-**P10 — The OLTP hot tier: point reads/writes directly over columnar.** *(Added 2026-07-13,
-grounded by reading the current codebase, not new design.)* The North Star (top of this
-document) is "columnar is the only canonical materialization," which implies something must
-serve OLTP point-read/write latency in front of it. Auditing what exists today against that
-bar:
+**P10 — The OLTP hot tier: point reads/writes directly over columnar. ⏸ PARKED 2026-07-13.**
+**Rationale in one line:** Databricks' shipped LTAP proves the V2/V2c storage-layer axis alone
+reaches "one copy, OLTP and OLAP both served," with no separate lake-native point interface —
+see the prior-art note in §1. This track is optional and non-blocking: kept below as a design
+register in case real need for a lake-native interface emerges later, not as part of the
+critical path to the North Star. *(Registered 2026-07-13, grounded by reading the current
+codebase, not new design — unchanged from the original write-up below.)* The original framing
+was: the North Star (top of this document) is "columnar is the only canonical materialization,"
+which implies something must serve OLTP point-read/write latency in front of it. Auditing what
+existed at the time against that bar:
 
 - *What's actually built* — none of it is a general-purpose serving tier; all of it is
   pre-image plumbing for the transcoder's own correctness. `txbuf::TxBuffer`'s per-xid overlay
@@ -573,18 +628,19 @@ bar:
   implied by completing V2a/V2b/V2c as currently scoped.** *Risk: research, larger than P5;
   no prototype exists; flagging honestly rather than inventing a stage for it.*
 
-**Full design (2026-07-13): `docs/hot-tier-design.md`.** Expands this entry into all eight
-sub-problems — write-optimized memtable + flush cadence, point-read merge order, snapshot-at-
-LSN reads (a genuine free win off the existing exactly-once watermarks), why "in-place update"
-is a category error over immutable columnar, the tombstone-retention correctness trap a naive
-point-read design would hit, the deliberate punt on secondary indexes and why, DV-based
-compaction as the recommended per-flush-cadence fast path (with `compact()` kept unchanged as
-the slow path), and how this composes with — never replaces — the page-shaped GetPage@LSN
-Oracle. Each sub-problem gets a design-space-with-tradeoffs then a grounded recommendation,
-plus a P10a→d phased plan and an open-questions list (Delta stats coverage, the unprototyped
-DV write/read round-trip, memtable memory bounds, Delta-vs-Iceberg for this specific need, and
-read-side concurrency). Orthogonal to P0→V2a→V2b→V2c, not a stage within it — see that doc's
-§5 for exactly how it intersects V2a's Unit D and V2c's reverse path without depending on
+**Full design (2026-07-13, also now ⏸ PARKED — see above): `docs/hot-tier-design.md`.** Expands
+this entry into all eight sub-problems — write-optimized memtable + flush cadence, point-read
+merge order, snapshot-at-LSN reads (a genuine free win off the existing exactly-once
+watermarks), why "in-place update" is a category error over immutable columnar, the
+tombstone-retention correctness trap a naive point-read design would hit, the deliberate punt
+on secondary indexes and why, DV-based compaction as the recommended per-flush-cadence fast
+path (with `compact()` kept unchanged as the slow path), and how this composes with — never
+replaces — the page-shaped GetPage@LSN Oracle. Each sub-problem gets a design-space-with-
+tradeoffs then a grounded recommendation, plus a P10a→d phased plan and an open-questions list
+(Delta stats coverage, the unprototyped DV write/read round-trip, memtable memory bounds,
+Delta-vs-Iceberg for this specific need, and read-side concurrency). Kept for reference, not
+being pursued. Orthogonal to P0→V2a→V2b→V2c, not a stage within it — see that doc's §5 for
+exactly how it intersects V2a's Unit D and V2c's reverse path without depending on
 either.
 
 ---
@@ -609,7 +665,8 @@ either.
   Neon-platform operators; nothing in it may regress or gate the external transcoder.
 - **Non-goals for all of v2**: transcoding index forks (page-native forever, per Databricks
   too); multi-shard tenants (P8); logical replication compatibility; supporting the fork as a
-  managed service.
+  managed service; a separate lake-native OLTP point-read/write interface (P10 — parked
+  2026-07-13, see §1 prior-art note and §5 P10).
 - **Gates**: P0→V2a = probes 1–2 pass. V2a→V2b = gauntlet passes in-process. V2b→V2c =
   reverse-path prototype validates against amcheck **and** a written GC/PITR/branching design.
   V2b is an acceptable terminal state if the V2c gate fails.

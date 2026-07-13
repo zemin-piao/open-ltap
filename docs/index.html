@@ -512,6 +512,7 @@
         <li><strong>Exact freshness for free</strong> — analytics pin an LSN and merge the unmaterialized tail from the pageserver (R⑤), zero Postgres involvement</li>
         <li><strong>Transcoding is amortized</strong> — it rides compaction work the storage layer already does</li>
         <li><strong>Everything from M0–M5 carries over</strong> — catalog tracking, visibility, TOAST, type fidelity are the same logic, relocated</li>
+        <li><strong>Open, not Lakebase-bound</strong> — same storage-layer axis Databricks proved out, built on an open Neon fork and open Delta/Iceberg tables any engine can read; no managed control plane required</li>
       </ul>
     </div>
     <div class="pc con">
@@ -519,7 +520,7 @@
       <ul>
         <li><strong>Pageserver fork</strong> — a rebase treadmill against fast-moving Neon internals, forever</li>
         <li><strong>The reverse path</strong> — rebuilding byte-addressed pages (indexes point at exact block/offset) is the research-grade problem; nobody outside Databricks has shipped it</li>
-        <li><strong>No general OLTP hot tier</strong> — this diagram's page cache reconstructs pages on a miss, which is not the same as a keyed memtable, secondary indexes, in-place updates, or low-write-amp compaction; nothing here builds that, it's still Neon's own page cache doing the job</li>
+        <li><strong>No separate lake-native OLTP interface, by choice</strong> — a PK-addressed point-read/write tier distinct from this page cache was explored and parked: Databricks' own shipped design reaches "one copy, OLTP and OLAP" via this page-cache-over-columnar path alone, with no such interface anywhere in it — not pursued unless real need emerges</li>
         <li><strong>Cold OLTP reads pay for it</strong> — a cache miss costs Parquet→page reconstruction (R④); needs an aggressive cache hierarchy to hide</li>
         <li><strong>Shared failure domain</strong> — a transcoder bug now sits in the OLTP read path, not beside it</li>
         <li><strong>Branching, PITR, GC all rework</strong> — Neon's copy-on-write branches must map onto Delta snapshots</li>

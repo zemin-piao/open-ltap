@@ -369,14 +369,22 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   (block,offset) per row, does NOT transcode indexes; Neon delta layers store raw WAL
   records; CLOG/multixact + relmapper are in the pageserver keyspace (visibility + mapped-rel
   catalog decode need no SQL). LTAP Writer Library still unreleased as of 2026-07-10.
-  **North Star added 2026-07-13** (`docs/v2-scope.md` §"North Star" + §5 P10): columnar as the
+  **North Star added 2026-07-13** (`docs/v2-scope.md` §"North Star"): columnar as the
   *only* canonical materialization, physical-WAL-fsync replication as the storage-layer
   ingest (not CDC) — articulates why V2a→V2c is worth the research risk, doesn't add a stage.
-  P10 grounds the gap honestly: today's mirror/txbuf/oracle/tail are all transcoder-internal
-  pre-image plumbing, not a general OLTP serving tier (no keyed memtable, no secondary
-  indexes, no in-place update, no point-grained tombstone check, replace-based compaction
-  that doesn't scale to per-row cadence) — genuinely serving OLTP point reads/writes directly
-  off columnar is **not started and not implied by finishing V2a/V2b/V2c as scoped**.
+  **P0→V2a→V2b→V2c is the whole path to it**, confirmed by Databricks' own shipped LTAP
+  architecture (added to `docs/v2-scope.md` §1 as facts 6–8 + a prior-art note, 2026-07-13):
+  storage-layer transcode, byte-exact values with a text-overflow field for the exceptions,
+  heap pages demoted to a rebuildable cache, MVCC via hidden intermediate versions, LSN-merge
+  freshness (same shape as our M4 tail) — and no separate lake-native serving interface
+  anywhere in their design. Our differentiation: open Neon fork + open Delta/Iceberg tables,
+  no managed control plane, vs. their proprietary Lakebase (the one open-source piece they
+  announced, the LTAP Writer Library, is still unreleased).
+  **P10 (a lake-native, PK-addressed point-read/write hot tier) explored this same day and
+  parked**: `docs/hot-tier-design.md` has the full design (memtable, point-read merge,
+  snapshot-at-LSN, tombstone correctness, DV-based compaction, etc.) for reference, but it's
+  explicitly non-blocking and not part of the critical path — see `docs/v2-scope.md` §5 P10
+  and its §1 prior-art note for the one-line rationale.
 
 ## Code map (src/)
 

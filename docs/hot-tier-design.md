@@ -1,6 +1,19 @@
 # The OLTP hot tier — point reads/writes over columnar
 
-*Status: design document, no code. Written 2026-07-13. Companion to `docs/v2-scope.md` P10
+> ## ⏸ PARKED — 2026-07-13
+> **This track is descoped, not pursued.** The roadmap's primary path to the North Star
+> ("columnar as the only canonical materialization") is `docs/v2-scope.md`'s **P0 → V2a → V2b
+> → V2c** axis — transcode at the storage layer, Postgres's own heap pages demoted to a
+> rebuildable cache. Databricks' shipped LTAP architecture validated that this axis alone
+> reaches "one copy, OLTP and OLAP both served," with no separate lake-native point interface
+> of the kind designed below (see `docs/v2-scope.md` §1's prior-art note, added 2026-07-13).
+> This document is kept **for reference only** — a design register in case real need for a
+> lake-native PK-addressed interface emerges later — and is explicitly **not** part of the
+> critical path. Nothing below has been implemented; nothing below is currently planned to be.
+> See `docs/v2-scope.md` §5 P10 for the one-paragraph rationale in context.
+
+*Status: design document, no code. Written 2026-07-13; parked the same day (see banner above).
+Companion to `docs/v2-scope.md` P10
 ("The OLTP hot tier: point reads/writes directly over columnar"), which this doc expands.
 Grounded entirely by reading the current codebase (`src/txbuf.rs`, `src/engine.rs`,
 `src/sink.rs`, `src/serve.rs`, `src/snapshot.rs`, `src/catalog.rs`, `src/pgwire.rs`) — no new
