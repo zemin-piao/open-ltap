@@ -33,10 +33,13 @@
 //! multixact (no updater, just concurrent lockers) is resolved for free —
 //! `HEAP_XMAX_LOCK_ONLY` means xmax never deletes the row, regardless of what
 //! it points at. A multixact *with* an updater member needs the
-//! members/offsets SLRU (a different, more involved format) to find that
-//! member's xid before CLOG can even be consulted; that's genuinely
-//! unimplemented, so [`tuple_visible`] returns a typed error for that case
-//! rather than guessing.
+//! members/offsets SLRU (a different, more involved packed format) to find
+//! that member's xid before CLOG can even be consulted — [`crate::multixact`]
+//! implements that, and [`tuple_visible_with_multixact`] composes it with
+//! this module's plain CLOG resolution. [`tuple_visible`] itself still
+//! returns a typed error for that one case (no `MultiXactSource` in scope);
+//! that's the entry point `catalog.rs` uses today, since catalog tables
+//! essentially never hit it.
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
@@ -47,7 +50,7 @@ pub const CLOG_XACTS_PER_BYTE: u32 = 4;
 pub const CLOG_XACTS_PER_PAGE: u32 = 8192 * CLOG_XACTS_PER_BYTE;
 /// `SLRU_PAGES_PER_SEGMENT` (slru.c), unchanged since introduced.
 pub const SLRU_PAGES_PER_SEGMENT: u32 = 32;
-const PAGE_SZ: usize = 8192;
+pub(crate) const PAGE_SZ: usize = 8192;
 
 pub const INVALID_XID: u32 = 0;
 pub const BOOTSTRAP_XID: u32 = 1;
@@ -131,6 +134,11 @@ const HEAP_XMAX_IS_MULTI: u16 = 0x1000;
 /// an aborted one would for xmin (not yet visible) or the same way an
 /// invalid one would for xmax (not yet deleted) — "not committed as of this
 /// read" either way.
+///
+/// A multixact xmax *with* an updater member bails here — that needs the
+/// members/offsets SLRU, which this function has no source for. Callers
+/// that can supply one should use [`tuple_visible_with_multixact`] instead,
+/// which handles that case and otherwise defers straight to this function.
 pub async fn tuple_visible<S: ClogSource>(src: &mut S, xmin: u32, xmax: u32, infomask: u16) -> Result<bool> {
     let xmin_committed = matches!(resolve(src, xmin).await?, TxnStatus::Committed);
     if !xmin_committed {
@@ -145,7 +153,7 @@ pub async fn tuple_visible<S: ClogSource>(src: &mut S, xmin: u32, xmax: u32, inf
         }
         bail!(
             "xmax {xmax} is a multixact with an updater member — resolving it needs \
-             the members/offsets SLRU, not implemented (docs/v2-scope.md P2 sub-case)"
+             the members/offsets SLRU (crate::multixact); use tuple_visible_with_multixact"
         );
     }
     if infomask & HEAP_XMAX_LOCK_ONLY != 0 {
@@ -153,6 +161,35 @@ pub async fn tuple_visible<S: ClogSource>(src: &mut S, xmin: u32, xmax: u32, inf
     }
     let xmax_committed = matches!(resolve(src, xmax).await?, TxnStatus::Committed);
     Ok(!xmax_committed)
+}
+
+/// [`tuple_visible`], but resolves a multixact-with-updater xmax instead of
+/// bailing: finds the updater member via [`crate::multixact::resolve_updater`]
+/// and feeds *its* xid back into the ordinary CLOG check. This is the P2
+/// sub-case `docs/v2-scope.md` names ("multixact xmax (members SLRU is also
+/// in the keyspace)") — closing it needed a second SLRU (offsets + members,
+/// a materially different packed layout than CLOG's 2-bit array), which is
+/// why it lives behind its own entry point rather than folded into
+/// `tuple_visible` itself (most callers — today, `catalog.rs`'s scan of
+/// pg_class/pg_attribute/pg_index — realistically never hit this case and
+/// don't need a `MultiXactSource` wired in just to compile).
+pub async fn tuple_visible_with_multixact<C: ClogSource, M: crate::multixact::MultiXactSource>(
+    clog: &mut C,
+    mx: &mut M,
+    xmin: u32,
+    xmax: u32,
+    infomask: u16,
+) -> Result<bool> {
+    if infomask & HEAP_XMAX_IS_MULTI != 0 && infomask & HEAP_XMAX_LOCK_ONLY == 0 {
+        if !matches!(resolve(clog, xmin).await?, TxnStatus::Committed) {
+            return Ok(false); // insert never (yet) took effect
+        }
+        return Ok(match crate::multixact::resolve_updater(mx, xmax).await? {
+            Some(updater_xid) => !matches!(resolve(clog, updater_xid).await?, TxnStatus::Committed),
+            None => true, // every member is a locker after all; nothing deleted this version
+        });
+    }
+    tuple_visible(clog, xmin, xmax, infomask).await
 }
 
 /// [`ClogSource`] over a live `pg_xact/` directory — a running compute's
@@ -171,18 +208,23 @@ impl FileClogSource {
 
 impl ClogSource for FileClogSource {
     async fn clog_page(&mut self, pageno: u32) -> Result<Vec<u8>> {
-        let segno = pageno / SLRU_PAGES_PER_SEGMENT;
-        let page_in_seg = (pageno % SLRU_PAGES_PER_SEGMENT) as usize;
-        let path = self.dir.join(format!("{segno:04X}"));
-        let bytes = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("reading clog segment {}", path.display()))?;
-        let off = page_in_seg * PAGE_SZ;
-        bytes
-            .get(off..off + PAGE_SZ)
-            .map(|s| s.to_vec())
-            .with_context(|| format!("clog segment {} has no page {page_in_seg}", path.display()))
+        read_slru_segment_page(&self.dir, pageno).await
     }
+}
+
+/// Read one page from a live SLRU segment directory — the on-disk
+/// convention (`slru.c`) is shared by every SLRU: CLOG here, and MultiXact
+/// offsets/members in [`crate::multixact`].
+pub(crate) async fn read_slru_segment_page(dir: &std::path::Path, pageno: u32) -> Result<Vec<u8>> {
+    let segno = pageno / SLRU_PAGES_PER_SEGMENT;
+    let page_in_seg = (pageno % SLRU_PAGES_PER_SEGMENT) as usize;
+    let path = dir.join(format!("{segno:04X}"));
+    let bytes = tokio::fs::read(&path).await.with_context(|| format!("reading SLRU segment {}", path.display()))?;
+    let off = page_in_seg * PAGE_SZ;
+    bytes
+        .get(off..off + PAGE_SZ)
+        .map(|s| s.to_vec())
+        .with_context(|| format!("SLRU segment {} has no page {page_in_seg}", path.display()))
 }
 
 #[cfg(test)]
