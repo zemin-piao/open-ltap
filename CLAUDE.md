@@ -260,7 +260,8 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   PG17 FormData fixed layouts (fetched from REL_17_STABLE headers, offsets in the example;
   **attcacheoff still exists in PG17** — relfilenode@88, relkind@115, relnatts@116; attname@4,
   atttypid@68, attlen@72, attnum@74, attalign@87, atthasmissing@92, attisdropped@95). Spike
-  visibility heuristic = keep xmax==0 catalog tuples (real answer = CLOG@LSN, v2-scope P2).
+  visibility heuristic = keep xmax==0 catalog tuples (superseded 2026-07-14 by real CLOG@LSN,
+  see the V2b P2 visibility entry below; v2-scope P2).
   Toast chunks preloaded from the toast rel's pages in the same layer feed the ToastCache.
   Verified vs live SQL: gnarly table (int8/bool/text/timestamptz/uuid + DROPped float4 column
   + ADD int4 DEFAULT 42) — derived desc exact (filenode 41019, toast 41022, 7 phys slots,
@@ -336,6 +337,29 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   `XlXactParsedRecord`; SmgrCreate main-fork-only. Remaining: unit C catalog-from-pages →
   lib, D native-read pre-images, E engine construction in the consumer + sink credentials;
   then step (d).
+- **V2b P2 visibility shipped & verified 2026-07-14 — real CLOG@LSN, retiring the spike
+  heuristic**: catalog-from-pages used to keep `xmax==0` tuples (`docs/v2-scope.md` §P2). Now
+  `src/clog.rs` (`dc01678`) decodes the standard Postgres CLOG SLRU page format (2 bits/xid,
+  grounded against live openltap-pg bytes) and exposes `tuple_visible()` — the MVCC-minus-
+  snapshot check catalog-from-pages needs; it fixes the two cases the heuristic got wrong
+  (aborted insert wrongly kept; aborted/lock-only xmax wrongly read as a delete). `catalog.rs`
+  `Catalog::load`/`scan` now resolve real per-version visibility through a `ClogSource` seam.
+  A multixact xmax with an updater member started as an explicit error; `src/multixact.rs`
+  (`67aed5c`) then closed that — `MultiXactSource` decodes the offsets SLRU (4-byte
+  MultiXactOffset/id) and members SLRU (20-byte groups: 4 flag bytes + 4 xids) per
+  `multixact.c`, `resolve_updater()` walks the member list and returns the updater's xid
+  (ISUPDATE_from_mxstatus), and `clog.rs::tuple_visible_with_multixact()` composes the two
+  (the plain `tuple_visible()` catalog.rs uses is unchanged — pg_class/pg_attribute/pg_index
+  essentially never hit the updater-multixact case). The one genuinely unanswerable disk-only
+  case (the single newest multixact cluster-wide, no bounding next-offset) is a typed error,
+  not a guess. Verified live vs SQL ground truth: CLOG resolver matched across 5 scenarios
+  (heuristic was wrong on 3/5, `examples/clogvis.rs`); multixact updater (xid 769) cross-
+  checked against `pg_get_multixact_members()` and re-read from real segment files
+  (`examples/mxcheck.rs`), both pinned as unit tests. **Honest gap** (called out in both
+  module docs): the only `ClogSource`/`MultiXactSource` today read *current* on-disk pg_xact/
+  pg_multixact, not SLRUs pinned to an arbitrary past LSN — the real V2b answer reads the
+  pageserver's SLRU keyspace, fork-side plumbing not yet built; the trait is the seam where
+  that lands with no caller change.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
@@ -410,6 +434,26 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 - `sink.rs` — Delta create-if-absent + `RecordBatchWriter` write, committed via `CommitBuilder`
   with `open-ltap.commit`/`open-ltap.restart` txn actions; `_ltap_lsn` column = row's commit LSN.
   Uses `AWS_S3_ALLOW_UNSAFE_RENAME` (single writer, dev).
+- `engine.rs` — the transcode engine, moved out of `main.rs` in V2a step (a):
+  `Config`/`Table`/`Engine`/`Oracle`/`PendingBatch`/`Mirror` + attach/remap/resume helpers,
+  public seams (`handle_record`, `handle_commit`/`handle_abort`/`handle_smgr_create`) so an
+  embedder can feed it interpreted records. `main.rs` is now a thin pgwire wire loop.
+- `embed.rs` — `run(cfg, events)` drives the engine off an in-process `SourceEvent` channel
+  (`Raw` / pre-decoded `Commit`/`Abort`/`SmgrCreate` / `Progress` / `Lost`) — the in-pageserver
+  deployment shape (V2a unit E1). Implements the gap-at-stream-start and `Lost` re-snapshot
+  policies. `examples/embedded.rs` is the live harness.
+- `serve.rs` — M4 freshness read path: `TailStore` + hand-rolled HTTP/1.1 serving
+  `GET /tail/<table>.parquet` (long-poll `?min_lsn`), `/status`, `X-Ltap-Applied-Lsn`.
+- `catalog.rs` — catalog-from-pages (V2a unit C): `PageSource` trait (layer-file +
+  `PagestreamSource` impls), relmapper (`parse_relmap`/`MappedRels`), `Catalog::load` scanning
+  pg_class/pg_attribute/pg_index → `desc()` with PK from pg_index; per-tuple visibility via a
+  `ClogSource` (below). `layerscan`/`examples` drive it.
+- `clog.rs` — CLOG SLRU page decoder (2 bits/xid) + `tuple_visible()` (MVCC-minus-snapshot)
+  and `tuple_visible_with_multixact()`; the `ClogSource` seam catalog-from-pages uses for real
+  visibility (V2b P2). Only impl today reads current on-disk pg_xact; SLRU-at-past-LSN is
+  fork-side future work.
+- `multixact.rs` — `MultiXactSource` decoding the offsets + members SLRUs; `resolve_updater()`
+  returns a multixact's updater/deleter xid so `clog.rs` can resolve an updater-multixact xmax.
 - Little-endian only, 64-bit maxalign assumed. **PG17 + PG18 verified** (2026-07-04: full M2
   gauntlet incl. FPI/COPY/TOAST/restart passed identically on 18.4; every layout we parse is
   unchanged between 17 and 18). `XLOG_PAGE_MAGICS` in `wal/mod.rs` allowlists verified majors

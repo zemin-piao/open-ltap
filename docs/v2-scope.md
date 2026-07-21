@@ -236,7 +236,8 @@ readers. Each stage's output is the next stage's substrate.
    filenode, fast defaults), validated by decoding the table byte-exact from the same layer —
    including an out-of-line TOAST value resolved from the toast rel's pages (md5 match), zero
    SQL. Open ends for V2a: visibility used the xmax==0 spike heuristic (P2 owns the real
-   answer), and pk discovery (pg_index) wasn't done.
+   answer), and pk discovery (pg_index) wasn't done. *Both since closed:* pk-from-pg_index
+   landed with unit C, and real CLOG@LSN visibility replaced the heuristic (see P2 below).
 3. **GetPage oracle** ✅ (commits `235392d`, `ae2f955`): pagestream_v3 client + engine
    integration; pre-images now come from the pageserver on the safekeeper path and the
    mirror's pageinspect dependency is gone. Closed the M5 remainder in the same stroke.
@@ -434,7 +435,8 @@ relfilenode rewrites) inside the pageserver's restart/failure model.
   Relmapper split honestly: `parse_relmap` + `MappedRels` for blob-capable sources —
   pagestream serves only rel blocks, so it takes mapped filenodes out of band; in-process
   keyspace reads and layer files parse the real blob. `Catalog::load` scans
-  pg_class/pg_attribute/pg_index once (xmax==0 heuristic unchanged, P2 pending);
+  pg_class/pg_attribute/pg_index once (xmax==0 heuristic at this commit; superseded 2026-07-14
+  by real CLOG@LSN visibility via a `ClogSource` — see P2);
   `desc()` now also derives the **primary key from pg_index** (indisprimary + indkey
   int2vector — layout verified against REL_17_STABLE pg_index.h: fixed bools end at 23,
   int2vector typalign 'i'/typstorage plain → 4-byte varlena header at 24, values at 48;
@@ -521,6 +523,15 @@ from the keyspace per distinct xmin/xmax (cache per fragment; a fragment sees fe
 xids). Sub-cases: multixact xmax (members SLRU is also in the keyspace), frozen tuples,
 `xmin == xmax` same-txn churn. *Risk: fiddly but fully specified by the Postgres visibility
 rules; the synthetic-WAL test style pins each case.*
+*Status (2026-07-14): the decode half is built and wired repo-side.* `src/clog.rs` decodes
+the CLOG SLRU page format and exposes `tuple_visible()`; `src/multixact.rs` decodes the
+offsets/members SLRUs and `resolve_updater()`, composed via `tuple_visible_with_multixact()`;
+`catalog.rs`'s catalog scan now resolves real per-version visibility through a `ClogSource`,
+retiring the `xmax==0` spike heuristic (was wrong on 3/5 live scenarios). What remains for
+the full V2b answer is the *source*: today's `ClogSource`/`MultiXactSource` read current
+on-disk pg_xact/pg_multixact, not SLRUs pinned to an arbitrary past LSN — the "CLOG@LSN from
+the keyspace" plumbing is fork-side and lands behind the same trait with no caller change.
+Verified live vs SQL (`examples/clogvis.rs`, `examples/mxcheck.rs`) + pinned unit tests.
 
 **P3 — HOT chains and ctid identity.** On-page chains mean "the row at (block,offnum)" is not
 one tuple. Fragment emit must walk chains to the visible version but record the **root** lp
