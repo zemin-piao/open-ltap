@@ -9,6 +9,7 @@ pub mod embed;
 pub mod engine;
 pub mod multixact;
 pub mod pgwire;
+pub mod reconstruct;
 pub mod schema;
 pub mod serve;
 pub mod sink;

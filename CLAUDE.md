@@ -396,6 +396,24 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   against a real catalog — worth a rename+recreate pass in the next gauntlet. NOTE: the Delta
   *path* still derives from the first-seen name, so a brand-new table reusing a renamed table's
   original name would collide on the lake path — a separate, pre-existing gap, not addressed here.
+- **V2c reverse-path prototype 2026-07-21 (P5 — the research core)**: `src/reconstruct.rs`
+  rebuilds an 8 KB heap page from decoded rows — the inverse of `wal::heap`'s page decode, and
+  the piece a `GetPage@LSN` miss below the fragment horizon needs once heap pages are demoted.
+  `build_page(desc, block, lsn, slots)` does exact line-pointer placement (LP_NORMAL/UNUSED/
+  DEAD/REDIRECT so any index (block,offnum) resolves — P3), MAXALIGN'd tuple packing downward
+  from pd_special, frozen xmin by default (`FrozenTransactionId` — legal below the horizon) with
+  per-tuple xmin/xmax/ctid/HOT flags for chain reconstruction, and a recomputed `pg_checksum_page`
+  (checksum_impl.h). Validated offline by round-trip: a built page decoded back through
+  `decode_tuple_from_page` yields the exact input rows — 10 inline tests (single/multi-row, gaps,
+  nulls in both positions, MAXALIGN non-overlap, checksum verify+sensitivity, redirect/dead LPs,
+  a HOT root→child chain, dropped-col + oversized-varlena rejection). `examples/rebuild.rs` is a
+  reviewer harness: `real=<page-file> cols=…` decodes a REAL dumped heap page, rebuilds it, and
+  asserts every offnum resolves identically (`emit=<path>` writes a demo page). **Honest gaps**
+  (all flagged in the module doc): no dropped-column descriptors, no on-page TOAST/compressed/
+  >126-byte varlenas (P6 overflow-text side channel), no HOT-chain *inference* (caller supplies
+  the shape). The **checksum is spec-faithful but NOT yet cross-checked against a real
+  data-checksums cluster** — that plus pg_filedump/amcheck is the live-gauntlet step. This is
+  the V2c research gate's forward-looking half; the fragment *emit* side (V2b) is the pair.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
@@ -500,6 +518,11 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   fork-side future work.
 - `multixact.rs` — `MultiXactSource` decoding the offsets + members SLRUs; `resolve_updater()`
   returns a multixact's updater/deleter xid so `clog.rs` can resolve an updater-multixact xmax.
+- `reconstruct.rs` — V2c reverse path (P5): `build_page(desc, block, lsn, slots)` rebuilds an
+  8 KB heap page from decoded rows (LP_NORMAL/UNUSED/DEAD/REDIRECT, MAXALIGN'd tuples, frozen
+  xmin, `pg_checksum_page`). The inverse of `wal::heap`'s page decode; validated by round-trip
+  through `decode_tuple_from_page` (inline tests) + `examples/rebuild.rs` (cross-check a real
+  dumped page). Prototype: no dropped cols / on-page TOAST / HOT-chain inference yet.
 - Little-endian only, 64-bit maxalign assumed. **PG17 + PG18 verified** (2026-07-04: full M2
   gauntlet incl. FPI/COPY/TOAST/restart passed identically on 18.4; every layout we parse is
   unchanged between 17 and 18). `XLOG_PAGE_MAGICS` in `wal/mod.rs` allowlists verified majors
