@@ -368,12 +368,16 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   more "must stay pglz" limitation. (2) `tests/compression.rs` round-trips both codecs through
   the reference encoders (lz4 block roundtrip + wrong-size reject, `decompress_datum` method
   dispatch incl. a hand-built pglz literal stream, FPI restore for lz4/zstd with and without a
-  page hole). (3) `tests/catalog_pages.rs` drives synthetic pg_class/pg_attribute/pg_index heap
+  page hole); `tests/varlena_compression.rs` then drives inline (`VARATT_4B_C`) and out-of-line
+  (TOAST pointer + `ToastCache`) compressed varlenas — pglz AND lz4 — through the real
+  `decode_insert_tuple`, the first synthetic coverage of the compressed-varlena decode branches
+  at all (the neon suite only resolved an uncompressed TOAST value). (3) `tests/catalog_pages.rs`
+  drives synthetic pg_class/pg_attribute/pg_index heap
   pages through the real `Catalog::load` → `desc()` (the P2 catalog-from-pages path had only
   field-parser unit tests): asserts PK derivation, dropped-slot/fast-default handling, the
   mapped-vs-own-pg_class filenode split for pg_index, and — the load-bearing case — that an
   aborted stale catalog-tuple version is dropped by the CLOG visibility check (a contrast test
-  marks the same xid committed and shows both versions then leak). 48 tests green, no live
+  marks the same xid committed and shows both versions then leak). 52 tests green, no live
   stack needed.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
@@ -444,9 +448,11 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 - `tests/` — synthetic-WAL regression suite (`cargo test`, no Postgres/Docker needed):
   `common/mod.rs` builds byte-exact records/pages/tuples in both dialects; `wal_framing.rs`
   covers reader reassembly + CRC; `neon_dialect.rs` covers Neon offset shifts, FPI-restore,
-  TOAST decode; `compression.rs` covers lz4/zstd datum + page-image decode; `catalog_pages.rs`
-  drives `Catalog::load`/`desc()` over synthetic catalog pages incl. CLOG visibility. Extend it
-  whenever a decode bug is found — cheapest place to pin a layout.
+  TOAST decode; `compression.rs` covers the lz4/zstd codecs + page-image restore;
+  `varlena_compression.rs` drives inline + out-of-line compressed varlenas (pglz/lz4) through
+  the real `decode_insert_tuple`; `catalog_pages.rs` drives `Catalog::load`/`desc()` over
+  synthetic catalog pages incl. CLOG visibility. Extend it whenever a decode bug is found —
+  cheapest place to pin a layout.
 - `schema.rs` — "catalog lite": table descriptor via SQL at startup (M3 replaces this).
 - `txbuf.rs` — per-xid op buffering (Insert/Update/Delete with ctids + RowVersion) + per-txn
   overlays for intra-txn pre-images; commit merges subxacts LSN-sorted, abort discards.
