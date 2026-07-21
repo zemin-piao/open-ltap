@@ -127,14 +127,48 @@ fn cross_check(path: &str, cols_arg: &str) -> Result<()> {
     for (i, (w, g)) in want.iter().zip(&got).enumerate() {
         if w != g {
             mismatches += 1;
-            println!("  MISMATCH at offnum {}: real={w:?} rebuilt={g:?}", i + 1);
+            println!("  MISMATCH (semantic) at offnum {}: real={w:?} rebuilt={g:?}", i + 1);
         }
     }
     if mismatches == 0 {
-        println!("OK: all {live} tuples resolve identically through the rebuilt page");
+        println!("OK (semantic): all {live} tuples resolve identically through the rebuilt page");
+    }
+
+    // P6 byte-exact pass: extract each LP_NORMAL tuple's raw attribute bytes,
+    // rebuild the page through the raw path, and assert every datum region is
+    // preserved bit-for-bit — the property page demotion actually needs. (This
+    // doesn't need the column types; it never decodes.)
+    let mut raw_slots = Vec::with_capacity(slots.len());
+    for offnum in 1..=slots.len() as u16 {
+        let lp = reconstruct::line_pointer(&real, offnum)?;
+        raw_slots.push(match lp.flags {
+            1 => Slot::Raw(reconstruct::RawTuple::from_page(&real, offnum)?),
+            2 => Slot::Redirect(lp.off),
+            3 => Slot::Dead,
+            _ => Slot::Unused,
+        });
+    }
+    let raw_rebuilt = reconstruct::build_page(&desc, 0, 0, &raw_slots)?;
+    let mut byte_mismatch = 0;
+    for offnum in 1..=slots.len() as u16 {
+        if reconstruct::line_pointer(&real, offnum)?.flags != 1 {
+            continue;
+        }
+        let a = reconstruct::RawTuple::from_page(&real, offnum)?.attrs;
+        let b = reconstruct::RawTuple::from_page(&raw_rebuilt, offnum)?.attrs;
+        if a != b {
+            byte_mismatch += 1;
+            println!("  MISMATCH (byte-exact) at offnum {offnum}: {} vs {} bytes", a.len(), b.len());
+        }
+    }
+    if byte_mismatch == 0 {
+        println!("OK (byte-exact): all {live} datum regions preserved bit-for-bit via the raw path");
+    }
+
+    if mismatches == 0 && byte_mismatch == 0 {
         Ok(())
     } else {
-        bail!("{mismatches} offnum(s) did not round-trip")
+        bail!("{mismatches} semantic + {byte_mismatch} byte-exact offnum(s) did not round-trip")
     }
 }
 

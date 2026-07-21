@@ -434,6 +434,22 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   container + `(rel, key_range, lsn)` metadata and the pageserver tee that calls this
   (`create_image_layer_for_rel_blocks`) are fork-side, not built here. With `reconstruct` this
   closes the V2c *round trip* offline: page → visible rows → page.
+- **P6 bit-exact datums 2026-07-21 (reconstruct raw path)**: the semantic `encode_attrs` path is
+  byte-exact for fixed types but re-encodes varlenas as short (1-byte-header) datums — a value
+  PG stored with a 4-byte header, inline compression, or as a TOAST pointer would come back with
+  different bytes and cascade misalignment. Added a raw-bytes path (`src/reconstruct.rs`):
+  `Slot::Raw(RawTuple)` places the exact on-disk attribute region + null bitmap verbatim (only
+  the header — xmin/xmax/hint bits — is synthesized, legitimately), and `RawTuple::from_page`
+  extracts a byte-exact `RawTuple` from any heap page, so extract→rebuild reproduces the datum
+  region bit-for-bit. Refactored the shared 23-byte header + infomask out of `encode_tuple`.
+  Tests prove the raw path is byte-exact where the semantic path is NOT (a 4-byte-header varlena
+  round-trips exactly via raw, differs via semantic — both still decode to the same row), and a
+  from_page→raw rebuild preserves attr bytes incl. a null bitmap. `examples/rebuild.rs` gained a
+  byte-exact cross-check pass: against a REAL dumped page it now asserts every datum region is
+  preserved bit-for-bit through the raw path, not just semantically equal — the property page
+  demotion actually needs. Remaining P6: threading raw attrs through `fragment::emit_page` (so
+  the visibility/HOT-resolved fragment carries raw datums), and numeric/other types beyond the
+  supported set. This is exactly the Databricks "raw datums alongside semantic" shape.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
@@ -543,8 +559,10 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   8 KB heap page from decoded rows (LP_NORMAL/UNUSED/DEAD/REDIRECT, MAXALIGN'd tuples, frozen
   xmin, `pg_checksum_page`). The inverse of `wal::heap`'s page decode; validated by round-trip
   through `decode_tuple_from_page` (inline tests) + `examples/rebuild.rs` (cross-check a real
-  dumped page). Handles dropped columns (stored as NULL slots); still no on-page TOAST /
-  HOT-chain inference. `tests/roundtrip.rs` fuzzes rows→page→rows against `fragment`.
+  dumped page). Handles dropped columns (stored as NULL slots) and a **byte-exact `RawTuple`
+  path (P6)** — `Slot::Raw` places the exact on-disk datum bytes verbatim (4-byte varlena
+  headers, inline compression, TOAST pointers survive), `RawTuple::from_page` extracts them;
+  still no HOT-chain inference. `tests/roundtrip.rs` fuzzes rows→page→rows against `fragment`.
 - `fragment.rs` — V2b fragment emit (P2 + P3): `emit_page(page, block, desc, toast, clog)`
   decodes a materialized heap page into the rows a columnar fragment carries, each tagged with
   its index-addressable `(block, offnum)`, with CLOG@LSN visibility (aborted/deleted excluded)

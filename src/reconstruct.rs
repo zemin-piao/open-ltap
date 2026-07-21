@@ -90,11 +90,80 @@ impl TupleSpec {
     }
 }
 
+/// A tuple whose attribute region is placed on the page **byte-for-byte** — the
+/// P6 bit-exact path. `attrs` is the exact on-disk datum region (`tuple[t_hoff..]`)
+/// and `null_bitmap` the exact bitmap bytes, so 4-byte varlena headers, inline
+/// compression, TOAST pointers, and odd padding survive untouched — the cases
+/// re-encoding a semantic [`Row`] cannot reproduce. The header (xmin/xmax/hint
+/// bits) is still synthesized; only the datum bytes are preserved.
+#[derive(Debug, Clone)]
+pub struct RawTuple {
+    /// Exact bytes from t_hoff onward (the attribute region).
+    pub attrs: Vec<u8>,
+    /// Exact null-bitmap bytes; empty means the tuple had no HEAP_HASNULL.
+    /// Length, when non-empty, must be `ceil(natts / 8)`.
+    pub null_bitmap: Vec<u8>,
+    /// Physical attribute count (t_infomask2 low 11 bits).
+    pub natts: u16,
+    /// Whether HEAP_HASVARWIDTH was set (a cosmetic hint; not load-bearing).
+    pub has_varwidth: bool,
+    pub xmin: u32,
+    pub xmax: u32,
+    pub ctid: Option<(u32, u16)>,
+    pub heap_only: bool,
+    pub hot_updated: bool,
+}
+
+impl RawTuple {
+    /// Extract the byte-exact raw tuple at `offnum` from a heap page — the
+    /// inverse of placing one. Feeding this straight back into
+    /// [`Slot::Raw`] rebuilds the same attribute bytes verbatim.
+    pub fn from_page(page: &[u8], offnum: u16) -> Result<RawTuple> {
+        let lp = line_pointer(page, offnum)?;
+        if lp.flags != 1 {
+            bail!("offnum {offnum} is not LP_NORMAL");
+        }
+        let tup = page
+            .get(lp.off as usize..lp.off as usize + lp.len as usize)
+            .ok_or_else(|| anyhow::anyhow!("tuple {offnum} beyond page"))?;
+        if tup.len() < HEAP_TUPLE_HEADER_SIZE {
+            bail!("tuple {offnum} shorter than its header");
+        }
+        let bi_hi = u16::from_le_bytes([tup[12], tup[13]]) as u32;
+        let bi_lo = u16::from_le_bytes([tup[14], tup[15]]) as u32;
+        let ctid_off = u16::from_le_bytes([tup[16], tup[17]]);
+        let t_infomask2 = u16::from_le_bytes([tup[18], tup[19]]);
+        let t_infomask = u16::from_le_bytes([tup[20], tup[21]]);
+        let t_hoff = tup[22] as usize;
+        let natts = t_infomask2 & HEAP_NATTS_MASK;
+        let bitmap_len =
+            if t_infomask & HEAP_HASNULL != 0 { (natts as usize).div_ceil(8) } else { 0 };
+        let null_bitmap = tup
+            .get(HEAP_TUPLE_HEADER_SIZE..HEAP_TUPLE_HEADER_SIZE + bitmap_len)
+            .ok_or_else(|| anyhow::anyhow!("tuple {offnum} shorter than its null bitmap"))?
+            .to_vec();
+        let attrs = tup.get(t_hoff..).ok_or_else(|| anyhow::anyhow!("t_hoff past tuple end"))?.to_vec();
+        Ok(RawTuple {
+            attrs,
+            null_bitmap,
+            natts,
+            has_varwidth: t_infomask & HEAP_HASVARWIDTH != 0,
+            xmin: u32::from_le_bytes(tup[0..4].try_into().unwrap()),
+            xmax: u32::from_le_bytes(tup[4..8].try_into().unwrap()),
+            ctid: Some(((bi_hi << 16) | bi_lo, ctid_off)),
+            heap_only: t_infomask2 & HEAP_ONLY_TUPLE != 0,
+            hot_updated: t_infomask2 & HEAP_HOT_UPDATED != 0,
+        })
+    }
+}
+
 /// One line-pointer slot; slot index `i` is offnum `i + 1`.
 #[derive(Debug, Clone)]
 pub enum Slot {
-    /// A live tuple (LP_NORMAL).
+    /// A live tuple (LP_NORMAL), re-encoded from a semantic row.
     Tuple(TupleSpec),
+    /// A live tuple (LP_NORMAL) with byte-exact attribute bytes (P6).
+    Raw(RawTuple),
     /// LP_UNUSED — a reserved-but-empty slot.
     Unused,
     /// LP_DEAD — a dead line pointer (an index may still point here; the
@@ -134,15 +203,11 @@ pub fn build_page(desc: &TableDesc, block: u32, lsn: u64, slots: &[Slot]) -> Res
             }
             Slot::Tuple(spec) => {
                 let tup = encode_tuple(desc, block, offnum, spec)?;
-                let slot_size = maxalign(tup.len());
-                if pd_upper < pd_lower + slot_size {
-                    bail!("reconstruct: page overflow placing tuple at offnum {offnum}");
-                }
-                pd_upper -= slot_size;
-                page[pd_upper..pd_upper + tup.len()].copy_from_slice(&tup);
-                // [pd_upper + tup.len() .. pd_upper + slot_size) is alignment
-                // padding and stays zero, exactly as heapam leaves it.
-                (pd_upper as u32) | (LP_NORMAL << 15) | ((tup.len() as u32) << 17)
+                place_tuple(&mut page, &mut pd_upper, pd_lower, &tup, offnum)?
+            }
+            Slot::Raw(rt) => {
+                let tup = encode_raw_tuple(block, offnum, rt)?;
+                place_tuple(&mut page, &mut pd_upper, pd_lower, &tup, offnum)?
             }
         };
         let idx = PAGE_HEADER_SIZE + i * ITEM_ID_SIZE;
@@ -179,16 +244,6 @@ fn encode_tuple(desc: &TableDesc, block: u32, offnum: u16, spec: &TupleSpec) -> 
     let bitmap_len = if has_nulls { natts.div_ceil(8) } else { 0 };
     let t_hoff = maxalign(HEAP_TUPLE_HEADER_SIZE + bitmap_len);
 
-    let mut tup = vec![0u8; t_hoff];
-    tup[0..4].copy_from_slice(&spec.xmin.to_le_bytes()); // t_xmin
-    tup[4..8].copy_from_slice(&spec.xmax.to_le_bytes()); // t_xmax
-    // t_field3 (t_cid / t_xvac) @8..12 stays 0.
-    // t_ctid @12..18: BlockIdData { bi_hi u16, bi_lo u16 } + ip_posid u16.
-    let (cblk, coff) = spec.ctid.unwrap_or((block, offnum));
-    tup[12..14].copy_from_slice(&((cblk >> 16) as u16).to_le_bytes()); // bi_hi
-    tup[14..16].copy_from_slice(&((cblk & 0xffff) as u16).to_le_bytes()); // bi_lo
-    tup[16..18].copy_from_slice(&coff.to_le_bytes()); // ip_posid
-
     let mut t_infomask2 = (natts as u16) & HEAP_NATTS_MASK;
     if spec.heap_only {
         t_infomask2 |= HEAP_ONLY_TUPLE;
@@ -196,28 +251,18 @@ fn encode_tuple(desc: &TableDesc, block: u32, offnum: u16, spec: &TupleSpec) -> 
     if spec.hot_updated {
         t_infomask2 |= HEAP_HOT_UPDATED;
     }
-    tup[18..20].copy_from_slice(&t_infomask2.to_le_bytes());
-
-    let mut t_infomask = 0u16;
-    if spec.xmax == 0 {
-        t_infomask |= HEAP_XMAX_INVALID;
-    }
-    if spec.xmin == FROZEN_XID {
-        t_infomask |= HEAP_XMIN_FROZEN;
-    }
-    if has_nulls {
-        t_infomask |= HEAP_HASNULL;
-    }
     let has_varwidth = desc
         .cols
         .iter()
         .zip(&spec.row)
         .any(|(c, v)| v.is_some() && matches!(c.ty, crate::schema::PgType::Text | crate::schema::PgType::Bytea));
-    if has_varwidth {
-        t_infomask |= HEAP_HASVARWIDTH;
-    }
-    tup[20..22].copy_from_slice(&t_infomask.to_le_bytes());
-    tup[22] = t_hoff as u8;
+    let t_infomask = infomask(spec.xmin, spec.xmax, has_nulls, has_varwidth);
+    let (cblk, coff) = spec.ctid.unwrap_or((block, offnum));
+
+    let mut tup = vec![0u8; t_hoff];
+    tup[..HEAP_TUPLE_HEADER_SIZE].copy_from_slice(&heap_header(
+        spec.xmin, spec.xmax, cblk, coff, t_infomask2, t_infomask, t_hoff as u8,
+    ));
 
     // Null bitmap over *physical* slots: a set bit means present. A live slot
     // is present iff its row value is Some; a dropped slot is always NULL
@@ -236,6 +281,105 @@ fn encode_tuple(desc: &TableDesc, block: u32, offnum: u16, spec: &TupleSpec) -> 
 
     tup.extend_from_slice(&attrs);
     Ok(tup)
+}
+
+/// Place an encoded tuple at the current `pd_upper`, MAXALIGN'd, and return its
+/// LP_NORMAL item id. Shared by the semantic and byte-exact tuple arms.
+fn place_tuple(
+    page: &mut [u8],
+    pd_upper: &mut usize,
+    pd_lower: usize,
+    tup: &[u8],
+    offnum: u16,
+) -> Result<u32> {
+    let slot_size = maxalign(tup.len());
+    if *pd_upper < pd_lower + slot_size {
+        bail!("reconstruct: page overflow placing tuple at offnum {offnum}");
+    }
+    *pd_upper -= slot_size;
+    page[*pd_upper..*pd_upper + tup.len()].copy_from_slice(tup);
+    // [*pd_upper + tup.len() .. *pd_upper + slot_size) is alignment padding and
+    // stays zero, exactly as heapam leaves it.
+    Ok((*pd_upper as u32) | (LP_NORMAL << 15) | ((tup.len() as u32) << 17))
+}
+
+/// Encode a byte-exact tuple (P6): a synthesized header + the raw null bitmap
+/// and attribute bytes placed verbatim. The attribute region is reproduced
+/// bit-for-bit — the point of the raw path.
+fn encode_raw_tuple(block: u32, offnum: u16, rt: &RawTuple) -> Result<Vec<u8>> {
+    let has_nulls = !rt.null_bitmap.is_empty();
+    let expected = if has_nulls { (rt.natts as usize).div_ceil(8) } else { 0 };
+    if rt.null_bitmap.len() != expected {
+        bail!(
+            "reconstruct: raw null bitmap is {} bytes, natts {} needs {expected}",
+            rt.null_bitmap.len(),
+            rt.natts
+        );
+    }
+    let t_hoff = maxalign(HEAP_TUPLE_HEADER_SIZE + rt.null_bitmap.len());
+
+    let mut t_infomask2 = rt.natts & HEAP_NATTS_MASK;
+    if rt.heap_only {
+        t_infomask2 |= HEAP_ONLY_TUPLE;
+    }
+    if rt.hot_updated {
+        t_infomask2 |= HEAP_HOT_UPDATED;
+    }
+    let t_infomask = infomask(rt.xmin, rt.xmax, has_nulls, rt.has_varwidth);
+    let (cblk, coff) = rt.ctid.unwrap_or((block, offnum));
+
+    let mut tup = vec![0u8; t_hoff];
+    tup[..HEAP_TUPLE_HEADER_SIZE]
+        .copy_from_slice(&heap_header(rt.xmin, rt.xmax, cblk, coff, t_infomask2, t_infomask, t_hoff as u8));
+    tup[HEAP_TUPLE_HEADER_SIZE..HEAP_TUPLE_HEADER_SIZE + rt.null_bitmap.len()]
+        .copy_from_slice(&rt.null_bitmap);
+    tup.extend_from_slice(&rt.attrs);
+    Ok(tup)
+}
+
+/// t_infomask for a rebuilt tuple: `HEAP_XMAX_INVALID` when there's no deleter,
+/// the frozen-xmin hint when xmin is `FrozenTransactionId`, plus the structural
+/// HASNULL / HASVARWIDTH flags. (Other hint bits are legitimately absent — they
+/// are set opportunistically on read and may differ, per P5.)
+fn infomask(xmin: u32, xmax: u32, has_nulls: bool, has_varwidth: bool) -> u16 {
+    let mut m = 0u16;
+    if xmax == 0 {
+        m |= HEAP_XMAX_INVALID;
+    }
+    if xmin == FROZEN_XID {
+        m |= HEAP_XMIN_FROZEN;
+    }
+    if has_nulls {
+        m |= HEAP_HASNULL;
+    }
+    if has_varwidth {
+        m |= HEAP_HASVARWIDTH;
+    }
+    m
+}
+
+/// The fixed 23-byte HeapTupleHeaderData prefix (t_field3 stays zero — it holds
+/// a command id / xvac we don't reproduce).
+fn heap_header(
+    xmin: u32,
+    xmax: u32,
+    ctid_block: u32,
+    ctid_off: u16,
+    t_infomask2: u16,
+    t_infomask: u16,
+    t_hoff: u8,
+) -> [u8; HEAP_TUPLE_HEADER_SIZE] {
+    let mut t = [0u8; HEAP_TUPLE_HEADER_SIZE];
+    t[0..4].copy_from_slice(&xmin.to_le_bytes()); // t_xmin
+    t[4..8].copy_from_slice(&xmax.to_le_bytes()); // t_xmax
+    // t_ctid @12..18: BlockIdData { bi_hi u16, bi_lo u16 } + ip_posid u16.
+    t[12..14].copy_from_slice(&((ctid_block >> 16) as u16).to_le_bytes());
+    t[14..16].copy_from_slice(&((ctid_block & 0xffff) as u16).to_le_bytes());
+    t[16..18].copy_from_slice(&ctid_off.to_le_bytes());
+    t[18..20].copy_from_slice(&t_infomask2.to_le_bytes());
+    t[20..22].copy_from_slice(&t_infomask.to_le_bytes());
+    t[22] = t_hoff;
+    t
 }
 
 fn write_page_header(page: &mut [u8], lsn: u64, pd_lower: u16, pd_upper: u16) {
@@ -350,6 +494,61 @@ mod tests {
         let page = build_page(&desc(), 5, 0, &[Slot::live(row(1, "hello"))]).unwrap();
         assert_eq!(page.len(), PAGE_SIZE);
         assert_eq!(read(&page, 1), row(1, "hello"));
+    }
+
+    #[test]
+    fn raw_path_is_byte_exact_where_semantic_is_not() {
+        // "hello" stored as a 4-byte-header varlena — a shape PG writes but our
+        // semantic re-encode (a 1-byte short varlena) cannot reproduce.
+        let payload = b"hello";
+        let mut raw_attrs = 7i32.to_le_bytes().to_vec();
+        let total = (4 + payload.len()) as u32;
+        raw_attrs.extend_from_slice(&(total << 2).to_le_bytes()); // 4-byte varlena header
+        raw_attrs.extend_from_slice(payload);
+
+        let rt = RawTuple {
+            attrs: raw_attrs.clone(),
+            null_bitmap: vec![],
+            natts: 2,
+            has_varwidth: true,
+            xmin: FROZEN_XID,
+            xmax: 0,
+            ctid: None,
+            heap_only: false,
+            hot_updated: false,
+        };
+        let page = build_page(&desc(), 3, 0, &[Slot::Raw(rt)]).unwrap();
+
+        // The datum region is preserved bit-for-bit...
+        assert_eq!(RawTuple::from_page(&page, 1).unwrap().attrs, raw_attrs);
+        // ...and still decodes to the right row.
+        assert_eq!(read(&page, 1), row(7, "hello"));
+
+        // Contrast: the semantic path yields DIFFERENT bytes for the same row
+        // (a short varlena), though it too decodes correctly.
+        let semantic = build_page(&desc(), 3, 0, &[Slot::live(row(7, "hello"))]).unwrap();
+        let semantic_attrs = RawTuple::from_page(&semantic, 1).unwrap().attrs;
+        assert_ne!(semantic_attrs, raw_attrs, "short vs 4-byte varlena headers must differ");
+        assert_eq!(read(&semantic, 1), row(7, "hello"));
+    }
+
+    #[test]
+    fn from_page_then_raw_rebuild_preserves_attr_bytes() {
+        // Extract each tuple's raw attrs from a page, rebuild via the raw path,
+        // and assert the attribute region is identical — incl. a null bitmap.
+        let page = build_page(
+            &desc(),
+            9,
+            0,
+            &[Slot::live(row(1, "a")), Slot::live(vec![Some(Value::I32(2)), None])],
+        )
+        .unwrap();
+        for offnum in [1u16, 2] {
+            let rt = RawTuple::from_page(&page, offnum).unwrap();
+            let orig = rt.attrs.clone();
+            let rebuilt = build_page(&desc(), 9, 0, &[Slot::Raw(rt)]).unwrap();
+            assert_eq!(RawTuple::from_page(&rebuilt, 1).unwrap().attrs, orig);
+        }
     }
 
     #[test]
