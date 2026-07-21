@@ -493,6 +493,17 @@ New machinery:
   fragment's LSN. V2a's commit-ordered log *is* a valid tail feed, so V2b's reader can be
   M4's `serve.rs` merged with fragment coverage tracking.
 
+*Status (2026-07-21): the page → rows decode (P2 + P3) exists — `src/fragment.rs`.*
+`emit_page(page, block, desc, toast, clog)` decodes a materialized page into `(block, offnum,
+row)` entries: per-version visibility through a `ClogSource` (aborted inserts and committed-
+deleted versions excluded — "committed as of this LSN"), and HOT chains collapsed to the visible
+version while keeping the chain **root** offnum as the row's index address (LP_REDIRECT roots
+followed, heap-only tuples skipped as roots, `t_ctid`/HEAP_HOT_UPDATED walked). It's a pure async
+fn validated against its inverse `reconstruct::build_page` + a fake CLOG (7 tests), so the V2c
+round trip — page → visible rows → page — is closed offline. Not built here (fork-side): the
+Parquet container + `(rel, key_range, lsn)` metadata, and the `create_image_layer_for_rel_blocks`
+tee that feeds it. Bit-exact datums (P6) are orthogonal and still open.
+
 **Gate to V2c** (this is the research gate): a written design, validated by prototype, for
 byte-placement-exact heap page reconstruction (P5) *and* an answer for GC/PITR/branching (P7).
 If either fails, V2b is still a shippable end state — "Parquet image tier, row layers retained"

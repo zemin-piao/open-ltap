@@ -414,6 +414,25 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   the shape). The **checksum is spec-faithful but NOT yet cross-checked against a real
   data-checksums cluster** — that plus pg_filedump/amcheck is the live-gauntlet step. This is
   the V2c research gate's forward-looking half; the fragment *emit* side (V2b) is the pair.
+- **V2b fragment-emit prototype 2026-07-21 (P2 + P3 — pairs with the reverse path)**:
+  `src/fragment.rs` `emit_page(page, block, desc, toast, clog)` is the forward half of the V2c
+  round trip — decode a materialized 8 KB heap page into the rows a columnar fragment carries,
+  each tagged with its index-addressable `(block, offnum)`. Visibility is resolved per tuple
+  version against a `ClogSource` (P2 — "committed as of this LSN"; aborted inserts and
+  committed-deleted versions are excluded, in-progress writers arrive later via the tail), and
+  HOT chains are collapsed to their single visible version while the row's address stays the
+  chain **root** line pointer an index points at (P3 — LP_REDIRECT roots followed to their
+  target, heap-only tuples skipped as roots, `t_ctid` + HEAP_HOT_UPDATED walked to the live
+  version). Reuses the existing `clog::tuple_visible` and `decode_tuple_from_page`; the whole
+  thing is a pure async fn so every case is pinned offline. Validated by 7 tests **against its
+  own inverse** (`reconstruct::build_page` builds pages with injected xmin/xmax/ctid/HOT shapes
+  + a fake CLOG, `emit_page` decodes them back): frozen rows, aborted-insert exclusion,
+  committed-delete exclusion, HOT-chain collapse to the live version at the root offnum,
+  LP_REDIRECT following, UNUSED/DEAD skipping, and a clean rows→page→rows round trip.
+  **Gaps**: semantic rows only (bit-exact datums = P6, orthogonal); the real fragment's Parquet
+  container + `(rel, key_range, lsn)` metadata and the pageserver tee that calls this
+  (`create_image_layer_for_rel_blocks`) are fork-side, not built here. With `reconstruct` this
+  closes the V2c *round trip* offline: page → visible rows → page.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
@@ -523,6 +542,11 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   xmin, `pg_checksum_page`). The inverse of `wal::heap`'s page decode; validated by round-trip
   through `decode_tuple_from_page` (inline tests) + `examples/rebuild.rs` (cross-check a real
   dumped page). Prototype: no dropped cols / on-page TOAST / HOT-chain inference yet.
+- `fragment.rs` — V2b fragment emit (P2 + P3): `emit_page(page, block, desc, toast, clog)`
+  decodes a materialized heap page into the rows a columnar fragment carries, each tagged with
+  its index-addressable `(block, offnum)`, with CLOG@LSN visibility (aborted/deleted excluded)
+  and HOT chains collapsed to the visible version at the root offnum. The forward half of the
+  V2c round trip — inverse of `reconstruct` — and validated against it offline.
 - Little-endian only, 64-bit maxalign assumed. **PG17 + PG18 verified** (2026-07-04: full M2
   gauntlet incl. FPI/COPY/TOAST/restart passed identically on 18.4; every layout we parse is
   unchanged between 17 and 18). `XLOG_PAGE_MAGICS` in `wal/mod.rs` allowlists verified majors

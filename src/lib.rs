@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod clog;
 pub mod embed;
 pub mod engine;
+pub mod fragment;
 pub mod multixact;
 pub mod pgwire;
 pub mod reconstruct;
