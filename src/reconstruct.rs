@@ -114,11 +114,6 @@ impl Slot {
 /// Rebuild the heap page at `block` holding `slots` (offnum = index + 1),
 /// stamping page LSN `lsn`. Returns the 8192-byte page.
 pub fn build_page(desc: &TableDesc, block: u32, lsn: u64, slots: &[Slot]) -> Result<Vec<u8>> {
-    if desc.phys.len() != desc.cols.len()
-        || desc.phys.iter().any(|p| matches!(p, PhysCol::Dropped { .. }))
-    {
-        bail!("reconstruct: descriptors with dropped columns are not supported yet");
-    }
     let mut page = vec![0u8; PAGE_SIZE];
     let pd_lower = PAGE_HEADER_SIZE + slots.len() * ITEM_ID_SIZE;
     if pd_lower > PAGE_SIZE {
@@ -163,9 +158,9 @@ pub fn build_page(desc: &TableDesc, block: u32, lsn: u64, slots: &[Slot]) -> Res
 /// Encode one on-disk heap tuple: HeapTupleHeaderData + null bitmap + padding
 /// to t_hoff + the attribute bytes (the inverse of `decode_tuple_payload`).
 fn encode_tuple(desc: &TableDesc, block: u32, offnum: u16, spec: &TupleSpec) -> Result<Vec<u8>> {
-    let natts = desc.cols.len();
-    if spec.row.len() != natts {
-        bail!("reconstruct: row has {} values, table has {natts} columns", spec.row.len());
+    let n_live = desc.cols.len();
+    if spec.row.len() != n_live {
+        bail!("reconstruct: row has {} values, table has {n_live} live columns", spec.row.len());
     }
     let attrs = encode_attrs(&spec.row, desc).ok_or_else(|| {
         anyhow::anyhow!(
@@ -174,7 +169,13 @@ fn encode_tuple(desc: &TableDesc, block: u32, offnum: u16, spec: &TupleSpec) -> 
         )
     })?;
 
-    let has_nulls = spec.row.iter().any(|v| v.is_none());
+    // natts counts *physical* slots (heapam stores dropped columns as slots),
+    // and a dropped column is always NULL in a freshly written tuple — so a
+    // descriptor with any dropped column forces a null bitmap.
+    let natts = desc.phys.len();
+    let has_dropped = desc.phys.iter().any(|p| matches!(p, PhysCol::Dropped { .. }));
+    let has_null_live = spec.row.iter().any(|v| v.is_none());
+    let has_nulls = has_dropped || has_null_live;
     let bitmap_len = if has_nulls { natts.div_ceil(8) } else { 0 };
     let t_hoff = maxalign(HEAP_TUPLE_HEADER_SIZE + bitmap_len);
 
@@ -218,11 +219,17 @@ fn encode_tuple(desc: &TableDesc, block: u32, offnum: u16, spec: &TupleSpec) -> 
     tup[20..22].copy_from_slice(&t_infomask.to_le_bytes());
     tup[22] = t_hoff as u8;
 
-    // Null bitmap: a set bit means the attribute is PRESENT (heapam's t_bits).
+    // Null bitmap over *physical* slots: a set bit means present. A live slot
+    // is present iff its row value is Some; a dropped slot is always NULL
+    // (bit clear), which is how heapam writes new tuples of an altered table.
     if has_nulls {
-        for (i, v) in spec.row.iter().enumerate() {
-            if v.is_some() {
-                tup[HEAP_TUPLE_HEADER_SIZE + i / 8] |= 1 << (i % 8);
+        let mut live_i = 0usize;
+        for (i, pc) in desc.phys.iter().enumerate() {
+            if let PhysCol::Live(_) = pc {
+                if spec.row[live_i].is_some() {
+                    tup[HEAP_TUPLE_HEADER_SIZE + i / 8] |= 1 << (i % 8);
+                }
+                live_i += 1;
             }
         }
     }
@@ -447,10 +454,32 @@ mod tests {
     }
 
     #[test]
-    fn dropped_columns_are_rejected_for_now() {
-        let mut d = desc();
-        d.phys.push(PhysCol::Dropped { attlen: 4, align: 4 });
-        assert!(build_page(&d, 0, 0, &[Slot::live(row(1, "x"))]).is_err());
+    fn dropped_column_round_trips() {
+        // (id int4, <dropped int4>, txt text): heapam stores the dropped slot as
+        // NULL, so a null bitmap appears even when both live values are present.
+        use crate::schema::{Col, PgType};
+        let cols =
+            vec![Col { name: "id".into(), ty: PgType::Int4 }, Col { name: "txt".into(), ty: PgType::Text }];
+        let d = TableDesc {
+            name: "t".into(),
+            oid: 40000,
+            db_oid: 5,
+            rel_node: 40000,
+            toast_rel_node: None,
+            phys: vec![
+                PhysCol::Live(cols[0].clone()),
+                PhysCol::Dropped { attlen: 4, align: 4 },
+                PhysCol::Live(cols[1].clone()),
+            ],
+            cols,
+            has_fast_defaults: false,
+            pk: vec!["id".into()],
+        };
+        let page = build_page(&d, 0, 0, &[Slot::live(row(7, "hi")), Slot::live(vec![Some(Value::I32(8)), None])])
+            .unwrap();
+        let dec = |o| decode_tuple_from_page(&page, o, &d, &ToastCache::default()).unwrap().0;
+        assert_eq!(dec(1), row(7, "hi"));
+        assert_eq!(dec(2), vec![Some(Value::I32(8)), None]); // live NULL alongside the dropped slot
     }
 
     #[test]

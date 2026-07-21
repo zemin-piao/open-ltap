@@ -406,12 +406,13 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   (checksum_impl.h). Validated offline by round-trip: a built page decoded back through
   `decode_tuple_from_page` yields the exact input rows — 10 inline tests (single/multi-row, gaps,
   nulls in both positions, MAXALIGN non-overlap, checksum verify+sensitivity, redirect/dead LPs,
-  a HOT root→child chain, dropped-col + oversized-varlena rejection). `examples/rebuild.rs` is a
-  reviewer harness: `real=<page-file> cols=…` decodes a REAL dumped heap page, rebuilds it, and
-  asserts every offnum resolves identically (`emit=<path>` writes a demo page). **Honest gaps**
-  (all flagged in the module doc): no dropped-column descriptors, no on-page TOAST/compressed/
-  >126-byte varlenas (P6 overflow-text side channel), no HOT-chain *inference* (caller supplies
-  the shape). The **checksum is spec-faithful but NOT yet cross-checked against a real
+  a HOT root→child chain, a dropped-column round trip, oversized-varlena rejection).
+  `examples/rebuild.rs` is a reviewer harness: `real=<page-file> cols=…` decodes a REAL dumped
+  heap page, rebuilds it, and asserts every offnum resolves identically (`emit=<path>` writes a
+  demo page). Dropped columns are handled (stored as NULL slots, `natts` = physical slot count).
+  **Honest gaps** (all flagged in the module doc): no on-page TOAST/compressed/>126-byte
+  varlenas (P6 overflow-text side channel), no HOT-chain *inference* (caller supplies the
+  shape). The **checksum is spec-faithful but NOT yet cross-checked against a real
   data-checksums cluster** — that plus pg_filedump/amcheck is the live-gauntlet step. This is
   the V2c research gate's forward-looking half; the fragment *emit* side (V2b) is the pair.
 - **V2b fragment-emit prototype 2026-07-21 (P2 + P3 — pairs with the reverse path)**:
@@ -505,8 +506,9 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   TOAST decode; `compression.rs` covers the lz4/zstd codecs + page-image restore;
   `varlena_compression.rs` drives inline + out-of-line compressed varlenas (pglz/lz4) through
   the real `decode_insert_tuple`; `catalog_pages.rs` drives `Catalog::load`/`desc()` over
-  synthetic catalog pages incl. CLOG visibility. Extend it whenever a decode bug is found —
-  cheapest place to pin a layout.
+  synthetic catalog pages incl. CLOG visibility; `roundtrip.rs` fuzzes rows→page→rows through
+  `reconstruct::build_page` + `fragment::emit_page` (V2c round trip). Extend it whenever a decode
+  bug is found — cheapest place to pin a layout.
 - `schema.rs` — "catalog lite": table descriptor via SQL. `TableDesc` carries the stable
   `pg_class` OID; `discover_by_oid` re-resolves a tracked table by that OID (rename- and
   rewrite-proof), and `list_tables` returns `(oid, name)` so auto-attach keys on identity.
@@ -541,7 +543,8 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   8 KB heap page from decoded rows (LP_NORMAL/UNUSED/DEAD/REDIRECT, MAXALIGN'd tuples, frozen
   xmin, `pg_checksum_page`). The inverse of `wal::heap`'s page decode; validated by round-trip
   through `decode_tuple_from_page` (inline tests) + `examples/rebuild.rs` (cross-check a real
-  dumped page). Prototype: no dropped cols / on-page TOAST / HOT-chain inference yet.
+  dumped page). Handles dropped columns (stored as NULL slots); still no on-page TOAST /
+  HOT-chain inference. `tests/roundtrip.rs` fuzzes rows→page→rows against `fragment`.
 - `fragment.rs` — V2b fragment emit (P2 + P3): `emit_page(page, block, desc, toast, clog)`
   decodes a materialized heap page into the rows a columnar fragment carries, each tagged with
   its index-addressable `(block, offnum)`, with CLOG@LSN visibility (aborted/deleted excluded)

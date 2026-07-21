@@ -565,10 +565,12 @@ question. *Approach: prototype as a pure function `(fragments, tail) → page` v
 block, lsn, slots)` is the inverse of `wal::heap`'s page decode: exact line-pointer placement
 (LP_NORMAL/UNUSED/DEAD/REDIRECT), MAXALIGN'd tuple packing, frozen xmin by default with
 per-tuple xmin/xmax/ctid/HOT flags, and `pg_checksum_page`. Validated offline by round-trip
-(a built page decoded back through `decode_tuple_from_page` returns the exact rows — 10 tests)
-and by `examples/rebuild.rs`, which rebuilds a *real* dumped heap page and checks every offnum
-resolves identically. Not yet: dropped columns, on-page TOAST/compressed varlenas (that's the
-P6 dependency), HOT-chain *inference* (the caller supplies the chain shape), and a
+(a built page decoded back through `decode_tuple_from_page` returns the exact rows) and by
+`examples/rebuild.rs`, which rebuilds a *real* dumped heap page and checks every offnum resolves
+identically; `tests/roundtrip.rs` then fuzzes thousands of random pages (mixed types, NULLs,
+gaps, padding) through build→emit. Dropped columns are handled (stored as NULL slots). Not yet:
+on-page TOAST/compressed varlenas (that's the P6 dependency), HOT-chain *inference* (the caller
+supplies the chain shape), and a
 `pg_filedump`/amcheck + data-checksums cross-check against a live cluster (the checksum is
 spec-faithful but unverified live). The `(fragments, tail) → slots` front half is V2b's job.
 
