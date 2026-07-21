@@ -6,12 +6,14 @@
 //! with `ZSTD_compress` (a standard zstd frame) — the exact formats
 //! `lz4_flex::block` and the `zstd` crate produce. So round-tripping a payload
 //! through those reference encoders and decoding it with our paths exercises
-//! the decoders faithfully without a live Postgres to emit the bytes. (pglz is
-//! also covered end-to-end by the live gauntlet and the neon_dialect suite;
-//! here we only pin that `decompress_datum` routes method 0 to it.)
+//! the decoders faithfully without a live Postgres to emit the bytes. pglz has
+//! no reference *encoder* here, so its all-literal round-trip is checked via
+//! `decompress_datum` dispatch and its back-reference machinery (offsets,
+//! overlapping copies, the len==18 escape, bounds checks) via hand-built
+//! streams at the bottom of the file.
 
 use open_ltap::wal::PageImage;
-use open_ltap::wal::heap::{decompress_datum, lz4_decompress};
+use open_ltap::wal::heap::{decompress_datum, lz4_decompress, pglz_decompress};
 
 const BLCKSZ: usize = 8192;
 
@@ -103,4 +105,54 @@ fn fpi_zstd_no_hole() {
         bimg_info: COMPRESS_ZSTD,
     };
     assert_eq!(img.restore().unwrap(), page);
+}
+
+// ---------------------------------------------------------------------------
+// pglz back-references — the part of pglz_decompress no other test reaches.
+// Everything elsewhere feeds all-literal streams (control byte 0x00); the
+// back-reference machinery (offset math, self-overlapping copies, the len==18
+// extended-length escape, and the bounds checks) only ran under the live
+// gauntlet until now. Streams are hand-built to the common/pg_lzcompress.c
+// format: a control byte's bits (LSB first) select literal (0) or a 2-byte
+// back-reference (1); a reference encodes len = (b0 & 0x0F) + 3 and
+// off = ((b0 & 0xF0) << 4) | b1, and when len hits 18 a third byte extends it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pglz_simple_backreference() {
+    // "abc" then copy 3 bytes from offset 3 → "abcabc".
+    // ctrl 0x08: items 0..2 literal, item 3 a back-reference.
+    let stream = [0x08, b'a', b'b', b'c', /*len-3=0,off hi*/ 0x00, /*off lo=3*/ 0x03];
+    assert_eq!(pglz_decompress(&stream, 6).unwrap(), b"abcabc");
+}
+
+#[test]
+fn pglz_overlapping_backreference() {
+    // literal 'a', then a length-5 copy from offset 1 — the source overlaps the
+    // destination byte-by-byte (RLE), the trickiest copy in the decoder.
+    // ctrl 0x02: item 0 literal, item 1 back-reference. len-3=2 → 0x02; off=1.
+    let stream = [0x02, b'a', 0x02, 0x01];
+    assert_eq!(pglz_decompress(&stream, 6).unwrap(), b"aaaaaa");
+}
+
+#[test]
+fn pglz_extended_length_backreference() {
+    // literal 'x', then a copy longer than 18 (the escape: low nibble 0x0F makes
+    // len==18, then a third byte adds 3 → len 21) from offset 1 → 22 x's.
+    let stream = [0x02, b'x', 0x0F, 0x01, 0x03];
+    assert_eq!(pglz_decompress(&stream, 22).unwrap(), &[b'x'; 22]);
+}
+
+#[test]
+fn pglz_backreference_before_any_output_is_rejected() {
+    // A reference at output position 0 (off > out.len()) must error, not panic.
+    let stream = [0x01, 0x00, 0x05];
+    assert!(pglz_decompress(&stream, 4).is_err());
+}
+
+#[test]
+fn pglz_short_output_is_rejected() {
+    // Two literals but a claimed rawsize of 5 → decoder must reject the shortfall.
+    let stream = [0x00, b'h', b'i'];
+    assert!(pglz_decompress(&stream, 5).is_err());
 }
