@@ -198,13 +198,15 @@ pub struct PageImage {
 
 impl PageImage {
     pub fn restore(&self) -> Result<Vec<u8>> {
+        let raw = XLOG_BLCKSZ - self.hole_len as usize;
         let body: std::borrow::Cow<[u8]> = match self.bimg_info & BKPIMAGE_COMPRESS_MASK {
             0 => self.data.as_slice().into(),
-            BKPIMAGE_COMPRESS_PGLZ => {
-                let raw = XLOG_BLCKSZ - self.hole_len as usize;
-                heap::pglz_decompress(&self.data, raw)?.into()
-            }
-            m => bail!("unsupported page-image compression {m:#x} (set wal_compression=off or pglz)"),
+            BKPIMAGE_COMPRESS_PGLZ => heap::pglz_decompress(&self.data, raw)?.into(),
+            BKPIMAGE_COMPRESS_LZ4 => heap::lz4_decompress(&self.data, raw)?.into(),
+            BKPIMAGE_COMPRESS_ZSTD => zstd::bulk::decompress(&self.data, raw)
+                .map_err(|e| anyhow::anyhow!("zstd page image: {e}"))?
+                .into(),
+            m => bail!("unsupported page-image compression {m:#x}"),
         };
         let hole_off = self.hole_offset as usize;
         let hole_len = self.hole_len as usize;
@@ -254,6 +256,8 @@ const BKPBLOCK_SAME_REL: u8 = 0x80;
 // bimg_info bits
 const BKPIMAGE_HAS_HOLE: u8 = 0x01;
 const BKPIMAGE_COMPRESS_PGLZ: u8 = 0x04;
+const BKPIMAGE_COMPRESS_LZ4: u8 = 0x08;
+const BKPIMAGE_COMPRESS_ZSTD: u8 = 0x10;
 const BKPIMAGE_COMPRESS_MASK: u8 = 0x04 | 0x08 | 0x10; // pglz | lz4 | zstd
 
 const XLR_BLOCK_ID_DATA_SHORT: u8 = 255;

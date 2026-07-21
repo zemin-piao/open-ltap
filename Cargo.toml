@@ -10,13 +10,16 @@ chrono = "0.4.45"
 crc32c = "0.6.8"
 deltalake = { version = "0.32.4", features = ["s3"] }
 futures-util = "0.3.32"
+# TOAST/inline lz4 datums + wal_compression=lz4 page images (raw LZ4 block format).
+lz4_flex = "0.11"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-postgres = "0.7.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
+# wal_compression=zstd page images; also layerscan example (pageserver image
+# blobs default to zstd(1)).
+zstd = "0.13"
 
 [dev-dependencies]
 crc32c = "0.6.8"
-# layerscan example: pageserver image-layer blobs default to zstd(1)
-zstd = "0.13"

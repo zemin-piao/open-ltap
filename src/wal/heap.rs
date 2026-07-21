@@ -669,11 +669,7 @@ fn decode_varlena(data: &[u8], mut off: usize, toast: &ToastCache) -> Result<(Op
         let payload = data
             .get(off + 8..off + total)
             .ok_or_else(|| anyhow::anyhow!("truncated compressed varlena body"))?;
-        let out = match method {
-            0 => pglz_decompress(payload, rawsize)?,
-            1 => bail!("lz4-compressed value: set default_toast_compression=pglz (lz4 unsupported)"),
-            m => bail!("unknown toast compression method {m}"),
-        };
+        let out = decompress_datum(method, payload, rawsize)?;
         return Ok((Some(out), off + total));
     }
     let payload =
@@ -739,11 +735,7 @@ impl ToastCache {
         // value carries) *before* the real pglz/lz4 stream — so `buf` has that
         // header baked in and must be skipped, not just the stored payload.
         let payload = buf.get(4..).ok_or_else(|| anyhow::anyhow!("toast value {valueid}: too short for a compression header"))?;
-        match extinfo >> 30 {
-            0 => pglz_decompress(payload, raw_data),
-            1 => bail!("lz4-compressed toast value: set default_toast_compression=pglz"),
-            m => bail!("unknown toast compression method {m}"),
-        }
+        decompress_datum(extinfo >> 30, payload, raw_data)
     }
 }
 
@@ -828,4 +820,30 @@ pub fn pglz_decompress(src: &[u8], rawsize: usize) -> Result<Vec<u8>> {
         bail!("pglz: expected {rawsize} bytes, produced {}", out.len());
     }
     Ok(out)
+}
+
+/// Raw LZ4 block-format decompression. Postgres compresses both TOAST datums
+/// (`lz4_compress_datum`, `toast_compression.h` method 1) and WAL full-page
+/// images (`wal_compression=lz4`) with `LZ4_compress_default` — the raw block
+/// format, with no frame header or size prefix — so the exact uncompressed
+/// length, known from the varlena/page geometry, must be supplied.
+pub fn lz4_decompress(src: &[u8], rawsize: usize) -> Result<Vec<u8>> {
+    let out = lz4_flex::block::decompress(src, rawsize)
+        .map_err(|e| anyhow::anyhow!("lz4 decompress: {e}"))?;
+    if out.len() != rawsize {
+        bail!("lz4: expected {rawsize} bytes, produced {}", out.len());
+    }
+    Ok(out)
+}
+
+/// Decompress a TOAST/inline datum body by its 2-bit compression method
+/// (`toast_compression.h`: 0 = pglz, 1 = lz4). `rawsize` is the exact
+/// uncompressed length (from `va_tcinfo` for inline, `va_rawsize` for
+/// out-of-line). TOAST has no zstd method — that GUC only governs page images.
+pub fn decompress_datum(method: u32, payload: &[u8], rawsize: usize) -> Result<Vec<u8>> {
+    match method {
+        0 => pglz_decompress(payload, rawsize),
+        1 => lz4_decompress(payload, rawsize),
+        m => bail!("unknown toast compression method {m}"),
+    }
 }

@@ -360,11 +360,27 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   pg_multixact, not SLRUs pinned to an arbitrary past LSN — the real V2b answer reads the
   pageserver's SLRU keyspace, fork-side plumbing not yet built; the trait is the seam where
   that lands with no caller change.
+- **lz4/zstd decompression + P2 test coverage 2026-07-21**: (1) closed the M2 lz4/zstd leftover
+  — `wal/heap.rs` now decodes TOAST/inline lz4 datums (method 1) alongside pglz via a shared
+  `decompress_datum`, and `wal/mod.rs` FPI restore handles `wal_compression` = lz4 (`lz4_flex`,
+  raw LZ4 block format — Postgres uses `LZ4_compress_default` for both TOAST and FPI) and zstd
+  (`zstd` crate, standard frame). `lz4_flex` added as a dep; `zstd` promoted from dev-dep. No
+  more "must stay pglz" limitation. (2) `tests/compression.rs` round-trips both codecs through
+  the reference encoders (lz4 block roundtrip + wrong-size reject, `decompress_datum` method
+  dispatch incl. a hand-built pglz literal stream, FPI restore for lz4/zstd with and without a
+  page hole). (3) `tests/catalog_pages.rs` drives synthetic pg_class/pg_attribute/pg_index heap
+  pages through the real `Catalog::load` → `desc()` (the P2 catalog-from-pages path had only
+  field-parser unit tests): asserts PK derivation, dropped-slot/fast-default handling, the
+  mapped-vs-own-pg_class filenode split for pg_index, and — the load-bearing case — that an
+  aborted stale catalog-tuple version is dropped by the CLOG visibility check (a contrast test
+  marks the same xid committed and shows both versions then leak). 48 tests green, no live
+  stack needed.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
 
-- **M2 leftovers (nice-to-have)** — lz4/zstd decompression; mirror memory bounds.
+- **M2 leftovers (nice-to-have)** — ~~lz4/zstd decompression~~ (done 2026-07-21: TOAST/inline
+  lz4 + WAL page-image lz4/zstd, `tests/compression.rs`); mirror memory bounds.
 - **Compaction leftovers** — DV-based collapse (less write amp than replace-based); streaming
   compaction for tables too big to hold in memory; optional VACUUM with a safe retention floor.
 - **M3 leftovers (nice-to-have)** — discovery re-keyed by table OID instead of name (rename of
@@ -420,12 +436,17 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   alignment, padding; record *headers* may split across pages — only xl_tot_len is guaranteed
   on-page) + `parse_record` (block headers per xlogrecord.h, CRC32C validated).
 - `wal/heap.rs` — heap INSERT + multi-insert (COPY) tuple decode (null bitmap, alignment,
-  varlena per varatt.h incl. pglz); XACT opcodes + subxact list parsing also here; `normalize_dml`
-  maps rmgr-NEON opcodes onto the vanilla `(rmid, op)` space + `HeapFmt` dialect tag.
+  varlena per varatt.h); `decompress_datum` dispatches TOAST/inline compression by method
+  (0 pglz / 1 lz4); `pglz_decompress`/`lz4_decompress` are the reusable codecs (WAL FPI restore
+  in `wal/mod.rs` also calls them, plus zstd for page images). XACT opcodes + subxact list
+  parsing also here; `normalize_dml` maps rmgr-NEON opcodes onto the vanilla `(rmid, op)` space
+  + `HeapFmt` dialect tag.
 - `tests/` — synthetic-WAL regression suite (`cargo test`, no Postgres/Docker needed):
   `common/mod.rs` builds byte-exact records/pages/tuples in both dialects; `wal_framing.rs`
   covers reader reassembly + CRC; `neon_dialect.rs` covers Neon offset shifts, FPI-restore,
-  TOAST decode. Extend it whenever a decode bug is found — cheapest place to pin a layout.
+  TOAST decode; `compression.rs` covers lz4/zstd datum + page-image decode; `catalog_pages.rs`
+  drives `Catalog::load`/`desc()` over synthetic catalog pages incl. CLOG visibility. Extend it
+  whenever a decode bug is found — cheapest place to pin a layout.
 - `schema.rs` — "catalog lite": table descriptor via SQL at startup (M3 replaces this).
 - `txbuf.rs` — per-xid op buffering (Insert/Update/Delete with ctids + RowVersion) + per-txn
   overlays for intra-txn pre-images; commit merges subxacts LSN-sorted, abort discards.
@@ -482,7 +503,10 @@ Git identity for commits: `zemin-piao <pzm6391@gmail.com>`.
   `scripts/dev-init.sh` appends `host replication all all trust` post-start (initdb-mount scripts
   hit a Docker Desktop exec-permission quirk).
 - Dev now runs `full_page_writes=on`; FPI-carried tuples are decoded from the page image.
-  `wal_compression`/`default_toast_compression` must stay off/pglz (no lz4/zstd).
+  All compression PG can emit is now decoded: `wal_compression` = off/pglz/lz4/zstd and
+  `default_toast_compression` = pglz/lz4 (zstd is not a TOAST method). lz4 = raw LZ4 block
+  format (`lz4_flex`), zstd = standard frame (`zstd` crate); both round-tripped in
+  `tests/compression.rs`.
 - WAL record *headers* can split across page boundaries — only xl_tot_len is guaranteed
   on-page. Never "skip to next page" when a header doesn't fit.
 - Docker Desktop VM clock jumps on Mac sleep can trip `wal_sender_timeout` on idle streams —
