@@ -406,35 +406,35 @@ impl Engine {
 
         let mut changed = false;
         for ti in 0..self.tables.len() {
-            let mut name = self.tables[ti].desc.name.clone();
+            let old_name = self.tables[ti].desc.name.clone();
             let old_node = self.tables[ti].desc.rel_node;
             if old_node == 0 {
                 continue; // already detached
             }
-            let mut fresh = schema::discover(conninfo, &name).await;
-            if fresh.is_err() {
-                // Renamed rather than dropped? The filenode survives a rename.
-                if let Ok(Some(new_name)) = schema::table_name_by_filenode(conninfo, old_node).await {
-                    tracing::warn!(
-                        table = %name,
-                        renamed_to = %new_name,
-                        "table renamed — following it (the Delta table stays at its original path)"
-                    );
-                    self.tables[ti].desc.name = new_name.clone();
-                    name = new_name;
-                    fresh = schema::discover(conninfo, &name).await;
-                }
-            }
-            let fresh = match fresh {
+            // Re-discover by the stable OID, not the name: a rename just changes
+            // the name (the OID and the Delta path stay), a rewrite changes the
+            // filenode, and only a real DROP removes the OID from the catalog.
+            // Resolving by name here would let a *different* table that reused
+            // the old name rebind this slot and corrupt its Delta.
+            let oid = self.tables[ti].desc.oid;
+            let fresh = match schema::discover_by_oid(conninfo, oid).await {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!(table = %name, "table vanished from catalog — detaching: {e:#}");
+                    tracing::warn!(table = %old_name, "table vanished from catalog — detaching: {e:#}");
                     self.tables[ti].desc.rel_node = 0; // routes nowhere (0 = invalid filenode)
                     self.tables[ti].desc.toast_rel_node = None;
                     changed = true;
                     continue;
                 }
             };
+            let name = fresh.name.clone();
+            if name != old_name {
+                tracing::warn!(
+                    table = %old_name,
+                    renamed_to = %name,
+                    "table renamed — following it (the Delta table stays at its original path)"
+                );
+            }
             let filenode_changed = fresh.rel_node != old_node;
             let cols_changed = fresh
                 .cols
@@ -482,15 +482,16 @@ impl Engine {
         }
         // Auto mode: attach tables created since startup (their pre-attach
         // DML is covered by the snapshot cutover + dedupe, like at startup).
+        // Keyed by OID: a renamed table (already tracked under its OID) is not
+        // re-attached under its new name, and a brand-new table that reuses a
+        // dropped table's name is still recognised as new.
         if cfg.tables.is_none() {
-            if let Ok(names) = schema::list_tables(conninfo).await {
-                for n in names {
-                    if self.tables.iter().any(|t| t.desc.name == n) || self.attach_failed.contains(&n) {
-                        continue;
-                    }
+            if let Ok(catalog) = schema::list_tables(conninfo).await {
+                let tracked: HashSet<u32> = self.tables.iter().map(|t| t.desc.oid).collect();
+                for (oid, n) in tables_to_attach(&tracked, &self.attach_failed, catalog) {
                     match attach_table(&n, cfg).await {
                         Ok(t) => {
-                            tracing::info!(table = %n, "new table attached");
+                            tracing::info!(table = %n, oid, "new table attached");
                             self.tables.push(t);
                             changed = true;
                         }
@@ -885,6 +886,22 @@ impl Engine {
     }
 }
 
+/// Which catalog `(oid, name)` entries auto-attach should try, given the OIDs
+/// already tracked and the names that previously failed to attach. Keyed on
+/// OID, not name: a renamed table (same OID, new name) is already tracked and
+/// must not be re-attached, while a brand-new table that reuses a dropped
+/// table's name has a fresh OID and is correctly seen as new.
+fn tables_to_attach(
+    tracked: &HashSet<u32>,
+    attach_failed: &HashSet<String>,
+    catalog: Vec<(u32, String)>,
+) -> Vec<(u32, String)> {
+    catalog
+        .into_iter()
+        .filter(|(oid, name)| !tracked.contains(oid) && !attach_failed.contains(name))
+        .collect()
+}
+
 /// Bring a table under management mid-stream: open its Delta table and
 /// snapshot it at a fresh cutover. Anything the stream already passed for
 /// this table is covered by the snapshot; anything after the cutover is
@@ -1144,4 +1161,53 @@ pub async fn build_engine(
         db_oid,
         oracle,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(xs: &[u32]) -> HashSet<u32> {
+        xs.iter().copied().collect()
+    }
+    fn names(xs: &[&str]) -> HashSet<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn attach_skips_tracked_oids_and_failed_names() {
+        // oid 10 already tracked; "bad" previously failed to attach; oid 11 is new.
+        let catalog =
+            vec![(10, "a".to_string()), (11, "b".to_string()), (12, "bad".to_string())];
+        let got = tables_to_attach(&set(&[10]), &names(&["bad"]), catalog);
+        assert_eq!(got, vec![(11, "b".to_string())]);
+    }
+
+    #[test]
+    fn rename_then_recreate_same_name_is_resolved_by_oid() {
+        // Table X (oid 10) was attached as "a", then renamed to "b" — tracked
+        // under oid 10, current catalog name "b". A brand-new table (oid 20)
+        // then takes the freed name "a". Keying on OID, only the new table
+        // attaches; the renamed one is not re-attached.
+        let catalog = vec![(10, "b".to_string()), (20, "a".to_string())];
+        let got = tables_to_attach(&set(&[10]), &names(&[]), catalog);
+        assert_eq!(got, vec![(20, "a".to_string())]);
+    }
+
+    #[test]
+    fn oid_key_survives_a_stale_tracked_name() {
+        // The case OID-keying is strictly more correct than name-keying: the
+        // tracked table's name lags the catalog (oid 10 tracked, catalog now
+        // calls it "b"). OID-keyed dedup still skips it and attaches only the
+        // genuinely new oid 20 — whereas keying on the stale name {"a"} would
+        // both re-attach oid 10 under "b" AND skip the real new table "a".
+        let catalog = vec![(10, "b".to_string()), (20, "a".to_string())];
+        let oid_keyed = tables_to_attach(&set(&[10]), &names(&[]), catalog.clone());
+        assert_eq!(oid_keyed, vec![(20, "a".to_string())]);
+
+        let stale_names = names(&["a"]);
+        let name_keyed: Vec<_> =
+            catalog.into_iter().filter(|(_, n)| !stale_names.contains(n)).collect();
+        assert_eq!(name_keyed, vec![(10, "b".to_string())]); // wrong on both counts
+    }
 }

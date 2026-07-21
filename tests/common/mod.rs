@@ -360,6 +360,9 @@ pub fn multi_insert_block_data(natts: u16, tuples: &[(Option<u8>, Vec<u8>)]) -> 
 pub const TEST_DB: u32 = 5;
 pub const TEST_REL: u32 = 16384;
 pub const TEST_TOAST_REL: u32 = 16387;
+/// Distinct from `TEST_REL` on purpose — the table's stable OID is not its
+/// relfilenode (they only coincide for a freshly created, never-rewritten heap).
+pub const TEST_OID: u32 = 16390;
 
 pub fn desc_int_text() -> TableDesc {
     let cols = vec![
@@ -368,6 +371,7 @@ pub fn desc_int_text() -> TableDesc {
     ];
     TableDesc {
         name: "t".into(),
+        oid: TEST_OID,
         db_oid: TEST_DB,
         rel_node: TEST_REL,
         toast_rel_node: Some(TEST_TOAST_REL),

@@ -68,6 +68,11 @@ pub enum PhysCol {
 #[derive(Debug, Clone)]
 pub struct TableDesc {
     pub name: String,
+    /// The table's `pg_class` OID — its stable identity. Unlike `name` (which a
+    /// rename changes) and `rel_node` (which a rewrite changes), the OID lives
+    /// for the table's whole lifetime, so remap/discovery keys on it: a reused
+    /// table name can't rebind a tracked slot to a different table's data.
+    pub oid: u32,
     pub db_oid: u32,
     pub rel_node: u32,
     /// relfilenode of the table's toast relation, if it has one.
@@ -145,13 +150,16 @@ pub async fn neon_ids(conninfo: &str) -> Result<(String, String)> {
     Ok((ids.pop().unwrap(), timeline))
 }
 
-/// All ordinary tables in the public schema.
-pub async fn list_tables(conninfo: &str) -> Result<Vec<String>> {
+/// All ordinary tables in the public schema, as `(pg_class oid, name)` — the
+/// OID lets auto-attach key on table identity, so a renamed table isn't
+/// re-attached under its new name and a new table reusing an old name is still
+/// recognised as new.
+pub async fn list_tables(conninfo: &str) -> Result<Vec<(u32, String)>> {
     let (client, conn) = tokio_postgres::connect(conninfo, NoTls).await?;
     let handle = tokio::spawn(conn);
     let rows = client
         .query(
-            "SELECT c.relname FROM pg_class c
+            "SELECT c.oid, c.relname FROM pg_class c
              JOIN pg_namespace n ON n.oid = c.relnamespace
              WHERE n.nspname = 'public' AND c.relkind = 'r'
              ORDER BY c.relname",
@@ -159,23 +167,7 @@ pub async fn list_tables(conninfo: &str) -> Result<Vec<String>> {
         )
         .await?;
     handle.abort();
-    Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
-}
-
-/// Current name of the table owning a relfilenode (rename detection).
-pub async fn table_name_by_filenode(conninfo: &str, node: u32) -> Result<Option<String>> {
-    let (client, conn) = tokio_postgres::connect(conninfo, NoTls).await?;
-    let handle = tokio::spawn(conn);
-    let row = client
-        .query_opt(
-            "SELECT c.relname FROM pg_class c
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE c.relfilenode = $1 AND n.nspname = 'public' AND c.relkind = 'r'",
-            &[&node],
-        )
-        .await?;
-    handle.abort();
-    Ok(row.map(|r| r.get(0)))
+    Ok(rows.iter().map(|r| (r.get::<_, u32>(0), r.get::<_, String>(1))).collect())
 }
 
 /// relfilenodes of pg_class (1259) and pg_attribute (1249): heap writes to
@@ -203,7 +195,8 @@ pub async fn discover(conninfo: &str, table: &str) -> Result<TableDesc> {
         .query_opt(
             "SELECT c.relfilenode,
                     (SELECT d.oid FROM pg_database d WHERE d.datname = current_database()),
-                    tc.relfilenode
+                    tc.relfilenode,
+                    c.oid
              FROM pg_class c
              JOIN pg_namespace n ON n.oid = c.relnamespace
              LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid
@@ -215,6 +208,7 @@ pub async fn discover(conninfo: &str, table: &str) -> Result<TableDesc> {
     let rel_node: u32 = row.get(0);
     let db_oid: u32 = row.get(1);
     let toast_rel_node: Option<u32> = row.get(2);
+    let oid: u32 = row.get(3);
 
     let pk_rows = client
         .query(
@@ -271,5 +265,31 @@ pub async fn discover(conninfo: &str, table: &str) -> Result<TableDesc> {
         bail!("table '{table}' has no columns?");
     }
     handle.abort();
-    Ok(TableDesc { name: table.to_string(), db_oid, rel_node, toast_rel_node, cols, phys, has_fast_defaults, pk })
+    Ok(TableDesc { name: table.to_string(), oid, db_oid, rel_node, toast_rel_node, cols, phys, has_fast_defaults, pk })
+}
+
+/// Re-discover a tracked table by its stable `pg_class` OID. This is what
+/// [`crate::engine::Engine::remap_check`] follows: because the OID survives
+/// both rename and relfilenode rewrite, resolving through it (rather than the
+/// possibly-reused name) means a slot is never rebound to a different table
+/// that happens to have taken the old name. Resolves the OID's current name,
+/// then reuses [`discover`] (relname is unique within the namespace, so the
+/// second lookup can't land on a different table).
+pub async fn discover_by_oid(conninfo: &str, oid: u32) -> Result<TableDesc> {
+    let (client, conn) = tokio_postgres::connect(conninfo, NoTls)
+        .await
+        .context("connecting for catalog discovery")?;
+    let handle = tokio::spawn(conn);
+    let row = client
+        .query_opt(
+            "SELECT c.relname FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.oid = $1 AND n.nspname = 'public' AND c.relkind = 'r'",
+            &[&oid],
+        )
+        .await?
+        .with_context(|| format!("table oid {oid} not found (dropped)"))?;
+    let name: String = row.get(0);
+    handle.abort();
+    discover(conninfo, &name).await
 }

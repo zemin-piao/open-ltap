@@ -379,6 +379,23 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   aborted stale catalog-tuple version is dropped by the CLOG visibility check (a contrast test
   marks the same xid committed and shows both versions then leak). 52 tests green, no live
   stack needed.
+- **OID-keyed table discovery 2026-07-21 (M3 leftover)**: `TableDesc` gained the stable
+  `pg_class` OID (survives both rename → name change and rewrite → relfilenode change).
+  `remap_check` now re-resolves each tracked table via `schema::discover_by_oid(oid)` instead of
+  `discover(name)` + the old `table_name_by_filenode` rename hack (removed) — so a table that a
+  DDL renamed is followed by identity, and, the actual bug, a *different* table that reuses the
+  old name can no longer rebind a tracked slot and corrupt its Delta (name-based `discover`
+  would have silently returned the new table's filenode → false remap/tombstone). Auto-attach
+  keys on OID too (`list_tables` now returns `(oid, name)`; extracted `tables_to_attach` helper):
+  a renamed table isn't re-attached under its new name, a new table reusing a dropped name is
+  still seen as new. `catalog.rs::desc()` sets oid from `cls.oid` (the SQL-free path already had
+  it). Covered by unit tests (`tables_to_attach`: tracked-OID/failed-name skip, rename+recreate,
+  and the stale-tracked-name case where OID-keying is strictly more correct than name-keying)
+  and a `desc.oid` assertion in `catalog_pages.rs`. 60 tests green. **Live-unverified** (no
+  stack in this env): the SQL of `discover_by_oid`/`list_tables` is mechanical but hasn't run
+  against a real catalog — worth a rename+recreate pass in the next gauntlet. NOTE: the Delta
+  *path* still derives from the first-seen name, so a brand-new table reusing a renamed table's
+  original name would collide on the lake path — a separate, pre-existing gap, not addressed here.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
@@ -387,10 +404,10 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   lz4 + WAL page-image lz4/zstd, `tests/compression.rs`); mirror memory bounds.
 - **Compaction leftovers** — DV-based collapse (less write amp than replace-based); streaming
   compaction for tables too big to hold in memory; optional VACUUM with a safe retention floor.
-- **M3 leftovers (nice-to-have)** — discovery re-keyed by table OID instead of name (rename of
-  A→B followed by CREATE A would confuse name-based tracking); attach_failed retry policy.
-  Notes: rewrites are handled by re-snapshot, not by decoding XLOG_FPI page loads; rapid
-  consecutive DDL on one table remains the known race window (mitigated by drift self-healing).
+- **M3 leftovers (nice-to-have)** — ~~discovery re-keyed by table OID instead of name~~ (done
+  2026-07-21, see State); attach_failed retry policy. Notes: rewrites are handled by re-snapshot,
+  not by decoding XLOG_FPI page loads; rapid consecutive DDL on one table remains the known race
+  window (mitigated by drift self-healing).
 - **M4 leftovers (explicitly deferred)** — Arrow Flight endpoint (only if ADBC clients demand
   it); HTTP Range support if force_download ever hurts; DV-based compaction; streaming
   compaction for tables larger than memory.
@@ -453,7 +470,9 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   the real `decode_insert_tuple`; `catalog_pages.rs` drives `Catalog::load`/`desc()` over
   synthetic catalog pages incl. CLOG visibility. Extend it whenever a decode bug is found —
   cheapest place to pin a layout.
-- `schema.rs` — "catalog lite": table descriptor via SQL at startup (M3 replaces this).
+- `schema.rs` — "catalog lite": table descriptor via SQL. `TableDesc` carries the stable
+  `pg_class` OID; `discover_by_oid` re-resolves a tracked table by that OID (rename- and
+  rewrite-proof), and `list_tables` returns `(oid, name)` so auto-attach keys on identity.
 - `txbuf.rs` — per-xid op buffering (Insert/Update/Delete with ctids + RowVersion) + per-txn
   overlays for intra-txn pre-images; commit merges subxacts LSN-sorted, abort discards.
 - `snapshot.rs` — initial snapshot (binary COPY with ctid under EXCLUSIVE lock, cutover LSN)

@@ -210,6 +210,7 @@ fn desc_from_cols(spec: &str, relnode: u32) -> Result<TableDesc> {
     }
     Ok(TableDesc {
         name: "layerscan".into(),
+        oid: 0, // synthetic desc for offline `rel=<node> cols=…` decode; identity unused
         db_oid: 0,
         rel_node: relnode,
         toast_rel_node: None,

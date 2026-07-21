@@ -177,7 +177,7 @@ const CATALOG_NS: u32 = 11;
 const TOAST_NS: u32 = 99;
 
 const T_OID: u32 = 40000;
-const T_FILENODE: u32 = 40000;
+const T_FILENODE: u32 = 40005; // != oid: the table has been rewritten at least once
 const T_STALE_FILENODE: u32 = 39000; // an earlier, rewritten filenode of `t`
 const TOAST_OID: u32 = 40010;
 const PG_INDEX_FILENODE: u32 = 2700;
@@ -243,6 +243,7 @@ async fn derives_desc_with_pk_dropped_slot_and_fast_default() {
     let d = cat.desc("t").unwrap();
     assert_eq!(d.name, "t");
     assert_eq!(d.db_oid, 5);
+    assert_eq!(d.oid, T_OID); // stable identity, distinct from the filenode
     // The committed version wins, not the aborted pre-rewrite filenode.
     assert_eq!(d.rel_node, T_FILENODE);
     assert_eq!(d.toast_rel_node, Some(TOAST_OID));

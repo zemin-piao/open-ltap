@@ -351,6 +351,7 @@ impl Catalog {
 
         Ok(TableDesc {
             name: table.to_string(),
+            oid: cls.oid,
             db_oid: self.db,
             rel_node: cls.filenode,
             toast_rel_node,
