@@ -22,7 +22,7 @@
 use anyhow::{Result, bail};
 
 use crate::clog::{ClogSource, tuple_visible};
-use crate::reconstruct::{PAGE_SIZE, line_pointer};
+use crate::reconstruct::{PAGE_SIZE, RawTuple, line_pointer};
 use crate::schema::TableDesc;
 use crate::wal::heap::{Row, ToastCache, decode_tuple_from_page};
 
@@ -44,6 +44,19 @@ pub struct FragmentRow {
     pub block: u32,
     pub offnum: u16,
     pub row: Row,
+}
+
+/// A fragment row carrying **both** the semantic row (DuckDB/Spark readable)
+/// and the byte-exact raw datums ([`RawTuple`]) needed to rebuild the source
+/// page bit-for-bit — the Databricks "raw datums alongside semantic" shape, and
+/// what [`emit_page_raw`] produces so page demotion (V2c) can reconstruct
+/// exactly (P6).
+#[derive(Debug, Clone)]
+pub struct RawFragmentRow {
+    pub block: u32,
+    pub offnum: u16,
+    pub row: Row,
+    pub raw: RawTuple,
 }
 
 /// The visibility-relevant + chain-linking fields of a HeapTupleHeader.
@@ -84,48 +97,84 @@ pub async fn emit_page<C: ClogSource>(
     toast: &ToastCache,
     clog: &mut C,
 ) -> Result<Vec<FragmentRow>> {
+    check_page(page)?;
+    let mut out = Vec::new();
+    for (index_offnum, chain_start) in chain_roots(page)? {
+        if let Some(vis) = visible_version(page, block, chain_start, clog).await? {
+            let (row, _) = decode_tuple_from_page(page, vis, desc, toast)?;
+            out.push(FragmentRow { block, offnum: index_offnum, row });
+        }
+    }
+    Ok(out)
+}
+
+/// Like [`emit_page`], but each row also carries its byte-exact [`RawTuple`]
+/// (P6) — the visible version's on-disk datum bytes, extracted verbatim — so a
+/// downstream `reconstruct::build_page` with [`crate::reconstruct::Slot::Raw`]
+/// rebuilds the page's datum regions bit-for-bit. The visibility and HOT-chain
+/// resolution is shared with `emit_page`, so both agree on which version and
+/// which root offnum every fragment row addresses.
+pub async fn emit_page_raw<C: ClogSource>(
+    page: &[u8],
+    block: u32,
+    desc: &TableDesc,
+    toast: &ToastCache,
+    clog: &mut C,
+) -> Result<Vec<RawFragmentRow>> {
+    check_page(page)?;
+    let mut out = Vec::new();
+    for (index_offnum, chain_start) in chain_roots(page)? {
+        if let Some(vis) = visible_version(page, block, chain_start, clog).await? {
+            let (row, _) = decode_tuple_from_page(page, vis, desc, toast)?;
+            let raw = RawTuple::from_page(page, vis)?;
+            out.push(RawFragmentRow { block, offnum: index_offnum, row, raw });
+        }
+    }
+    Ok(out)
+}
+
+fn check_page(page: &[u8]) -> Result<()> {
     if page.len() != PAGE_SIZE {
         bail!("emit_page: expected an {PAGE_SIZE}-byte page, got {}", page.len());
     }
+    Ok(())
+}
+
+/// The index-addressable line pointers and where each one's HOT chain starts:
+/// `(index_offnum, chain_start_offnum)`. LP_REDIRECT roots point at their
+/// target; heap-only tuples are skipped (reached only via their root); UNUSED /
+/// DEAD are skipped.
+fn chain_roots(page: &[u8]) -> Result<Vec<(u16, u16)>> {
     let pd_lower = u16::from_le_bytes([page[12], page[13]]) as usize;
     let n_line_pointers = pd_lower.saturating_sub(24) / 4;
-
-    let mut out = Vec::new();
+    let mut roots = Vec::new();
     for offnum in 1..=n_line_pointers as u16 {
         let lp = line_pointer(page, offnum)?;
-        // Determine where this index-addressable slot's HOT chain starts.
-        let chain_start = match lp.flags {
-            LP_REDIRECT => lp.off, // a HOT root redirect → follow to the target
+        let start = match lp.flags {
+            LP_REDIRECT => lp.off,
             LP_NORMAL => {
-                // A heap-only tuple is reachable only through its chain root,
-                // never directly from an index — skip it as a starting point;
-                // it is visited when we walk its root's chain.
                 let hdr = read_header(page, lp.off as usize)?;
                 if hdr.infomask2 & HEAP_ONLY_TUPLE != 0 {
                     continue;
                 }
                 offnum
             }
-            _ => continue, // LP_UNUSED / LP_DEAD
+            _ => continue,
         };
-        if let Some(row) = walk_chain(page, block, chain_start, desc, toast, clog).await? {
-            out.push(FragmentRow { block, offnum, row });
-        }
+        roots.push((offnum, start));
     }
-    Ok(out)
+    Ok(roots)
 }
 
-/// Walk a HOT chain from `start` to its visible version, returning that row (or
-/// `None` if the whole chain is invisible: an aborted insert, or a deletion
-/// with no live successor).
-async fn walk_chain<C: ClogSource>(
+/// Walk a HOT chain from `start` to its visible version, returning that
+/// version's offnum (or `None` if the whole chain is invisible: an aborted
+/// insert, or a deletion with no live successor).
+async fn visible_version<C: ClogSource>(
     page: &[u8],
     block: u32,
     start: u16,
-    desc: &TableDesc,
-    toast: &ToastCache,
     clog: &mut C,
-) -> Result<Option<Row>> {
+) -> Result<Option<u16>> {
     let mut cur = start;
     for _ in 0..MAX_CHAIN {
         let lp = line_pointer(page, cur)?;
@@ -134,8 +183,7 @@ async fn walk_chain<C: ClogSource>(
         }
         let hdr = read_header(page, lp.off as usize)?;
         if tuple_visible(clog, hdr.xmin, hdr.xmax, hdr.infomask).await? {
-            let (row, _) = decode_tuple_from_page(page, cur, desc, toast)?;
-            return Ok(Some(row));
+            return Ok(Some(cur));
         }
         // Not visible. Only a *HOT update* to a newer version on the same page
         // continues the chain; anything else (aborted insert, plain delete) is
@@ -154,7 +202,7 @@ async fn walk_chain<C: ClogSource>(
 mod tests {
     use super::*;
     use crate::clog::{CLOG_XACTS_PER_BYTE, CLOG_XACTS_PER_PAGE, xid_to_page};
-    use crate::reconstruct::{Slot, TupleSpec, build_page};
+    use crate::reconstruct::{FROZEN_XID, Slot, TupleSpec, build_page};
     use crate::schema::{Col, PgType, PhysCol};
     use crate::wal::heap::Value;
     use std::collections::HashMap;
@@ -211,6 +259,20 @@ mod tests {
     async fn emit(slots: &[Slot]) -> Vec<FragmentRow> {
         let page = build_page(&desc(), BLOCK, 0, slots).unwrap();
         emit_page(&page, BLOCK, &desc(), &ToastCache::default(), &mut clog()).await.unwrap()
+    }
+    async fn emit_raw(slots: &[Slot]) -> Vec<RawFragmentRow> {
+        let page = build_page(&desc(), BLOCK, 0, slots).unwrap();
+        emit_page_raw(&page, BLOCK, &desc(), &ToastCache::default(), &mut clog()).await.unwrap()
+    }
+
+    /// A raw tuple whose `txt` is stored as a 4-byte-header varlena — the shape
+    /// the semantic path can't reproduce, so it proves raw datums flow through.
+    fn raw4(id: i32, txt: &str, xmin: u32, xmax: u32, heap_only: bool, hot_updated: bool, ctid: Option<(u32, u16)>) -> RawTuple {
+        let mut attrs = id.to_le_bytes().to_vec();
+        let total = (4 + txt.len()) as u32;
+        attrs.extend_from_slice(&(total << 2).to_le_bytes());
+        attrs.extend_from_slice(txt.as_bytes());
+        RawTuple { attrs, null_bitmap: vec![], natts: 2, has_varwidth: true, xmin, xmax, ctid, heap_only, hot_updated }
     }
 
     #[tokio::test]
@@ -288,5 +350,48 @@ mod tests {
         let got = emit(&slots).await;
         let got_rows: Vec<Row> = got.into_iter().map(|f| f.row).collect();
         assert_eq!(got_rows, rows);
+    }
+
+    #[tokio::test]
+    async fn emit_raw_carries_byte_exact_datums() {
+        // A 4-byte-header varlena the semantic path can't reproduce — proving
+        // the raw datums, not a re-encode, flow through emit.
+        let rt = raw4(7, "hello", FROZEN_XID, 0, false, false, None);
+        let want = rt.attrs.clone();
+        let got = emit_raw(&[Slot::Raw(rt)]).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].offnum, 1);
+        assert_eq!(got[0].row, row(7, "hello")); // semantic view still present
+        assert_eq!(got[0].raw.attrs, want); // ...alongside the byte-exact datums
+    }
+
+    #[tokio::test]
+    async fn emit_raw_carries_the_live_version_after_hot_collapse() {
+        // root (committed, HOT-updated to offnum 2) -> child (updater, heap-only,
+        // 4-byte varlena). The fragment must carry the CHILD's raw datums,
+        // addressed by the root offnum.
+        let mut root = spec(COMMITTED, UPDATER, row(1, "v1"));
+        root.ctid = Some((BLOCK, 2));
+        root.hot_updated = true;
+        let child = raw4(1, "v2", UPDATER, 0, true, false, None);
+        let want = child.attrs.clone();
+
+        let got = emit_raw(&[Slot::Tuple(root), Slot::Raw(child)]).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].offnum, 1); // addressed by the root
+        assert_eq!(got[0].row, row(1, "v2")); // the live version, semantically
+        assert_eq!(got[0].raw.attrs, want); // ...and its byte-exact datums
+    }
+
+    #[tokio::test]
+    async fn raw_fragment_rebuilds_the_page_byte_exact() {
+        // The full byte-exact loop through visibility: page -> emit_page_raw ->
+        // reconstruct (Slot::Raw) -> byte-identical datum region.
+        let rt = raw4(9, "exact-bytes", FROZEN_XID, 0, false, false, None);
+        let want = rt.attrs.clone();
+        let frags = emit_raw(&[Slot::Raw(rt)]).await;
+        let slots: Vec<Slot> = frags.iter().map(|f| Slot::Raw(f.raw.clone())).collect();
+        let rebuilt = build_page(&desc(), BLOCK, 0, &slots).unwrap();
+        assert_eq!(RawTuple::from_page(&rebuilt, 1).unwrap().attrs, want);
     }
 }

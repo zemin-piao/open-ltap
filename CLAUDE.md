@@ -447,9 +447,12 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   from_page→raw rebuild preserves attr bytes incl. a null bitmap. `examples/rebuild.rs` gained a
   byte-exact cross-check pass: against a REAL dumped page it now asserts every datum region is
   preserved bit-for-bit through the raw path, not just semantically equal — the property page
-  demotion actually needs. Remaining P6: threading raw attrs through `fragment::emit_page` (so
-  the visibility/HOT-resolved fragment carries raw datums), and numeric/other types beyond the
-  supported set. This is exactly the Databricks "raw datums alongside semantic" shape.
+  demotion actually needs. This is exactly the Databricks "raw datums alongside semantic" shape.
+  **Extended through the visibility layer** the same day: `fragment::emit_page_raw` carries each
+  visible row's byte-exact `RawTuple` alongside the semantic row, so the full loop — page →
+  `emit_page_raw` (CLOG@LSN visibility + HOT collapse) → `reconstruct` (`Slot::Raw`) → the exact
+  datum region — is closed offline (3 fragment tests incl. byte-exact through a HOT collapse and
+  a full rebuild). Remaining P6: numeric/other types beyond the supported set.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
@@ -566,8 +569,10 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 - `fragment.rs` — V2b fragment emit (P2 + P3): `emit_page(page, block, desc, toast, clog)`
   decodes a materialized heap page into the rows a columnar fragment carries, each tagged with
   its index-addressable `(block, offnum)`, with CLOG@LSN visibility (aborted/deleted excluded)
-  and HOT chains collapsed to the visible version at the root offnum. The forward half of the
-  V2c round trip — inverse of `reconstruct` — and validated against it offline.
+  and HOT chains collapsed to the visible version at the root offnum. `emit_page_raw` returns
+  the same but with each row's byte-exact `RawTuple` (P6) alongside the semantic row, so a
+  downstream `reconstruct` rebuilds the page's datums bit-for-bit. The forward half of the V2c
+  round trip — inverse of `reconstruct` — and validated against it offline.
 - Little-endian only, 64-bit maxalign assumed. **PG17 + PG18 verified** (2026-07-04: full M2
   gauntlet incl. FPI/COPY/TOAST/restart passed identically on 18.4; every layout we parse is
   unchanged between 17 and 18). `XLOG_PAGE_MAGICS` in `wal/mod.rs` allowlists verified majors

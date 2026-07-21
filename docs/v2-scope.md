@@ -585,8 +585,9 @@ places the exact on-disk attribute region + null bitmap byte-for-byte (4-byte va
 inline compression, TOAST pointers all survive — the cases the semantic re-encode gets wrong),
 and `RawTuple::from_page` extracts a byte-exact `RawTuple` from any page, so extract→rebuild
 reproduces the datum region bit-for-bit. Tests pin that raw is byte-exact where semantic is not,
-and `examples/rebuild.rs` adds a byte-exact pass over a *real* dumped page. Remaining: carrying
-raw datums through `fragment::emit_page` alongside the visibility/HOT result, and the still-
+and `examples/rebuild.rs` adds a byte-exact pass over a *real* dumped page. `fragment::emit_page_raw`
+now carries each visible row's `RawTuple` through the CLOG@LSN + HOT-collapse resolution, so the
+full loop page → raw fragment → rebuilt page is byte-exact offline. Remaining: the still-
 unsupported types (numeric et al.).
 
 **P7 — GC, PITR, branching.** Today layer GC is gated by the PITR window; branches are CoW
