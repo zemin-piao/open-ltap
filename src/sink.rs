@@ -135,7 +135,7 @@ fn delta_type(ty: PgType) -> DeltaType {
         PgType::Int8 => PrimitiveType::Long,
         PgType::Float4 => PrimitiveType::Float,
         PgType::Float8 => PrimitiveType::Double,
-        PgType::Text | PgType::Uuid | PgType::Numeric => PrimitiveType::String,
+        PgType::Text | PgType::Uuid | PgType::Numeric | PgType::Jsonb => PrimitiveType::String,
         PgType::Bytea => PrimitiveType::Binary,
         PgType::Date => PrimitiveType::Date,
         PgType::Timestamp => PrimitiveType::TimestampNtz,
@@ -151,7 +151,7 @@ fn arrow_type(ty: PgType) -> ArrowType {
         PgType::Int8 => ArrowType::Int64,
         PgType::Float4 => ArrowType::Float32,
         PgType::Float8 => ArrowType::Float64,
-        PgType::Text | PgType::Uuid | PgType::Numeric => ArrowType::Utf8,
+        PgType::Text | PgType::Uuid | PgType::Numeric | PgType::Jsonb => ArrowType::Utf8,
         PgType::Bytea => ArrowType::Binary,
         PgType::Date => ArrowType::Date32,
         PgType::Timestamp => ArrowType::Timestamp(TimeUnit::Microsecond, None),
@@ -328,7 +328,7 @@ impl DeltaSink {
                 PgType::Int8 => Arc::new(Int64Array::from(col_vals!(li, I64))),
                 PgType::Float4 => Arc::new(Float32Array::from(col_vals!(li, F32))),
                 PgType::Float8 => Arc::new(Float64Array::from(col_vals!(li, F64))),
-                PgType::Text | PgType::Uuid | PgType::Numeric => {
+                PgType::Text | PgType::Uuid | PgType::Numeric | PgType::Jsonb => {
                     Arc::new(StringArray::from(col_vals!(li, Text)))
                 }
                 PgType::Bytea => Arc::new(BinaryArray::from(
@@ -484,7 +484,7 @@ impl DeltaSink {
                             PgType::Int8 => Value::I64(any.downcast_ref::<AI64>().unwrap().value(i)),
                             PgType::Float4 => Value::F32(any.downcast_ref::<AF32>().unwrap().value(i)),
                             PgType::Float8 => Value::F64(any.downcast_ref::<AF64>().unwrap().value(i)),
-                            PgType::Text | PgType::Uuid | PgType::Numeric => {
+                            PgType::Text | PgType::Uuid | PgType::Numeric | PgType::Jsonb => {
                                 Value::Text(any.downcast_ref::<AStr>().unwrap().value(i).to_string())
                             }
                             PgType::Bytea => Value::Bytes(any.downcast_ref::<ABin>().unwrap().value(i).to_vec()),
@@ -707,7 +707,7 @@ fn arrow_cell_key(col: &ArrayRef, ty: PgType, row: usize) -> String {
         PgType::Int8 => a.downcast_ref::<AI64>().unwrap().value(row).to_string(),
         PgType::Float4 => a.downcast_ref::<AF32>().unwrap().value(row).to_bits().to_string(),
         PgType::Float8 => a.downcast_ref::<AF64>().unwrap().value(row).to_bits().to_string(),
-        PgType::Text | PgType::Uuid | PgType::Numeric => {
+        PgType::Text | PgType::Uuid | PgType::Numeric | PgType::Jsonb => {
             a.downcast_ref::<AStr>().unwrap().value(row).to_string()
         }
         PgType::Bytea => hex_of(a.downcast_ref::<ABin>().unwrap().value(row)),

@@ -618,6 +618,14 @@ fn decode_value(data: &[u8], off: usize, ty: PgType, toast: &ToastCache) -> Resu
             };
             Ok((v, new_off))
         }
+        PgType::Jsonb => {
+            let (bytes, new_off) = decode_varlena(data, off, toast)?;
+            let v = match bytes {
+                Some(b) => Some(Value::Text(jsonb_to_string(&b)?)),
+                None => None, // unresolved toast pointer (large jsonb)
+            };
+            Ok((v, new_off))
+        }
     }
 }
 
@@ -1045,4 +1053,158 @@ pub fn numeric_from_string(s: &str) -> Result<Vec<u8>> {
         out.extend_from_slice(&d.to_le_bytes());
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// jsonb (utils/adt/jsonb.h + jsonb_util.c on-disk format)
+//
+// A jsonb value (varlena header already stripped here) is a `JsonbContainer`:
+// a uint32 header (top bits = array/object/scalar flags, low 28 = element/pair
+// count), then a JEntry array (one uint32 per element; 2N for an object: N keys
+// then N values), then the packed value data. Each JEntry's low 28 bits are a
+// length OR — for every 32nd entry, flagged JENTRY_HAS_OFF — an end offset, so
+// a value's offset is the running sum of preceding lengths back to the last
+// stored offset. Numerics and nested containers are 4-byte aligned (leading pad
+// counted in the JEntry length). We render to canonical JSON text (String-
+// backed) matching Postgres's `jsonb::text`: sorted keys as stored, `": "` /
+// `", "` separators, numerics via `numeric_to_string`.
+// ---------------------------------------------------------------------------
+
+const JB_CMASK: u32 = 0x0FFF_FFFF;
+const JB_FOBJECT: u32 = 0x2000_0000;
+const JB_FSCALAR: u32 = 0x1000_0000;
+const JENTRY_OFFLENMASK: u32 = 0x0FFF_FFFF;
+const JENTRY_HAS_OFF: u32 = 0x8000_0000;
+const JENTRY_TYPEMASK: u32 = 0x7000_0000;
+const JENTRY_ISSTRING: u32 = 0x0000_0000;
+const JENTRY_ISNUMERIC: u32 = 0x1000_0000;
+const JENTRY_ISBOOL_FALSE: u32 = 0x2000_0000;
+const JENTRY_ISBOOL_TRUE: u32 = 0x3000_0000;
+const JENTRY_ISNULL: u32 = 0x4000_0000;
+const JENTRY_ISCONTAINER: u32 = 0x5000_0000;
+
+/// Decode a jsonb value's on-disk bytes (varlena header stripped) to canonical
+/// JSON text.
+pub fn jsonb_to_string(container: &[u8]) -> Result<String> {
+    let mut out = String::new();
+    jsonb_write(container, &mut out, 0)?;
+    Ok(out)
+}
+
+fn jsonb_write(c: &[u8], out: &mut String, depth: usize) -> Result<()> {
+    if depth > 200 {
+        bail!("jsonb nested too deep");
+    }
+    if c.len() < 4 {
+        bail!("jsonb container too short");
+    }
+    let header = u32::from_le_bytes(c[0..4].try_into().unwrap());
+    let count = (header & JB_CMASK) as usize;
+    let is_object = header & JB_FOBJECT != 0;
+    let is_scalar = header & JB_FSCALAR != 0;
+    let nentries = if is_object { count * 2 } else { count };
+
+    let ent = |i: usize| -> Result<u32> {
+        let o = 4 + i * 4;
+        Ok(u32::from_le_bytes(c.get(o..o + 4).ok_or_else(|| anyhow::anyhow!("jsonb JEntry {i} truncated"))?.try_into().unwrap()))
+    };
+    // Running end offset of each entry (relative to the data region).
+    let mut ends = vec![0usize; nentries];
+    let mut cum = 0usize;
+    for (i, end) in ends.iter_mut().enumerate() {
+        let je = ent(i)?;
+        if je & JENTRY_HAS_OFF != 0 {
+            cum = (je & JENTRY_OFFLENMASK) as usize;
+        } else {
+            cum += (je & JENTRY_OFFLENMASK) as usize;
+        }
+        *end = cum;
+    }
+    let data_start = 4 + nentries * 4;
+    let start_of = |i: usize| if i == 0 { 0 } else { ends[i - 1] };
+
+    let write_value = |i: usize, out: &mut String| -> Result<()> {
+        let je = ent(i)?;
+        let s = data_start + start_of(i);
+        let e = data_start + ends[i];
+        let slot = c.get(s..e).ok_or_else(|| anyhow::anyhow!("jsonb value {i} out of range"))?;
+        match je & JENTRY_TYPEMASK {
+            JENTRY_ISSTRING => write_json_string(slot, out),
+            JENTRY_ISBOOL_TRUE => out.push_str("true"),
+            JENTRY_ISBOOL_FALSE => out.push_str("false"),
+            JENTRY_ISNULL => out.push_str("null"),
+            JENTRY_ISNUMERIC => {
+                // 4-byte aligned within the container; skip leading pad, then
+                // the value is a full numeric varlena.
+                let pad = (4 - (s % 4)) % 4;
+                out.push_str(&numeric_varlena_to_string(&c[s + pad..e])?);
+            }
+            JENTRY_ISCONTAINER => {
+                let pad = (4 - (s % 4)) % 4;
+                jsonb_write(&c[s + pad..e], out, depth + 1)?;
+            }
+            other => bail!("jsonb: unknown JEntry type {other:#010x}"),
+        }
+        Ok(())
+    };
+
+    if is_scalar {
+        return write_value(0, out); // a scalar is a 1-element array, unwrapped
+    }
+    if is_object {
+        out.push('{');
+        for p in 0..count {
+            if p > 0 {
+                out.push_str(", ");
+            }
+            write_value(p, out)?; // key (a string)
+            out.push_str(": ");
+            write_value(count + p, out)?; // value
+        }
+        out.push('}');
+    } else {
+        out.push('[');
+        for i in 0..count {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            write_value(i, out)?;
+        }
+        out.push(']');
+    }
+    Ok(())
+}
+
+/// Strip a numeric's varlena header (short 1-byte or 4-byte) and render it.
+fn numeric_varlena_to_string(v: &[u8]) -> Result<String> {
+    let b0 = *v.first().ok_or_else(|| anyhow::anyhow!("jsonb numeric empty"))?;
+    let payload = if b0 & 0x01 == 1 {
+        let total = ((b0 >> 1) & 0x7F) as usize;
+        v.get(1..total).ok_or_else(|| anyhow::anyhow!("jsonb short numeric truncated"))?
+    } else {
+        let hdr = u32::from_le_bytes(v.get(0..4).ok_or_else(|| anyhow::anyhow!("jsonb numeric hdr"))?.try_into().unwrap());
+        let total = (hdr >> 2) as usize;
+        v.get(4..total).ok_or_else(|| anyhow::anyhow!("jsonb long numeric truncated"))?
+    };
+    numeric_to_string(payload)
+}
+
+/// Write a JSON string literal (Postgres json escaping: quotes, backslash, and
+/// control chars; non-ASCII passes through as UTF-8).
+fn write_json_string(bytes: &[u8], out: &mut String) {
+    out.push('"');
+    for ch in String::from_utf8_lossy(bytes).chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }

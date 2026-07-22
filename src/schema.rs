@@ -23,6 +23,9 @@ pub enum PgType {
     /// Arbitrary-precision `numeric`/`decimal`: decoded to its exact decimal
     /// string (base-10000 digits on the wire), stored String-backed like uuid.
     Numeric,
+    /// `jsonb`: the binary JsonbContainer/JEntry tree, decoded to canonical
+    /// JSON text (String-backed). (`json` is plain text and maps to `Text`.)
+    Jsonb,
     /// i32 days since 2000-01-01 on the wire; shifted to unix epoch on decode.
     Date,
     /// i64 microseconds since 2000-01-01; shifted to unix epoch on decode.
@@ -44,12 +47,13 @@ impl PgType {
             17 => PgType::Bytea,
             2950 => PgType::Uuid,
             1700 => PgType::Numeric, // numeric / decimal
+            3802 => PgType::Jsonb, // jsonb (json=114 is plain text, above)
             1082 => PgType::Date,
             1114 => PgType::Timestamp,
             1184 => PgType::TimestampTz,
             other => bail!(
                 "unsupported column type oid {other} \
-                 (supported: bool/int2/int4/int8/float4/float8/text/varchar/bytea/uuid/numeric/date/timestamp/timestamptz)"
+                 (supported: bool/int2/int4/int8/float4/float8/text/varchar/bytea/uuid/numeric/jsonb/date/timestamp/timestamptz)"
             ),
         })
     }

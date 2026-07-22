@@ -597,10 +597,10 @@ and `RawTuple::from_page` extracts a byte-exact `RawTuple` from any page, so ext
 reproduces the datum region bit-for-bit. Tests pin that raw is byte-exact where semantic is not,
 and `examples/rebuild.rs` adds a byte-exact pass over a *real* dumped page. `fragment::emit_page_raw`
 now carries each visible row's `RawTuple` through the CLOG@LSN + HOT-collapse resolution, so the
-full loop page → raw fragment → rebuilt page is byte-exact offline. numeric is now supported
-(exact decimal string, exercised through the round-trip fuzz), and json/xml decode as text.
-Remaining types: jsonb (binary on-disk format — a recursive JsonbContainer/JEntry decoder) and
-the rarer ones (arrays, ranges).
+full loop page → raw fragment → rebuilt page is byte-exact offline. numeric (exact decimal
+string), json/xml (as text), and **jsonb** (recursive JsonbContainer/JEntry decoder →
+canonical JSON text, live-verified byte-exact vs real PG16) are all supported. Remaining types:
+the rarer ones (arrays, ranges). jsonb encode is decode-only (re-encode via the P6 raw path).
 
 **P7 — GC, PITR, branching.** Today layer GC is gated by the PITR window; branches are CoW
 references into ancestor layer stacks. If Parquet is canonical: PITR = lake-format time travel

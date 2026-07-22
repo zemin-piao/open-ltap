@@ -473,10 +473,23 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   (no binary format; the exact JSON/XML string is preserved). numeric was also threaded through
   the V2c page round trip: `tests/roundtrip.rs` now generates a numeric column (canonicalized
   through the codec) and proves it survives build_page→emit_page, so numeric works in the
-  demotion path, not just WAL→Delta. Next type item: **jsonb** (oid 3802) — unlike json it has a
-  binary on-disk format (JsonbContainer header + JEntry array + 4-byte-aligned values, numerics
-  nested as varlenas), so it needs a real recursive decoder; scoped but not built (the binary-
-  COPY form is trivially `[version byte][JSON text]`, but the on-disk WAL form is the work).
+  demotion path, not just WAL→Delta.
+- **jsonb support 2026-07-22 (P6 type gap) — live-verified**: `PgType::Jsonb` (oid 3802) decoded
+  to canonical JSON text (String-backed). `wal/heap.rs` `jsonb_to_string` is a recursive
+  JsonbContainer/JEntry decoder (jsonb.h): u32 header (array/object/scalar flags + count), JEntry
+  array (length-or-offset with the HAS_OFF stride; 2N entries for an object = N keys then N
+  values), 4-byte-aligned numerics (as nested varlenas → `numeric_to_string`) and containers;
+  output matches PG's `jsonb::text` (sorted keys as stored, `": "`/`", "` separators, JSON string
+  escaping, UTF-8 passthrough). `snapshot.rs` handles the binary-COPY form (`[version byte][JSON
+  text]`). Threaded through `sink.rs` (String/Utf8 like uuid/numeric) + `schema::from_oid`. Encode
+  is decode-only (the semantic re-encode of JSON→binary is not implemented; the P6 raw path
+  preserves the bytes, and `encode_attrs` returns None for jsonb → mirror seeding falls back, as
+  it already does for oversized varlenas). **Live-verified 2026-07-22 byte-exact vs real PG16**
+  (`examples/pgverify.rs` on a dumped jsonb page): objects, arrays, nesting, empty {}/[], all
+  scalars + top-level scalars, string escaping (\"/\n), large/negative numerics-in-jsonb, UTF-8
+  (café ☃), and PG's key-length reordering all matched `jsonb::text`. `tests/jsonb.rs` (5) pins
+  the format offline with hand-built bytes + a full-tuple decode. Remaining types: the rarer
+  ones (arrays, ranges).
 - **Live verification 2026-07-22 (real PG16, no Docker/neon needed)**: stood up a local
   PostgreSQL 16 `initdb -k` (data checksums on) cluster in the sandbox and verified the offline
   V2c/type work against real on-disk bytes via `examples/pgverify.rs` (reads a dumped 8 KB heap
@@ -583,7 +596,8 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   varlena per varatt.h); `decompress_datum` dispatches TOAST/inline compression by method
   (0 pglz / 1 lz4); `pglz_decompress`/`lz4_decompress` are the reusable codecs (WAL FPI restore
   in `wal/mod.rs` also calls them, plus zstd for page images); `numeric_to_string` /
-  `numeric_from_binary` / `numeric_from_string` decode/encode `numeric` (on-disk + send forms).
+  `numeric_from_binary` / `numeric_from_string` decode/encode `numeric` (on-disk + send forms);
+  `jsonb_to_string` recursively decodes the jsonb JsonbContainer/JEntry binary format to JSON text.
   XACT opcodes + subxact list
   parsing also here; `normalize_dml` maps rmgr-NEON opcodes onto the vanilla `(rmid, op)` space
   + `HeapFmt` dialect tag.

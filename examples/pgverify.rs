@@ -18,6 +18,7 @@ fn pgtype(s: &str) -> Result<PgType> {
         "float8" => PgType::Float8,
         "text" => PgType::Text,
         "numeric" => PgType::Numeric,
+        "jsonb" => PgType::Jsonb,
         "bytea" => PgType::Bytea,
         "uuid" => PgType::Uuid,
         "date" => PgType::Date,
