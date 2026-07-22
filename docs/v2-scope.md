@@ -571,8 +571,11 @@ identically; `tests/roundtrip.rs` then fuzzes thousands of random pages (mixed t
 gaps, padding) through build→emit. Dropped columns are handled (stored as NULL slots). Not yet:
 on-page TOAST/compressed varlenas (that's the P6 dependency), HOT-chain *inference* (the caller
 supplies the chain shape), and a
-`pg_filedump`/amcheck + data-checksums cross-check against a live cluster (the checksum is
-spec-faithful but unverified live). The `(fragments, tail) → slots` front half is V2b's job.
+a full `pg_filedump`/amcheck sweep (the data-checksums cross-check itself is **done** — verified
+2026-07-22 against a real PG16 `-k` cluster via `examples/pgverify.rs`, which found+fixed a bug:
+`pg_checksum_block` was missing its two zero-mixing rounds; now matches real pages across several
+blocks, and a real heap page reconstructs bit-for-bit). The `(fragments, tail) → slots` front
+half is V2b's job.
 
 **P6 — Bit-exact vs semantic encoding.** Our Arrow mapping is semantic (readable by DuckDB/Spark
 directly) but not provably round-trippable for every type; Databricks stores raw datums.

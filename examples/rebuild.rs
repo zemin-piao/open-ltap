@@ -32,6 +32,7 @@ fn synthetic_desc(cols_arg: &str) -> Result<TableDesc> {
             "float4" | "real" => PgType::Float4,
             "float8" => PgType::Float8,
             "text" | "varchar" => PgType::Text,
+            "numeric" | "decimal" => PgType::Numeric,
             "bytea" => PgType::Bytea,
             "uuid" => PgType::Uuid,
             "date" => PgType::Date,

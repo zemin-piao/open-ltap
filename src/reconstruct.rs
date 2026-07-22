@@ -24,9 +24,13 @@
 //!
 //! **Validation.** The strongest offline check is the round-trip: a page built
 //! here decoded back through [`crate::wal::heap::decode_tuple_from_page`]
-//! yields the exact input rows (see the tests). The checksum is spec-faithful
-//! but has NOT yet been cross-checked against a real data-checksums cluster —
-//! that (and pg_filedump/amcheck) is the live-gauntlet step.
+//! yields the exact input rows (see the tests). The checksum and the byte-exact
+//! rebuild were **live-verified 2026-07-22** against a real PostgreSQL 16
+//! `--data-checksums` cluster (`examples/pgverify.rs`): `pg_checksum_page`
+//! matches the stored pd_checksum across several blocks, and a real heap page
+//! reconstructs bit-for-bit. (The live check caught a real bug — the two extra
+//! zero-mixing rounds in `pg_checksum_block` were missing; an offline
+//! round-trip can't catch it since build and verify would skip it identically.)
 
 use anyhow::{Result, bail};
 
@@ -410,13 +414,23 @@ const FNV_PRIME: u32 = 16_777_619;
 /// the page's 2048 uint32 words, folded to one uint32.
 fn pg_checksum_block(page: &[u8]) -> u32 {
     const N_SUMS: usize = 32;
+    let comp = |sum: u32, value: u32| {
+        let tmp = sum ^ value;
+        tmp.wrapping_mul(FNV_PRIME) ^ (tmp >> 17)
+    };
     let mut sums = CHECKSUM_BASE_OFFSETS;
     for i in 0..(PAGE_SIZE / (4 * N_SUMS)) {
         for (j, sum) in sums.iter_mut().enumerate() {
             let idx = (i * N_SUMS + j) * 4;
-            let value = u32::from_le_bytes(page[idx..idx + 4].try_into().unwrap());
-            let tmp = *sum ^ value;
-            *sum = tmp.wrapping_mul(FNV_PRIME) ^ (tmp >> 17);
+            *sum = comp(*sum, u32::from_le_bytes(page[idx..idx + 4].try_into().unwrap()));
+        }
+    }
+    // Two rounds of zeroes for additional mixing (checksum_impl.h) — the step
+    // an offline round-trip can't catch, since both build and verify would skip
+    // it identically. Live-verified against a real data-checksums cluster.
+    for _ in 0..2 {
+        for sum in sums.iter_mut() {
+            *sum = comp(*sum, 0);
         }
     }
     sums.iter().fold(0u32, |acc, &s| acc ^ s)

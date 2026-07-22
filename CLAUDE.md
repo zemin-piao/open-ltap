@@ -412,8 +412,8 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   demo page). Dropped columns are handled (stored as NULL slots, `natts` = physical slot count).
   **Honest gaps** (all flagged in the module doc): no on-page TOAST/compressed/>126-byte
   varlenas (P6 overflow-text side channel), no HOT-chain *inference* (caller supplies the
-  shape). The **checksum is spec-faithful but NOT yet cross-checked against a real
-  data-checksums cluster** — that plus pg_filedump/amcheck is the live-gauntlet step. This is
+  shape). The checksum **was live-verified 2026-07-22** against a real PG16 `--data-checksums`
+  cluster (found+fixed a bug — see the live-verification entry below). This is
   the V2c research gate's forward-looking half; the fragment *emit* side (V2b) is the pair.
 - **V2b fragment-emit prototype 2026-07-21 (P2 + P3 — pairs with the reverse path)**:
   `src/fragment.rs` `emit_page(page, block, desc, toast, clog)` is the forward half of the V2c
@@ -467,8 +467,7 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   NaN/±Infinity handled. `tests/numeric.rs` (7 tests): string↔on-disk round trips incl.
   trailing-zero/scale/canonical-zero cases, decode grounded against hand-built short/long/
   binary layouts, specials, and a full numeric-column tuple through `decode_insert_tuple`. 90
-  tests green. **Live-unverified**: the byte layouts are per numeric.c and self-consistent, but
-  not yet run against a real PG numeric column — a gauntlet check worth doing.
+  tests green. Numeric was **live-verified 2026-07-22** — see the live-verification entry below.
 - **json/xml + numeric-in-V2c 2026-07-21**: `json` (oid 114) and `xml` (142) map to `PgType::Text`
   — both are plain text varlenas on disk, so they decode losslessly via the existing text path
   (no binary format; the exact JSON/XML string is preserved). numeric was also threaded through
@@ -478,6 +477,23 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   binary on-disk format (JsonbContainer header + JEntry array + 4-byte-aligned values, numerics
   nested as varlenas), so it needs a real recursive decoder; scoped but not built (the binary-
   COPY form is trivially `[version byte][JSON text]`, but the on-disk WAL form is the work).
+- **Live verification 2026-07-22 (real PG16, no Docker/neon needed)**: stood up a local
+  PostgreSQL 16 `initdb -k` (data checksums on) cluster in the sandbox and verified the offline
+  V2c/type work against real on-disk bytes via `examples/pgverify.rs` (reads a dumped 8 KB heap
+  page, checks `pg_checksum_page` vs the stored pd_checksum, decodes tuples for eyeball diff vs
+  SQL `::text`). Results: **(1) page checksum — a real BUG found and fixed**: `pg_checksum_block`
+  was missing the "two rounds of zeroes for additional mixing" step (checksum_impl.h) after the
+  main loop; an offline round-trip couldn't catch it (build+verify skip it identically). Fixed;
+  now matches the stored checksum across blocks 0/1/3 of two tables (distinct blkno → the blkno
+  XOR-fold is right). **(2) numeric — confirmed byte-exact**: 1234.5 / -0.05 / 0 /
+  99999999999999.99999 / -123456789 / NaN / 0.000001 / 42 all decode to match PG's own `::text`
+  (short+long formats, negatives, specials, fractions). **(3) all other types confirmed** vs
+  ground truth: bool, int2, int8 (max i64), float4/8, uuid (exact), date/timestamp/timestamptz
+  (the epoch-shifted unix values that go to Delta). **(4) reconstruct — byte-exact vs a REAL
+  page**: `examples/rebuild.rs real=<page>` rebuilt the `v` heap page and all 8 datum regions
+  matched bit-for-bit (semantic + raw). All 91 offline tests still green after the fix. Still
+  unverified live (needs the neon fork/stack, not just PG): the pageserver tee, native page@LSN
+  reads, TOAST/DDL over the safekeeper path end-to-end.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
