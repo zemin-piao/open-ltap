@@ -561,7 +561,11 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   `src/engine.rs` (step a, done), fork version pinned at neon @ `8f60b04` (step b, done), fork
   tee scaffold + engine-adapter units A/B/C/E1 shipped on the `openltap/v2a` fork branch
   (step c phases 1–2, in progress) → V2b (transcode at image-layer creation; fragments +
-  tail merge) → V2c (heap-page demotion; research gate: reverse path + GC/PITR/branching). Key confirmed
+  tail merge — **fragment emit prototyped** `src/fragment.rs`) → V2c (heap-page demotion;
+  **research gate now CLOSED on paper + prototype**: reverse path `src/reconstruct.rs` (P5/P6,
+  live-verified byte-exact vs real PG16 incl. a checksum-bug fix) + GC/PITR/branching
+  `src/timetravel.rs` + `docs/v2c-p7.md` (P7, branching needs no Iceberg). What remains for v2 is
+  fork-side integration, not open research). Key confirmed
   facts: Databricks transcodes at page materialization, keeps bit-exact datums, stores
   (block,offset) per row, does NOT transcode indexes; Neon delta layers store raw WAL
   records; CLOG/multixact + relmapper are in the pageserver keyspace (visibility + mapped-rel

@@ -96,7 +96,9 @@
   <p class="dek">The product: point one binary at the Postgres you already run and get fresh Delta
   tables on your own S3 — no Kafka, no Debezium, no new database platform. Storage-level
   integration with Neon is the research track: M5 (safekeeper source) is validated end-to-end
-  against a local Neon stack, v2 is future work. Each diagram traces a write
+  against a local Neon stack; v2 (transcoding inside the pageserver) is future work, but its
+  research core — the reverse path and GC/PITR/branching — is now prototyped and verified against
+  real Postgres. Each diagram traces a write
   (<code>W①…</code>) to durable storage and the two kinds of reads (<code>R①…</code>):
   OLTP point queries and analytical scans.</p>
   <div class="legend">
@@ -409,12 +411,24 @@
   four fork-free probes (P0) are complete — an offline pageserver layer-file reader, deriving a
   table's schema straight from <code>pg_class</code>/<code>pg_attribute</code> pages with zero SQL,
   the GetPage@LSN oracle client (now also powering the M5 oracle above), and image-layer cadence
-  measurement all validated live. The first stage, <strong>V2a — embedding the transcoder inside
-  the pageserver — is underway</strong>: the engine has been extracted into a library, a fork of
-  Neon is pinned to a specific commit, and a <code>TranscodeSink</code> tee scaffold plus several
-  engine-adapter units are landing on a local fork branch. None of that has run the end-to-end
-  gauntlet yet, and V2b/V2c — canonical Parquet, the reverse path described below — haven't
-  started.</p>
+  measurement all validated live. <strong>V2a — embedding the transcoder inside the pageserver —
+  is underway</strong>: the engine has been extracted into a library, a fork of Neon is pinned to
+  a specific commit, and a <code>TranscodeSink</code> tee scaffold plus several engine-adapter
+  units are on a local fork branch; the end-to-end gauntlet hasn't run yet.</p>
+  <p>The part everyone assumes is the hard, open question — the <strong>V2c research core — is now
+  built and validated offline.</strong> The <strong>reverse path</strong> (rebuild an exact 8&nbsp;KB
+  heap page from columnar rows — R④ below) is a working pure function: exact line-pointer
+  placement, HOT chains, byte-exact datums, and a recomputed page checksum, all
+  <strong>live-verified byte-for-byte against a real PostgreSQL&nbsp;16 data-checksums cluster</strong>
+  (the round-trip caught and fixed a genuine checksum bug an offline test structurally could not).
+  Its inverse — a materialized page decoded into visible columnar rows with CLOG@LSN visibility and
+  HOT-chain collapse — closes the loop. <strong>GC, PITR, and branching over columnar fragments are
+  designed and prototyped</strong>, with one dependency dropped: branching does <em>not</em> require
+  Iceberg, it works on the Delta sink today. And every common column type — including
+  <code>numeric</code>, <code>jsonb</code>, <code>uuid</code>, and the temporals — is decoded and
+  verified against real Postgres bytes. What remains for v2 is now overwhelmingly <strong>fork-side
+  integration</strong> — the compaction tee, native page@LSN reads, and wiring the GC gate and read
+  path into the pageserver — not open research.</p>
 
   <div class="diagram">
   <svg viewBox="0 0 1000 470" role="img" aria-label="v2: writes flow through safekeepers into a forked pageserver whose compaction writes canonical Parquet; OLTP reads are served from an ephemeral page cache rebuilt from Parquet on miss; analytics scan Parquet directly with a tail merge">
@@ -519,11 +533,11 @@
       <h3>Missing / costs</h3>
       <ul>
         <li><strong>Pageserver fork</strong> — a rebase treadmill against fast-moving Neon internals, forever</li>
-        <li><strong>The reverse path</strong> — rebuilding byte-addressed pages (indexes point at exact block/offset) is the research-grade problem; nobody outside Databricks has shipped it</li>
+        <li><strong>The reverse path</strong> — rebuilding byte-addressed pages (indexes point at exact block/offset) is the research-grade problem; a working prototype now rebuilds pages byte-exact (checksum + datums verified against real Postgres), but wiring it to serve live GetPage misses <em>inside the fork</em> is the remaining work</li>
         <li><strong>No separate lake-native OLTP interface, by choice</strong> — a PK-addressed point-read/write tier distinct from this page cache was explored and parked: Databricks' own shipped design reaches "one copy, OLTP and OLAP" via this page-cache-over-columnar path alone, with no such interface anywhere in it — not pursued unless real need emerges</li>
         <li><strong>Cold OLTP reads pay for it</strong> — a cache miss costs Parquet→page reconstruction (R④); needs an aggressive cache hierarchy to hide</li>
         <li><strong>Shared failure domain</strong> — a transcoder bug now sits in the OLTP read path, not beside it</li>
-        <li><strong>Branching, PITR, GC all rework</strong> — Neon's copy-on-write branches must map onto Delta snapshots</li>
+        <li><strong>Branching, PITR, GC — designed, not yet wired</strong> — time-travel by LSN, GC gated on fragment coverage, and copy-on-write branches are prototyped as pure functions (a branch pins the parent's GC horizon); branching needs no Iceberg. Wiring the gate into the pageserver's GC loop remains</li>
       </ul>
     </div>
   </div>
@@ -547,13 +561,13 @@
       <tr><td>Copies of table data</td><td>2 — heap + Parquet</td><td>2 — layers + Parquet</td><td class="t-good">1 — Parquet only</td></tr>
       <tr><td>Neon fork needed</td><td class="t-good">no — any Postgres</td><td class="t-good">no — external subscriber</td><td class="t-hot">yes — compaction + read path</td></tr>
       <tr><td>Who wants it</td><td class="t-good">anyone with Postgres + S3 + Spark/DuckDB</td><td>platform teams running Neon</td><td>whoever forks the pageserver</td></tr>
-      <tr><td>Status</td><td class="t-good">M0–M4 shipped &amp; verified</td><td class="t-good">fully validated end-to-end; oracle wired for pre-images (snapshot/backfill still SQL)</td><td>research-grade; V2a (embedding) underway, P0 probes done</td></tr>
+      <tr><td>Status</td><td class="t-good">M0–M4 shipped &amp; verified</td><td class="t-good">fully validated end-to-end; oracle wired for pre-images (snapshot/backfill still SQL)</td><td>V2c research core prototyped &amp; PG-verified (reverse path + GC/PITR/branching); V2a embedding underway; fork-side integration remains</td></tr>
     </tbody>
   </table>
   </div>
 </section>
 
 <footer>
-  open-ltap · <a href="https://github.com/zemin-piao/open-ltap">github.com/zemin-piao/open-ltap</a> · M0–M4 complete, M4 shipped 2026-07-06
+  open-ltap · <a href="https://github.com/zemin-piao/open-ltap">github.com/zemin-piao/open-ltap</a> · M0–M4 complete (2026-07-06) · M5 validated · V2c research core prototyped &amp; PG-verified (2026-07-22)
 </footer>
 </div>
