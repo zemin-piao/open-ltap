@@ -20,6 +20,9 @@ pub enum PgType {
     Text,
     Bytea,
     Uuid,
+    /// Arbitrary-precision `numeric`/`decimal`: decoded to its exact decimal
+    /// string (base-10000 digits on the wire), stored String-backed like uuid.
+    Numeric,
     /// i32 days since 2000-01-01 on the wire; shifted to unix epoch on decode.
     Date,
     /// i64 microseconds since 2000-01-01; shifted to unix epoch on decode.
@@ -39,12 +42,13 @@ impl PgType {
             25 | 1043 | 1042 => PgType::Text, // text, varchar, bpchar
             17 => PgType::Bytea,
             2950 => PgType::Uuid,
+            1700 => PgType::Numeric, // numeric / decimal
             1082 => PgType::Date,
             1114 => PgType::Timestamp,
             1184 => PgType::TimestampTz,
             other => bail!(
                 "unsupported column type oid {other} \
-                 (supported: bool/int2/int4/int8/float4/float8/text/varchar/bytea/uuid/date/timestamp/timestamptz)"
+                 (supported: bool/int2/int4/int8/float4/float8/text/varchar/bytea/uuid/numeric/date/timestamp/timestamptz)"
             ),
         })
     }

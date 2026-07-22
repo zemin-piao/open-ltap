@@ -404,6 +404,9 @@ pub fn encode_attrs(row: &Row, desc: &TableDesc) -> Option<Vec<u8>> {
             }
             (PgType::Text, Value::Text(t)) => encode_short_varlena(&mut buf, t.as_bytes())?,
             (PgType::Bytea, Value::Bytes(b)) => encode_short_varlena(&mut buf, b)?,
+            (PgType::Numeric, Value::Text(t)) => {
+                encode_short_varlena(&mut buf, &numeric_from_string(t).ok()?)?
+            }
             _ => return None, // type/value mismatch
         }
     }
@@ -606,6 +609,14 @@ fn decode_value(data: &[u8], off: usize, ty: PgType, toast: &ToastCache) -> Resu
         PgType::Bytea => {
             let (bytes, new_off) = decode_varlena(data, off, toast)?;
             Ok((bytes.map(Value::Bytes), new_off))
+        }
+        PgType::Numeric => {
+            let (bytes, new_off) = decode_varlena(data, off, toast)?;
+            let v = match bytes {
+                Some(b) => Some(Value::Text(numeric_to_string(&b)?)),
+                None => None, // unresolved toast pointer (rare for numeric)
+            };
+            Ok((v, new_off))
         }
     }
 }
@@ -846,4 +857,192 @@ pub fn decompress_datum(method: u32, payload: &[u8], rawsize: usize) -> Result<V
         1 => lz4_decompress(payload, rawsize),
         m => bail!("unknown toast compression method {m}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// numeric / decimal (utils/adt/numeric.c on-disk format)
+//
+// After the varlena header a numeric is a `NumericChoice`: a `uint16 n_header`
+// whose top bits select the variant. Digits are base-`NBASE` (10000), each a
+// `int16` NumericDigit; `weight` is the power-of-NBASE of the first digit and
+// `dscale` the number of decimal digits to show after the point. We carry the
+// value as its exact decimal string (String-backed, like uuid) — lossless for
+// arbitrary precision, unlike a fixed Arrow decimal.
+// ---------------------------------------------------------------------------
+
+/// Render a numeric's on-disk bytes (varlena header already stripped) as its
+/// exact decimal string.
+pub fn numeric_to_string(payload: &[u8]) -> Result<String> {
+    if payload.len() < 2 {
+        bail!("numeric too short: {} bytes", payload.len());
+    }
+    let n_header = u16::from_le_bytes([payload[0], payload[1]]);
+    let flagbits = n_header & 0xC000;
+    if flagbits == 0xC000 {
+        // NUMERIC_SPECIAL: NaN / ±Infinity, distinguished by the next nibble.
+        return Ok(match n_header & 0xF000 {
+            0xC000 => "NaN".to_string(),
+            0xD000 => "Infinity".to_string(),
+            0xF000 => "-Infinity".to_string(),
+            other => bail!("numeric: unknown special header {other:#06x}"),
+        });
+    }
+    let (neg, dscale, weight, digits_off) = if flagbits == 0x8000 {
+        // NUMERIC_SHORT: sign/dscale/weight packed into n_header.
+        let neg = n_header & 0x2000 != 0; // NUMERIC_SHORT_SIGN_MASK
+        let dscale = ((n_header & 0x1F80) >> 7) as i32; // NUMERIC_SHORT_DSCALE_*
+        let raw_w = (n_header & 0x003F) as i32; // NUMERIC_SHORT_WEIGHT_MASK
+        let weight = if n_header & 0x0040 != 0 { raw_w - 64 } else { raw_w }; // sign-extend bit 6
+        (neg, dscale, weight, 2usize)
+    } else {
+        // NUMERIC_LONG: pos (0x0000) or neg (0x4000); weight is a separate int16.
+        let neg = flagbits == 0x4000;
+        let dscale = (n_header & 0x3FFF) as i32; // NUMERIC_DSCALE_MASK
+        if payload.len() < 4 {
+            bail!("numeric long header truncated");
+        }
+        let weight = i16::from_le_bytes([payload[2], payload[3]]) as i32;
+        (neg, dscale, weight, 4usize)
+    };
+    let mut digits = Vec::new();
+    let mut o = digits_off;
+    while o + 2 <= payload.len() {
+        digits.push(u16::from_le_bytes([payload[o], payload[o + 1]]));
+        o += 2;
+    }
+    Ok(numeric_digits_to_string(neg, weight, dscale, &digits))
+}
+
+/// Render a numeric from its binary-COPY / `numeric_send` wire form (all
+/// big-endian: int16 ndigits, weight, sign, dscale, then the digits). This is
+/// *not* the on-disk layout — it's what `snapshot.rs`'s binary COPY yields.
+pub fn numeric_from_binary(f: &[u8]) -> Result<String> {
+    if f.len() < 8 {
+        bail!("numeric binary too short: {} bytes", f.len());
+    }
+    let ndigits = i16::from_be_bytes([f[0], f[1]]).max(0) as usize;
+    let weight = i16::from_be_bytes([f[2], f[3]]) as i32;
+    let sign = u16::from_be_bytes([f[4], f[5]]);
+    let dscale = i16::from_be_bytes([f[6], f[7]]) as i32;
+    match sign {
+        0xC000 => return Ok("NaN".to_string()),
+        0xD000 => return Ok("Infinity".to_string()),
+        0xF000 => return Ok("-Infinity".to_string()),
+        _ => {}
+    }
+    let neg = sign == 0x4000;
+    let mut digits = Vec::with_capacity(ndigits);
+    let mut o = 8;
+    for _ in 0..ndigits {
+        if o + 2 > f.len() {
+            bail!("numeric binary digits truncated");
+        }
+        digits.push(u16::from_be_bytes([f[o], f[o + 1]]));
+        o += 2;
+    }
+    Ok(numeric_digits_to_string(neg, weight, dscale, &digits))
+}
+
+/// Value = Σ digits[k]·10000^(weight−k); print with `dscale` fractional digits.
+fn numeric_digits_to_string(neg: bool, weight: i32, dscale: i32, digits: &[u16]) -> String {
+    // The digit at decimal exponent `exp` (0 = ones, negative = fractional).
+    let digit_at = |exp: i32| -> u8 {
+        let g = weight - exp.div_euclid(4); // which base-10000 group holds it
+        if g < 0 || g as usize >= digits.len() {
+            return 0;
+        }
+        let within = exp.rem_euclid(4) as u32; // 0=ones … 3=thousands
+        ((digits[g as usize] as u32 / 10u32.pow(within)) % 10) as u8
+    };
+    let mut s = String::new();
+    if neg {
+        s.push('-');
+    }
+    let hi = (4 * weight + 3).max(0);
+    let mut started = false;
+    for e in (0..=hi).rev() {
+        let d = digit_at(e);
+        started |= d != 0;
+        if started {
+            s.push((b'0' + d) as char);
+        }
+    }
+    if !started {
+        s.push('0');
+    }
+    if dscale > 0 {
+        s.push('.');
+        for e in (-dscale..=-1).rev() {
+            s.push((b'0' + digit_at(e)) as char);
+        }
+    }
+    s
+}
+
+/// Encode a decimal string back to numeric on-disk bytes (varlena payload,
+/// always NUMERIC_LONG). The inverse of [`numeric_to_string`] up to
+/// canonicalization (−0 → 0). Used by the semantic `encode_attrs` path; the P6
+/// raw path preserves original bytes exactly and doesn't call this.
+pub fn numeric_from_string(s: &str) -> Result<Vec<u8>> {
+    let t = s.trim();
+    let special = match t.to_ascii_lowercase().as_str() {
+        "nan" => Some(0xC000u16),
+        "infinity" | "inf" | "+infinity" | "+inf" => Some(0xD000),
+        "-infinity" | "-inf" => Some(0xF000),
+        _ => None,
+    };
+    if let Some(h) = special {
+        return Ok(h.to_le_bytes().to_vec());
+    }
+
+    let (mut neg, body) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (int_str, frac_str) = body.split_once('.').unwrap_or((body, ""));
+    if (int_str.is_empty() && frac_str.is_empty())
+        || !int_str.bytes().all(|b| b.is_ascii_digit())
+        || !frac_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        bail!("invalid numeric literal '{s}'");
+    }
+    let dscale = frac_str.len() as i32;
+
+    // Pad so each side of the point is a whole number of base-10000 groups.
+    let int_pad = (4 - int_str.len() % 4) % 4;
+    let frac_pad = (4 - frac_str.len() % 4) % 4;
+    let mut combined = String::new();
+    combined.extend(std::iter::repeat_n('0', int_pad));
+    combined.push_str(int_str);
+    let padded_int_len = int_pad + int_str.len();
+    combined.push_str(frac_str);
+    combined.extend(std::iter::repeat_n('0', frac_pad));
+
+    let mut digits: Vec<i16> = combined
+        .as_bytes()
+        .chunks(4)
+        .map(|c| c.iter().fold(0i16, |v, &b| v * 10 + (b - b'0') as i16))
+        .collect();
+    let mut weight = (padded_int_len / 4) as i32 - 1;
+    while digits.len() > 1 && digits[0] == 0 {
+        digits.remove(0);
+        weight -= 1;
+    }
+    while digits.len() > 1 && *digits.last().unwrap() == 0 {
+        digits.pop();
+    }
+    if digits.iter().all(|&d| d == 0) {
+        digits.clear();
+        weight = 0;
+        neg = false; // canonical zero is unsigned
+    }
+
+    let n_sign_dscale = (if neg { 0x4000u16 } else { 0 }) | (dscale as u16 & 0x3FFF);
+    let mut out = Vec::with_capacity(4 + digits.len() * 2);
+    out.extend_from_slice(&n_sign_dscale.to_le_bytes());
+    out.extend_from_slice(&(weight as i16).to_le_bytes());
+    for d in digits {
+        out.extend_from_slice(&d.to_le_bytes());
+    }
+    Ok(out)
 }

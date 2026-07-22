@@ -453,6 +453,22 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   `emit_page_raw` (CLOG@LSN visibility + HOT collapse) → `reconstruct` (`Slot::Raw`) → the exact
   datum region — is closed offline (3 fragment tests incl. byte-exact through a HOT collapse and
   a full rebuild). Remaining P6: numeric/other types beyond the supported set.
+- **numeric/decimal support 2026-07-21 (P6 type gap)**: `PgType::Numeric` (oid 1700) decoded to
+  its **exact decimal string** (String-backed like uuid — lossless for arbitrary precision,
+  unlike a fixed Arrow decimal). `wal/heap.rs` decodes the on-disk `NumericChoice` (both
+  NUMERIC_SHORT with packed sign/dscale/weight and NUMERIC_LONG, base-10000 digits, per
+  numeric.c) via `numeric_to_string`; `numeric_from_binary` decodes the `numeric_send` binary-
+  COPY form (big-endian ndigits/weight/sign/dscale) for `snapshot.rs`; `numeric_from_string`
+  re-encodes to the on-disk long form for `encode_attrs` (the semantic mirror path — the P6 raw
+  path preserves original bytes and doesn't need it). Threaded through `sink.rs` (String/Utf8
+  everywhere uuid is) and `schema::from_oid`. Also fixed a latent reopen bug: the Delta type
+  check now compares by *Delta representation* so re-opening a uuid **or** numeric table isn't
+  misread as an incompatible type change (both store as String, indistinguishable on read).
+  NaN/±Infinity handled. `tests/numeric.rs` (7 tests): string↔on-disk round trips incl.
+  trailing-zero/scale/canonical-zero cases, decode grounded against hand-built short/long/
+  binary layouts, specials, and a full numeric-column tuple through `decode_insert_tuple`. 90
+  tests green. **Live-unverified**: the byte layouts are per numeric.c and self-consistent, but
+  not yet run against a real PG numeric column — a gauntlet check worth doing.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
@@ -516,7 +532,9 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
 - `wal/heap.rs` — heap INSERT + multi-insert (COPY) tuple decode (null bitmap, alignment,
   varlena per varatt.h); `decompress_datum` dispatches TOAST/inline compression by method
   (0 pglz / 1 lz4); `pglz_decompress`/`lz4_decompress` are the reusable codecs (WAL FPI restore
-  in `wal/mod.rs` also calls them, plus zstd for page images). XACT opcodes + subxact list
+  in `wal/mod.rs` also calls them, plus zstd for page images); `numeric_to_string` /
+  `numeric_from_binary` / `numeric_from_string` decode/encode `numeric` (on-disk + send forms).
+  XACT opcodes + subxact list
   parsing also here; `normalize_dml` maps rmgr-NEON opcodes onto the vanilla `(rmid, op)` space
   + `HeapFmt` dialect tag.
 - `tests/` — synthetic-WAL regression suite (`cargo test`, no Postgres/Docker needed):

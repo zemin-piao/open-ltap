@@ -198,6 +198,7 @@ fn decode_field(f: &[u8], ty: PgType) -> Result<Value> {
         PgType::Text => Value::Text(String::from_utf8_lossy(f).into_owned()),
         PgType::Bytea => Value::Bytes(f.to_vec()),
         PgType::Uuid => Value::Text(heap::format_uuid(f)),
+        PgType::Numeric => Value::Text(heap::numeric_from_binary(f)?),
         PgType::Date => Value::I32(i32::from_be_bytes(be(f, "date")?) + heap::PG_EPOCH_DAYS),
         PgType::Timestamp | PgType::TimestampTz => {
             Value::I64(i64::from_be_bytes(be(f, "timestamp")?) + heap::PG_EPOCH_MICROS)

@@ -579,7 +579,9 @@ directly) but not provably round-trippable for every type; Databricks stores raw
 Options for V2c: (a) raw-datum binary columns alongside semantic ones (storage cost, both
 audiences served), (b) canonical re-encode with proof-of-round-trip per supported type,
 (c) restrict demotion to relations whose columns are round-trip-safe. Decide at the V2b→V2c
-gate; V2a/V2b need no change. *Note: numeric — unsupported today — becomes unavoidable here.*
+gate; V2a/V2b need no change. *Note: numeric is now supported* (2026-07-21) — decoded to its
+exact decimal string (String-backed), so the semantic path handles it and the raw path preserves
+its bytes; option (a) doesn't force a decision for numeric specifically anymore.
 *Status (2026-07-21): option (a) prototyped in `src/reconstruct.rs`.* `Slot::Raw(RawTuple)`
 places the exact on-disk attribute region + null bitmap byte-for-byte (4-byte varlena headers,
 inline compression, TOAST pointers all survive — the cases the semantic re-encode gets wrong),
@@ -587,8 +589,8 @@ and `RawTuple::from_page` extracts a byte-exact `RawTuple` from any page, so ext
 reproduces the datum region bit-for-bit. Tests pin that raw is byte-exact where semantic is not,
 and `examples/rebuild.rs` adds a byte-exact pass over a *real* dumped page. `fragment::emit_page_raw`
 now carries each visible row's `RawTuple` through the CLOG@LSN + HOT-collapse resolution, so the
-full loop page → raw fragment → rebuilt page is byte-exact offline. Remaining: the still-
-unsupported types (numeric et al.).
+full loop page → raw fragment → rebuilt page is byte-exact offline. numeric is now supported
+(exact decimal string); remaining types are the rarer ones (arrays, ranges, jsonb, …).
 
 **P7 — GC, PITR, branching.** Today layer GC is gated by the PITR window; branches are CoW
 references into ancestor layer stacks. If Parquet is canonical: PITR = lake-format time travel

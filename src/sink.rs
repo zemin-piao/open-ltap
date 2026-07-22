@@ -135,7 +135,7 @@ fn delta_type(ty: PgType) -> DeltaType {
         PgType::Int8 => PrimitiveType::Long,
         PgType::Float4 => PrimitiveType::Float,
         PgType::Float8 => PrimitiveType::Double,
-        PgType::Text | PgType::Uuid => PrimitiveType::String,
+        PgType::Text | PgType::Uuid | PgType::Numeric => PrimitiveType::String,
         PgType::Bytea => PrimitiveType::Binary,
         PgType::Date => PrimitiveType::Date,
         PgType::Timestamp => PrimitiveType::TimestampNtz,
@@ -151,7 +151,7 @@ fn arrow_type(ty: PgType) -> ArrowType {
         PgType::Int8 => ArrowType::Int64,
         PgType::Float4 => ArrowType::Float32,
         PgType::Float8 => ArrowType::Float64,
-        PgType::Text | PgType::Uuid => ArrowType::Utf8,
+        PgType::Text | PgType::Uuid | PgType::Numeric => ArrowType::Utf8,
         PgType::Bytea => ArrowType::Binary,
         PgType::Date => ArrowType::Date32,
         PgType::Timestamp => ArrowType::Timestamp(TimeUnit::Microsecond, None),
@@ -214,7 +214,11 @@ impl DeltaSink {
                     .ok_or_else(|| anyhow::anyhow!("Delta column '{name}' has an unsupported type"))?;
                 let live = desc.cols.iter().position(|c| c.name == name);
                 if let Some(li) = live {
-                    if desc.cols[li].ty != ty {
+                    // Compare by Delta representation, not the exact PgType: uuid
+                    // and numeric both store as String, and a String column read
+                    // back can't be told apart from Text — so re-opening a uuid
+                    // or numeric table must not read as an incompatible change.
+                    if delta_type(desc.cols[li].ty) != delta_type(ty) {
                         anyhow::bail!(
                             "column '{name}' changed type (Delta {ty:?} vs PG {:?}) — \
                              drop the Delta table to re-snapshot",
@@ -249,7 +253,7 @@ impl DeltaSink {
         for dc in &mut self.delta_cols {
             dc.live = cols.iter().position(|c| c.name == dc.col.name);
             if let Some(li) = dc.live {
-                if cols[li].ty != dc.col.ty {
+                if delta_type(cols[li].ty) != delta_type(dc.col.ty) {
                     anyhow::bail!(
                         "column '{}' changed type ({:?} -> {:?})",
                         dc.col.name,
@@ -324,7 +328,9 @@ impl DeltaSink {
                 PgType::Int8 => Arc::new(Int64Array::from(col_vals!(li, I64))),
                 PgType::Float4 => Arc::new(Float32Array::from(col_vals!(li, F32))),
                 PgType::Float8 => Arc::new(Float64Array::from(col_vals!(li, F64))),
-                PgType::Text | PgType::Uuid => Arc::new(StringArray::from(col_vals!(li, Text))),
+                PgType::Text | PgType::Uuid | PgType::Numeric => {
+                    Arc::new(StringArray::from(col_vals!(li, Text)))
+                }
                 PgType::Bytea => Arc::new(BinaryArray::from(
                     col_vals!(li, Bytes).iter().map(|o| o.as_deref()).collect::<Vec<_>>(),
                 )),
@@ -478,7 +484,7 @@ impl DeltaSink {
                             PgType::Int8 => Value::I64(any.downcast_ref::<AI64>().unwrap().value(i)),
                             PgType::Float4 => Value::F32(any.downcast_ref::<AF32>().unwrap().value(i)),
                             PgType::Float8 => Value::F64(any.downcast_ref::<AF64>().unwrap().value(i)),
-                            PgType::Text | PgType::Uuid => {
+                            PgType::Text | PgType::Uuid | PgType::Numeric => {
                                 Value::Text(any.downcast_ref::<AStr>().unwrap().value(i).to_string())
                             }
                             PgType::Bytea => Value::Bytes(any.downcast_ref::<ABin>().unwrap().value(i).to_vec()),
@@ -701,7 +707,9 @@ fn arrow_cell_key(col: &ArrayRef, ty: PgType, row: usize) -> String {
         PgType::Int8 => a.downcast_ref::<AI64>().unwrap().value(row).to_string(),
         PgType::Float4 => a.downcast_ref::<AF32>().unwrap().value(row).to_bits().to_string(),
         PgType::Float8 => a.downcast_ref::<AF64>().unwrap().value(row).to_bits().to_string(),
-        PgType::Text | PgType::Uuid => a.downcast_ref::<AStr>().unwrap().value(row).to_string(),
+        PgType::Text | PgType::Uuid | PgType::Numeric => {
+            a.downcast_ref::<AStr>().unwrap().value(row).to_string()
+        }
         PgType::Bytea => hex_of(a.downcast_ref::<ABin>().unwrap().value(row)),
         PgType::Timestamp | PgType::TimestampTz => a.downcast_ref::<ATs>().unwrap().value(row).to_string(),
     }
