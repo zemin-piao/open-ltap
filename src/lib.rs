@@ -15,5 +15,6 @@ pub mod schema;
 pub mod serve;
 pub mod sink;
 pub mod snapshot;
+pub mod timetravel;
 pub mod txbuf;
 pub mod wal;

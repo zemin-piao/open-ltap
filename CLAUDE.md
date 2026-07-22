@@ -503,6 +503,22 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   neon fork/stack, not just PG): the pageserver tee, native page@LSN reads, TOAST/DDL over the
   safekeeper path end-to-end. Harnesses `examples/pgverify.rs` + `examples/catverify.rs` are
   reusable against any local PG data dir.
+- **V2c P7 designed + prototyped 2026-07-22 (GC/PITR/branching — the research gate's 2nd half)**:
+  `src/timetravel.rs` + `docs/v2c-p7.md`. Once heap pages are demoted, reads/GC/branching must be
+  answered over columnar fragments + a delta tail instead of layer files. Pure functions pin the
+  policy (a wrong answer here deletes still-needed data): `Lake::resolve(rel, block, read_lsn)` =
+  pick the newest base fragment ≤ read_lsn, roll the tail `(base, read]` forward (serveable iff
+  base==read or base≥tail_floor; below-horizon vs uncovered distinguished); `image_redundant` =
+  the GC gate, a heap image layer is droppable iff a fragment covers every block at an LSN in
+  `[tail_floor, gc_horizon]` (rebuildable from fragment+tail); `Branch::resolve` = CoW, inherit
+  ≤ branch_lsn / diverge above (untouched pages inherit the parent frozen at branch_lsn);
+  `effective_gc_horizon` = a branch pins the parent's GC at its branch point. PITR falls out for
+  free (fragment.lsn IS the time axis). 7 tests. **Key finding: branching does NOT require
+  Iceberg** — the model is logical (works on Delta today); Iceberg native branch/tag metadata is
+  an optimization, not a prerequisite, so V2c isn't gated on a second sink. Fork-side remainder:
+  the real fragment index + wiring the gate into the pageserver GC loop and `resolve` into the
+  read path (with `reconstruct` doing the rebuild). With the P5/P6 reverse path (also done +
+  live-verified), **the V2c research gate is now closed on paper + in prototype**.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
@@ -618,6 +634,11 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   path (P6)** — `Slot::Raw` places the exact on-disk datum bytes verbatim (4-byte varlena
   headers, inline compression, TOAST pointers survive), `RawTuple::from_page` extracts them;
   still no HOT-chain inference. `tests/roundtrip.rs` fuzzes rows→page→rows against `fragment`.
+- `timetravel.rs` — V2c P7 (GC/PITR/branching), the second half of the research gate:
+  pure functions over fragment `(rel, key_range, lsn)` metadata — `Lake::resolve` (page@LSN =
+  base fragment + tail roll-forward), `image_redundant` (GC gate = fragment coverage in
+  `[tail_floor, gc_horizon]`), `Branch::resolve` (CoW inherit/diverge), `effective_gc_horizon`
+  (a branch pins the parent). Design: `docs/v2c-p7.md`. Key finding: branching needs no Iceberg.
 - `fragment.rs` — V2b fragment emit (P2 + P3): `emit_page(page, block, desc, toast, clog)`
   decodes a materialized heap page into the rows a columnar fragment carries, each tagged with
   its index-addressable `(block, offnum)`, with CLOG@LSN visibility (aborted/deleted excluded)

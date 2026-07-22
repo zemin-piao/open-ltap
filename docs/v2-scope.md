@@ -609,6 +609,17 @@ the parent's fragments ≤ LSN plus the branch's own tail. Delta has no native b
 **Iceberg's branch/tag model is a materially better fit for V2c specifically** — flag for
 reconsideration at that gate only (the thin-sink decision from M0 stands; do not relitigate
 for the product). *Risk: design-heavy; V2c-gated.*
+*Status (2026-07-22): designed + prototyped — `docs/v2c-p7.md` + `src/timetravel.rs`.* Pure
+functions over fragment `(rel, key_range, lsn)` metadata pin the policy: `Lake::resolve` (base
+fragment + tail roll-forward for page@LSN, with below-horizon/uncovered distinguished),
+`image_redundant` (the GC gate — an image layer is droppable iff a fragment covers its blocks at
+an LSN in `[tail_floor, gc_horizon]`), `Branch::resolve` (inherit ≤ branch_lsn, diverge above),
+and `effective_gc_horizon` (a branch pins the parent's GC at its branch point). 7 tests.
+**Key finding: branching does NOT require Iceberg** — the branch model is *logical* (parent
+fragments ≤ branch_lsn + branch's own), so V2c ships branching on the Delta sink today; Iceberg
+native branch/tag metadata is an optimization, not a prerequisite. Fork-side remainder: the real
+fragment index, and wiring the gate into the pageserver GC loop + `resolve` into the read path.
+This closes the second half of the V2c research gate (the reverse path P5/P6 is the first).
 
 **P8 — Sharding.** Shards see interleaved block stripes; per-shard fragments would shred any
 table scan. Options: transcode on shard 0 only (re-centralizes I/O), or a merge tier. *Scoped
