@@ -469,6 +469,15 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   binary layouts, specials, and a full numeric-column tuple through `decode_insert_tuple`. 90
   tests green. **Live-unverified**: the byte layouts are per numeric.c and self-consistent, but
   not yet run against a real PG numeric column — a gauntlet check worth doing.
+- **json/xml + numeric-in-V2c 2026-07-21**: `json` (oid 114) and `xml` (142) map to `PgType::Text`
+  — both are plain text varlenas on disk, so they decode losslessly via the existing text path
+  (no binary format; the exact JSON/XML string is preserved). numeric was also threaded through
+  the V2c page round trip: `tests/roundtrip.rs` now generates a numeric column (canonicalized
+  through the codec) and proves it survives build_page→emit_page, so numeric works in the
+  demotion path, not just WAL→Delta. Next type item: **jsonb** (oid 3802) — unlike json it has a
+  binary on-disk format (JsonbContainer header + JEntry array + 4-byte-aligned values, numerics
+  nested as varlenas), so it needs a real recursive decoder; scoped but not built (the binary-
+  COPY form is trivially `[version byte][JSON text]`, but the on-disk WAL form is the work).
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan

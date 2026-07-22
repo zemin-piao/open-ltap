@@ -99,6 +99,15 @@ fn binary_copy_form_decodes() {
     assert_eq!(numeric_from_binary(&nan).unwrap(), "NaN");
 }
 
+#[test]
+fn textual_type_oids_map_to_text() {
+    // json (114) and xml (142) are stored as plain text varlenas, so they
+    // decode via the Text path; numeric (1700) is its own type.
+    assert_eq!(PgType::from_oid(114).unwrap(), PgType::Text);
+    assert_eq!(PgType::from_oid(142).unwrap(), PgType::Text);
+    assert_eq!(PgType::from_oid(1700).unwrap(), PgType::Numeric);
+}
+
 /// The real decode path: a tuple with a numeric column, through
 /// `decode_insert_tuple`.
 #[test]

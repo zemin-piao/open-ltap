@@ -40,6 +40,7 @@ impl PgType {
             700 => PgType::Float4,
             701 => PgType::Float8,
             25 | 1043 | 1042 => PgType::Text, // text, varchar, bpchar
+            114 | 142 => PgType::Text, // json, xml — stored as plain text varlenas
             17 => PgType::Bytea,
             2950 => PgType::Uuid,
             1700 => PgType::Numeric, // numeric / decimal

@@ -14,7 +14,7 @@ use open_ltap::clog::ClogSource;
 use open_ltap::fragment::{FragmentRow, emit_page};
 use open_ltap::reconstruct::{Slot, build_page};
 use open_ltap::schema::{Col, PgType, PhysCol, TableDesc};
-use open_ltap::wal::heap::{Row, ToastCache, Value};
+use open_ltap::wal::heap::{Row, ToastCache, Value, numeric_from_string, numeric_to_string};
 
 /// CLOG that never needs to answer: every row we build is frozen (xmin =
 /// FrozenTransactionId), which `clog::resolve` special-cases as committed
@@ -53,6 +53,7 @@ fn desc() -> TableDesc {
         Col { name: "c".into(), ty: PgType::Int8 },
         Col { name: "d".into(), ty: PgType::Bool },
         Col { name: "e".into(), ty: PgType::Bytea },
+        Col { name: "f".into(), ty: PgType::Numeric },
     ];
     TableDesc {
         name: "fuzz".into(),
@@ -86,7 +87,31 @@ fn random_row(rng: &mut Rng) -> Row {
     let byteslen = rng.below(130) as usize;
     let e = Value::Bytes(vec![0xABu8; byteslen]);
     let e = maybe(rng, e);
-    vec![a, b, c, d, e]
+    // A numeric carried as its canonical decimal string — round it through the
+    // codec so the stored value already equals what decode will yield.
+    let f = Value::Text(random_numeric(rng));
+    let f = maybe(rng, f);
+    vec![a, b, c, d, e, f]
+}
+
+/// A random canonical decimal string (sign, 1–6 integer digits, 0–4 fraction
+/// digits), normalized through the numeric codec so it survives round trip.
+fn random_numeric(rng: &mut Rng) -> String {
+    let mut raw = String::new();
+    if rng.boolean() {
+        raw.push('-');
+    }
+    for _ in 0..=rng.below(6) {
+        raw.push((b'0' + rng.below(10) as u8) as char);
+    }
+    let fraclen = rng.below(5);
+    if fraclen > 0 {
+        raw.push('.');
+        for _ in 0..fraclen {
+            raw.push((b'0' + rng.below(10) as u8) as char);
+        }
+    }
+    numeric_to_string(&numeric_from_string(&raw).unwrap()).unwrap()
 }
 
 #[tokio::test]

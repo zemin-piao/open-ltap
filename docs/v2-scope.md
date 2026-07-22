@@ -590,7 +590,9 @@ reproduces the datum region bit-for-bit. Tests pin that raw is byte-exact where 
 and `examples/rebuild.rs` adds a byte-exact pass over a *real* dumped page. `fragment::emit_page_raw`
 now carries each visible row's `RawTuple` through the CLOG@LSN + HOT-collapse resolution, so the
 full loop page → raw fragment → rebuilt page is byte-exact offline. numeric is now supported
-(exact decimal string); remaining types are the rarer ones (arrays, ranges, jsonb, …).
+(exact decimal string, exercised through the round-trip fuzz), and json/xml decode as text.
+Remaining types: jsonb (binary on-disk format — a recursive JsonbContainer/JEntry decoder) and
+the rarer ones (arrays, ranges).
 
 **P7 — GC, PITR, branching.** Today layer GC is gated by the PITR window; branches are CoW
 references into ancestor layer stacks. If Parquet is canonical: PITR = lake-format time travel
