@@ -526,7 +526,10 @@ further than that today would be fiction.
 decode `pg_class`/`pg_attribute`/`pg_type` from their own heap pages (fixed, per-major
 layouts; we already decode arbitrary heap pages) with relmapper resolution (ingested, see §2)
 and pick a consistent catalog LSN (= the DDL txn's commit LSN — same suspect-xid flow as M3b/c).
-*Risk: engineering, not research. P0 probe 2 retires it.*
+*Risk: engineering, not research. P0 probe 2 retires it.* *(Live-verified 2026-07-22 against a
+real PG16 data dir via `examples/catverify.rs`: `Catalog::load` over the real pg_class/
+pg_attribute/pg_index pages + parsed relmapper derived the exact TableDesc — filenode, columns,
+and pk — matching SQL, and the PG17-targeted FormData offsets decoded PG16 pages correctly.)*
 
 **P2 — Visibility at a page-driven horizon.** A materialized page carries uncommitted, aborted,
 and dead tuples; hint bits can't be trusted (not WAL-logged by default). Resolution: CLOG@LSN
@@ -542,7 +545,9 @@ retiring the `xmax==0` spike heuristic (was wrong on 3/5 live scenarios). What r
 the full V2b answer is the *source*: today's `ClogSource`/`MultiXactSource` read current
 on-disk pg_xact/pg_multixact, not SLRUs pinned to an arbitrary past LSN — the "CLOG@LSN from
 the keyspace" plumbing is fork-side and lands behind the same trait with no caller change.
-Verified live vs SQL (`examples/clogvis.rs`, `examples/mxcheck.rs`) + pinned unit tests.
+Verified live vs SQL (`examples/clogvis.rs`, `examples/mxcheck.rs`) + pinned unit tests, and
+again 2026-07-22: `clog::resolve` over a real `pg_xact` matched `pg_xact_status` (committed +
+aborted xids), and `Catalog::load`'s visibility filter ran through it end-to-end.
 
 **P3 — HOT chains and ctid identity.** On-page chains mean "the row at (block,offnum)" is not
 one tuple. Fragment emit must walk chains to the visible version but record the **root** lp

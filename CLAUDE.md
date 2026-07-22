@@ -491,9 +491,18 @@ Architecture deep-dive: https://zemin-piao.github.io/open-ltap/ (source: `docs/i
   ground truth: bool, int2, int8 (max i64), float4/8, uuid (exact), date/timestamp/timestamptz
   (the epoch-shifted unix values that go to Delta). **(4) reconstruct — byte-exact vs a REAL
   page**: `examples/rebuild.rs real=<page>` rebuilt the `v` heap page and all 8 datum regions
-  matched bit-for-bit (semantic + raw). All 91 offline tests still green after the fix. Still
-  unverified live (needs the neon fork/stack, not just PG): the pageserver tee, native page@LSN
-  reads, TOAST/DDL over the safekeeper path end-to-end.
+  matched bit-for-bit (semantic + raw). All 91 offline tests still green after the fix.
+  **(5) catalog-from-pages + CLOG visibility — confirmed against the real data dir**
+  (`examples/catverify.rs`, reads the files, no server): `clog::resolve` on real `pg_xact`
+  matched PG's `pg_xact_status` (xid 731 Committed, 733 Aborted); `Catalog::load` over the real
+  pg_class/pg_attribute/pg_index pages + the parsed relmapper (pg_class=1259, pg_attribute=1249)
+  derived `desc(v)` = filenode 16384, pk `["id"]`, cols `id:Int8, amt:Numeric, txt:Text` —
+  exact vs SQL, with visibility filtered through real CLOG. **Notably this also validates the
+  PG17-targeted catalog FormData offsets decode PG16 pages correctly** (relfilenode@88,
+  relnatts@116, pg_index int2vector PK, etc. — stable 16↔17). Still unverified live (needs the
+  neon fork/stack, not just PG): the pageserver tee, native page@LSN reads, TOAST/DDL over the
+  safekeeper path end-to-end. Harnesses `examples/pgverify.rs` + `examples/catverify.rs` are
+  reusable against any local PG data dir.
 - Working tree = `main`. GitHub Pages serves `/docs` on `main`.
 
 ## Next: milestone plan
